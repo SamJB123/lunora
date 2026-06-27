@@ -59,7 +59,17 @@ const COPY = {
     packageManager: "Which package manager?",
 } as const;
 
-type Template = "analog" | "astro" | "next" | "nuxt" | "react-router" | "standalone" | "sveltekit" | "tanstack-start-react" | "tanstack-start-solid";
+type Template =
+    | "analog"
+    | "astro"
+    | "nuxt"
+    | "react-router"
+    | "standalone"
+    | "sveltekit"
+    | "tanstack-start-react"
+    | "tanstack-start-solid"
+    | "vinext"
+    | "vinext-pages";
 
 interface InitCommandOptions {
     /**
@@ -1219,8 +1229,7 @@ const DEFAULT_FRAMEWORK = "react";
  * The frameworks offered in the interactive picker. The create-vite frameworks
  * (`react` / `vue` / `solid` / `svelte`) scaffold via the overlay engine — the
  * official create-vite base plus the Lunora layer — while the rest are bespoke
- * Lunora templates. (`vanilla` is overlay-only via `--vite`; `next` is hidden
- * until available.)
+ * Lunora templates. (`vanilla` is overlay-only via `--vite`.)
  */
 const FRAMEWORK_CHOICES: ReadonlyArray<{ description: string; label: string; value: string }> = [
     { description: "React SPA — official create-vite base + the Lunora layer (the default)", label: "React", value: "react" },
@@ -1229,6 +1238,8 @@ const FRAMEWORK_CHOICES: ReadonlyArray<{ description: string; label: string; val
     { description: "Svelte SPA — create-vite base + Lunora", label: "Svelte", value: "svelte" },
     { description: "TanStack Start (React) — SSR with live-loader routes", label: "TanStack Start · React", value: "tanstack-start-react" },
     { description: "TanStack Start (Solid)", label: "TanStack Start · Solid", value: "tanstack-start-solid" },
+    { description: "Next.js App Router on Vite (vinext) — composed into the Lunora worker (experimental)", label: "vinext · App Router", value: "vinext" },
+    { description: "Next.js Pages Router on Vite (vinext) — hand-wired single worker (experimental)", label: "vinext · Pages Router", value: "vinext-pages" },
     { description: "React Router (v7, framework mode) — SSR composed into the Lunora worker", label: "React Router", value: "react-router" },
     { description: "Astro + a standalone Lunora worker", label: "Astro", value: "astro" },
     { description: "AnalogJS (Angular) — single-worker, Lunora mounted in Nitro", label: "Analog", value: "analog" },
@@ -1332,12 +1343,6 @@ const scaffoldOverlayPath = async (options: InitCommandOptions, framework: strin
  * `--ref`/`--source` or being offline fails fast and clean.
  */
 const scaffoldTemplatePath = async (options: InitCommandOptions, templateType: Template, name: string, target: string): Promise<InitCommandResult> => {
-    if (templateType === "next") {
-        options.logger.warn('template "next" is not yet available — re-run with `--vite react` or `-t standalone`.');
-
-        return { code: 1, files: [], target };
-    }
-
     if (options.from !== undefined) {
         return await scaffoldFromLocal(options.from, templateType, target, name, options.logger);
     }
@@ -1561,13 +1566,14 @@ const runInitCommand = async (options: InitCommandOptions): Promise<InitCommandR
 const isTemplate = (value: unknown): value is Template =>
     value === "analog" ||
     value === "astro" ||
-    value === "next" ||
     value === "nuxt" ||
     value === "react-router" ||
     value === "standalone" ||
     value === "sveltekit" ||
     value === "tanstack-start-react" ||
-    value === "tanstack-start-solid";
+    value === "tanstack-start-solid" ||
+    value === "vinext" ||
+    value === "vinext-pages";
 
 /** Narrow the `--ci` value to a {@link CiProvider}, warning (and ignoring it) on an unknown provider. */
 const resolveCiProvider = (raw: string | undefined, logger: Logger): CiProvider | undefined => {

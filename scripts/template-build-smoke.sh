@@ -19,11 +19,10 @@
 #   ./scripts/template-build-smoke.sh       # same
 #   ./scripts/template-build-smoke.sh tanstack-start-react  # single template (fast iteration)
 #
-# Scaffolding note: `lunora init -t` only supports vite|standalone|tanstack-start
-# (next is unfinished). All 8 templates are obtained by direct `cp -R` from the
-# templates/ root — offline-deterministic, identical to what giget would produce.
-# This avoids the isTemplate guard in init/handler.ts that falls back to "vite"
-# for unsupported names.
+# Scaffolding note: templates are obtained by direct `cp -R` from the templates/
+# root — offline-deterministic, identical to what giget would produce. This
+# avoids the isTemplate guard in init/handler.ts that falls back to "vite" for
+# unsupported names.
 #
 # What this does NOT cover:
 #   - The remote giget fetch path (needs network + a published template ref).
@@ -63,7 +62,13 @@ ONLY_TEMPLATE="${1:-}"
 # (@react-router/dev, vinxi/@solidjs/start) only support Vite <=7 while Lunora
 # is standardized on Vite 8 — see the official CF react-router starter which
 # pins vite ^7. Re-add the templates when those frameworks ship Vite 8 support.)
-XFAIL_BUILD=()
+#
+# vinext / vinext-pages: vinext is Cloudflare's EXPERIMENTAL Next.js-on-Vite
+# plugin (pre-1.0). Scaffold + install are expected to pass; the full `vinext
+# build` (RSC + Cloudflare worker composition with virtual:lunora/worker) is not
+# yet verified offline here. Drop from this list once the build is confirmed
+# green (an XPASS will flag exactly that).
+XFAIL_BUILD=(vinext vinext-pages)
 
 # ---------------------------------------------------------------------------
 # Discover templates (dynamic, so adding a new dir is automatically included).

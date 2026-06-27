@@ -356,21 +356,46 @@ describe("lunora init", () => {
             expect(pkg).toContain('"name": "starter"');
         });
 
-        it("next template is not yet available", async () => {
-            expect.assertions(2);
-
-            const warnings: string[] = [];
+        it("vinext (App Router) template scaffolds the class-A composed worker", async () => {
+            expect.assertions(4);
 
             const result = await runInitCommand({
                 cwd: workdir,
                 from: templatesRoot,
-                logger: { ...silentLogger(), warn: (message) => warnings.push(message) },
-                name: "soon",
-                templateType: "next",
+                logger: silentLogger(),
+                name: "vinext-app",
+                templateType: "vinext",
             });
 
-            expect(result.code).toBe(1);
-            expect(warnings.join("\n")).toContain("not yet available");
+            expect(result.code).toBe(0);
+
+            const target = join(workdir, "vinext-app");
+
+            // App-Router scaffold: app/ directory + the composed `virtual:lunora/worker` entry.
+            expect(existsSync(join(target, "app", "page.tsx"))).toBe(true);
+            expect(existsSync(join(target, "lunora", "schema.ts"))).toBe(true);
+            expect(readFileSync(join(target, "wrangler.jsonc"), "utf8")).toContain("virtual:lunora/worker");
+        });
+
+        it("vinext-pages (Pages Router) template scaffolds the hand-wired worker", async () => {
+            expect.assertions(4);
+
+            const result = await runInitCommand({
+                cwd: workdir,
+                from: templatesRoot,
+                logger: silentLogger(),
+                name: "vinext-pages-app",
+                templateType: "vinext-pages",
+            });
+
+            expect(result.code).toBe(0);
+
+            const target = join(workdir, "vinext-pages-app");
+
+            // Pages-Router scaffold: pages/ + the hand-wired worker that wraps vinext.
+            expect(existsSync(join(target, "pages", "index.tsx"))).toBe(true);
+            expect(existsSync(join(target, "worker", "index.ts"))).toBe(true);
+            expect(existsSync(join(target, "worker", "vinext-pages.ts"))).toBe(true);
         });
 
         it("refuses to scaffold into a non-empty target", async () => {
@@ -415,8 +440,8 @@ describe("lunora init", () => {
             expect(errors.join("\n")).toContain("template not found in local source");
         });
 
-        it("isTemplate accepts the 6 real template dir names and next (not the removed vite-react)", () => {
-            expect.assertions(9);
+        it("isTemplate accepts the real template dir names incl. vinext (not the removed vite-react)", () => {
+            expect.assertions(10);
 
             expect(isTemplate("astro")).toBe(true);
             expect(isTemplate("nuxt")).toBe(true);
@@ -424,7 +449,8 @@ describe("lunora init", () => {
             expect(isTemplate("sveltekit")).toBe(true);
             expect(isTemplate("tanstack-start-react")).toBe(true);
             expect(isTemplate("tanstack-start-solid")).toBe(true);
-            expect(isTemplate("next")).toBe(true);
+            expect(isTemplate("vinext")).toBe(true);
+            expect(isTemplate("vinext-pages")).toBe(true);
             expect(isTemplate("vite-react")).toBe(false);
             expect(isTemplate("unknown-framework")).toBe(false);
         });
