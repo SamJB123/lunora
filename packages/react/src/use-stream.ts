@@ -4,7 +4,7 @@ import type { ArgsOf, FunctionReference, ReturnOf } from "@lunora/client";
 import { useEffect, useReducer, useRef } from "react";
 
 import { useLunora } from "./lunora-provider";
-import { stableStringify } from "./query-key";
+import { stableWireKey } from "./query-key";
 
 /** The lifecycle of a stream the hook is observing. */
 type UseStreamStatus = "complete" | "error" | "idle" | "streaming";
@@ -76,7 +76,7 @@ const useStream = <F extends FunctionReference<"stream">>(
     const [state, dispatch] = useReducer<State<ReturnOf<F>>, [Action<ReturnOf<F>>]>(reducer<ReturnOf<F>>, { chunks: [], error: undefined, status: "idle" });
 
     const skipped = args === "skip";
-    const serialized = skipped ? "skip" : stableStringify(args);
+    const serialized = skipped ? "skip" : stableWireKey(args);
 
     // Stash the live cancel handle so unmount + manual cancel call into the
     // same function. The reducer doesn't own it because cancel is a side
@@ -85,6 +85,13 @@ const useStream = <F extends FunctionReference<"stream">>(
 
     useEffect(() => {
         if (skipped) {
+            // Args transitioned to "skip" — the previous effect's cleanup already
+            // cancelled the iterator, so no `complete`/`error` will ever fire.
+            // Reset to idle with empty chunks so the hook doesn't stay stuck in
+            // its last status over stale chunks, mirroring useSubscription's skip
+            // teardown.
+            dispatch({ type: "reset" });
+
             return () => {};
         }
 
@@ -111,6 +118,7 @@ const useStream = <F extends FunctionReference<"stream">>(
         // the trailing `.catch` is a belt-and-braces guard that can never fire.
         (async () => {
             try {
+                // react-doctor-disable-next-line react-hooks-js/todo -- `for await` over the stream iterable is the effect's core consumer loop; it lives inside a background IIFE (not render), and the compiler simply can't lower `for-await` yet. The construct is required, not optimizable-away.
                 for await (const chunk of iterable) {
                     // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- `stillMounted` is flipped to `false` by the cleanup closure between awaits; TS's static flow analysis can't see the async mutation, so this guard is real, not dead.
                     if (!stillMounted) {
@@ -144,6 +152,7 @@ const useStream = <F extends FunctionReference<"stream">>(
             cancel();
             cancelRef.current = undefined;
         };
+        // react-doctor-disable-next-line react-doctor/exhaustive-deps -- intentional: the stream re-opens on the query's stable `__lunoraRef` and the serialized args (a content hash) rather than the raw `function_`/`args` object identity, so a caller recreating them with the same value doesn't tear down and re-open the stream. `client` is provider-stable.
     }, [client, function_.__lunoraRef, serialized, skipped, options.shardKey, options.maxBuffer]);
 
     return {

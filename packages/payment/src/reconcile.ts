@@ -15,8 +15,12 @@ import { compareMoney } from "./money";
 import type { PaymentObserver } from "./observability";
 import { notifyObserver } from "./observability";
 import type { PaymentStore } from "./store";
-import type { PaymentSession, Subscription } from "./types";
+import type { PaymentSession, PaymentState, Subscription } from "./types";
 
+/**
+ * `ReconcileInput` is part of the experimental `@lunora/payment` API and may change without a major version bump.
+ * @experimental
+ */
 interface ReconcileInput {
     readonly adapter: PaymentAdapter;
     /** Optional telemetry sink — fired per drifted row and once on completion. */
@@ -26,6 +30,10 @@ interface ReconcileInput {
     readonly subscriptionIds?: ReadonlyArray<string>;
 }
 
+/**
+ * `ReconcileResult` is part of the experimental `@lunora/payment` API and may change without a major version bump.
+ * @experimental
+ */
 interface ReconcileResult {
     readonly checkedPayments: number;
     readonly checkedSubscriptions: number;
@@ -49,6 +57,32 @@ const paymentDrifted = (existing: PaymentSession | undefined, current: PaymentSe
     !sameCurrencyAmount(existing.capturedAmount, current.capturedAmount) ||
     !sameCurrencyAmount(existing.refundedAmount, current.refundedAmount);
 
+const REFUND_STATES: ReadonlySet<PaymentState> = new Set<PaymentState>(["partially_refunded", "refunded"]);
+
+/**
+ * Merge the provider's payment snapshot over the stored row without regressing owner attribution or a
+ * refund the provider truth can't see. Reconcile trusts `getPaymentStatus` as authoritative, but some
+ * providers surface neither refunds nor the reference on that call: a Stripe PaymentIntent stays
+ * `succeeded` after a refund (refunds live on the charge the status call never fetches), and a Polar
+ * order snapshot carries no `referenceId`. A naive overwrite would then erase a `charge.refunded`
+ * webhook (re-entitling a refunded/charged-back customer) or blank a webhook-set reference (orphaning
+ * the row from the `by_reference` index and the default authorizer). So never move the refunded total
+ * backward, never regress a refund state back to `captured`, and never blank a non-empty reference.
+ */
+const mergePaymentTruth = (existing: PaymentSession | undefined, current: PaymentSession): PaymentSession => {
+    if (!existing) {
+        return current;
+    }
+
+    const sameRefundCurrency = existing.refundedAmount.currency === current.refundedAmount.currency;
+    const refundedAmount =
+        sameRefundCurrency && compareMoney(existing.refundedAmount, current.refundedAmount) > 0 ? existing.refundedAmount : current.refundedAmount;
+    const state = current.state === "captured" && REFUND_STATES.has(existing.state) ? existing.state : current.state;
+    const referenceId = current.referenceId === "" ? existing.referenceId : current.referenceId;
+
+    return { ...current, referenceId, refundedAmount, state };
+};
+
 // Re-sync one subscription against the provider's truth. Returns whether the store changed.
 const reconcileSubscription = async (adapter: PaymentAdapter, store: PaymentStore, id: string, observer?: PaymentObserver): Promise<boolean> => {
     const current = await adapter.getSubscriptionStatus(id);
@@ -66,8 +100,9 @@ const reconcileSubscription = async (adapter: PaymentAdapter, store: PaymentStor
 };
 
 const reconcilePayment = async (adapter: PaymentAdapter, store: PaymentStore, id: string, observer?: PaymentObserver): Promise<boolean> => {
-    const current = await adapter.getPaymentStatus(id);
+    const providerTruth = await adapter.getPaymentStatus(id);
     const existing = await store.getPaymentSession(adapter.identifier, id);
+    const current = mergePaymentTruth(existing, providerTruth);
 
     if (!paymentDrifted(existing, current)) {
         return false;
@@ -113,6 +148,10 @@ const sweep = async (
     return { failed, updated };
 };
 
+/**
+ * `reconcile` is part of the experimental `@lunora/payment` API and may change without a major version bump.
+ * @experimental
+ */
 const reconcile = async (input: ReconcileInput): Promise<ReconcileResult> => {
     const { adapter, observability, store } = input;
     const subscriptionIds = input.subscriptionIds ?? [];

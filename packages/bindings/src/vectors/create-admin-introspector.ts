@@ -1,3 +1,5 @@
+import { LunoraError } from "@lunora/errors";
+
 import type { EmbedFunction, VectorizeIndexLike, VectorMetric } from "./types";
 
 /**
@@ -110,16 +112,22 @@ export const createVectorAdminIntrospector = (options: VectorAdminIntrospectorOp
     }
 
     const queryIndex = async ({ name, text, topK }: { name: string; text: string; topK?: number }): Promise<{ matches: VectorAdminQueryMatch[] }> => {
+        // Own-property check (not `=== undefined`): a prototype key like
+        // "__proto__"/"constructor" resolves to an inherited Object.prototype
+        // member on this caller-provided plain object, which would slip past a
+        // truthiness/undefined guard and then be called as a function (raw
+        // TypeError → 500). Object.hasOwn routes those into the controlled
+        // LunoraError below instead.
         const binding = indexes[name];
 
-        if (binding === undefined) {
-            throw new Error(`@lunora/bindings/vectors: no Vectorize binding registered for index "${name}"`);
+        if (!Object.hasOwn(indexes, name) || binding === undefined) {
+            throw new LunoraError("INTERNAL", `@lunora/bindings/vectors: no Vectorize binding registered for index "${name}"`);
         }
 
         const embed = embedders[name];
 
-        if (embed === undefined) {
-            throw new Error(`@lunora/bindings/vectors: no embedder registered for index "${name}" — it lists read-only`);
+        if (!Object.hasOwn(embedders, name) || embed === undefined) {
+            throw new LunoraError("INTERNAL", `@lunora/bindings/vectors: no embedder registered for index "${name}" — it lists read-only`);
         }
 
         const vector = await embed(text);

@@ -15,7 +15,7 @@ import { renderOrderTerm } from "./order";
 import type { Condition, Queryable, QueryExecutor } from "./query";
 import SetOperation from "./set-operation";
 import type { Sql } from "./sql";
-import { lit, toText } from "./sql";
+import { assertLimit, lit, tableRef, toText } from "./sql";
 import type { R2SqlResult } from "./types";
 
 const JOIN_KEYWORDS = {
@@ -65,7 +65,10 @@ export default class SelectBuilder<Row = Record<string, unknown>> implements Que
 
     public constructor(exec: QueryExecutor, table: string) {
         this.exec = exec;
-        this.table = table;
+        // Validate here (not only at the `ctx.r2sql.from` entry) so a directly
+        // constructed builder can't splice an unchecked table name into `FROM`.
+        // `tableRef` allows an optional `[AS] alias` (e.g. `s.zones z`).
+        this.table = tableRef(table);
     }
 
     /** The `SELECT` list. Omit/empty for `SELECT *`. Items are columns, expressions, or aliased window fragments (`fn.rowNumber().over(...).as("rk")`). */
@@ -154,6 +157,7 @@ export default class SelectBuilder<Row = Record<string, unknown>> implements Que
 
     /** `LIMIT n` (R2 SQL: 1–10,000, default 500). */
     public limit(n: number): this {
+        assertLimit(n);
         this.limitValue = n;
 
         return this;
@@ -239,7 +243,10 @@ export default class SelectBuilder<Row = Record<string, unknown>> implements Que
     }
 
     private addJoin(kind: JoinKind, table: string, on?: Condition): this {
-        this.joins.push({ kind, on, table });
+        // Join tables are spliced into the rendered SQL (R2 SQL has no parameter
+        // binding), so allowlist the reference (`table [AS] alias`) — the `on`
+        // condition is already a value-escaping `sql`/`lit` fragment.
+        this.joins.push({ kind, on, table: tableRef(table) });
 
         return this;
     }

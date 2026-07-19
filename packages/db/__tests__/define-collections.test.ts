@@ -1,4 +1,5 @@
 /* eslint-disable no-underscore-dangle -- `_id`/`_creationTime` are Lunora document fields the fixtures mirror */
+import { LunoraError } from "@lunora/errors";
 import type { OfflineExecutor } from "@tanstack/offline-transactions";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -22,8 +23,11 @@ interface SubscribeCall {
 /** A mock `LunoraClient` recording every `subscribe`, with a configurable `mutation`. */
 const makeClient = (mutation: () => Promise<unknown> = async () => "server-id") => {
     const subscribes: SubscribeCall[] = [];
-    const mutationMock = vi.fn<(reference: unknown, args: Record<string, unknown>) => Promise<unknown>>(mutation);
+    const mutationMock = vi.fn<(reference: unknown, args: Record<string, unknown>, options?: { mutationId?: string }) => Promise<unknown>>(mutation);
     const client = {
+        // The list-path row callback advances the checkpoint registry from this
+        // (server-confirmed custom-mutator watermark); no custom mutators here → 0.
+        confirmedMutationWatermark: () => 0,
         mutation: mutationMock,
         subscribe: vi.fn<
             (
@@ -220,8 +224,94 @@ describe(defineCollections, () => {
         });
 
         // `toArgs` maps the optimistic row's `_id` onto the mutation's `id` arg, so
-        // a retry replays the same clientId and the server can dedupe it.
-        expect(mutation).toHaveBeenCalledWith(messagesSend, { channelId: "c1", id, text: "hi" });
+        // a retry replays the same clientId and the server can dedupe it — and the
+        // write also carries a stable `mutationId` (the executor's idempotency key)
+        // so the server dedupes a committed-but-unacked retry at the transport
+        // layer, not only by the app's manual `id`-arg dedup.
+        // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment -- test fixture id from a mocked runtime
+        expect(mutation).toHaveBeenCalledWith(messagesSend, { channelId: "c1", id, text: "hi" }, { mutationId: expect.any(String) });
+    });
+
+    it("passes a stable idempotency key on the insert replay so a retry dedupes", async () => {
+        expect.hasAssertions();
+
+        const { client, mutation } = makeClient();
+        const database = build(client);
+
+        database.collections.messages.subscribeChanges(() => {});
+        database.scope.messages({ channelId: "c1" });
+        await database.executor.waitForInit();
+        await flush();
+
+        database.actions.messages({ channelId: "c1", text: "hi" });
+
+        await vi.waitFor(() => {
+            expect(mutation).toHaveBeenCalledTimes(1);
+        });
+
+        // The write carries an explicit `mutationId` — the executor's stable
+        // idempotency key, NOT a fresh id minted per call — so a committed-but-
+        // unacked write the outbox retries resends the same `x-lunora-mutation-id`
+        // and the server dedupes it instead of inserting the row twice.
+        const options = mutation.mock.calls[0]?.[2];
+
+        expect(options?.mutationId).toBeTypeOf("string");
+        expect((options?.mutationId ?? "").length).toBeGreaterThan(0);
+    });
+
+    it("reports a permanently-rejected write on onWriteRejected (fire-and-forget safe)", async () => {
+        // The server rejects the write with a coded application error — a
+        // permanent verdict the outbox surfaces as a NonRetriableError.
+        const coded = new LunoraError("CONFLICT", "duplicate name");
+        const { client } = makeClient(async () => {
+            throw coded;
+        });
+        const onWriteRejected = vi.fn<(event: { code?: string; collection: string; error: Error; row?: { _id: string } }) => void>();
+
+        const database = defineCollections(
+            client,
+            {
+                messages: {
+                    insert: {
+                        mutation: messagesSend,
+                        optimistic: (input: { channelId: string; text: string }, id) => {
+                            return { _creationTime: 0, _id: id, channelId: input.channelId, text: input.text };
+                        },
+                        toArgs: (row) => {
+                            return { channelId: row.channelId, id: row._id, text: row.text };
+                        },
+                    },
+                    list: messagesList,
+                    scopeBy: "channelId",
+                },
+            },
+            { onWriteRejected },
+        ) as unknown as TestDb & { actions: { messages: (input: { channelId: string; text: string }) => { id: string } } };
+
+        executors.push(database.executor);
+
+        database.collections.messages.subscribeChanges(() => {});
+        database.scope.messages({ channelId: "c1" });
+        await database.executor.waitForInit();
+        await flush();
+
+        // Fire-and-forget: we never retain the returned transaction.
+        const { id } = database.actions.messages({ channelId: "c1", text: "dupe" });
+
+        await vi.waitFor(() => {
+            expect(onWriteRejected).toHaveBeenCalledTimes(1);
+        });
+
+        const event = onWriteRejected.mock.calls[0]![0];
+
+        expect(event.collection).toBe("messages");
+        expect(event.row?._id).toBe(id);
+        expect(event.error.message).toContain("duplicate name");
+
+        // The optimistic row was rolled back once the verdict landed.
+        await vi.waitFor(() => {
+            expect(database.collections.messages.get(id)).toBeUndefined();
+        });
     });
 
     it("surfaces a failed subscription via onError and does not leave the collection stuck loading", async () => {
@@ -251,5 +341,55 @@ describe(defineCollections, () => {
         // The user's onError fired and the collection left `loading` (not stuck).
         expect(onError).toHaveBeenCalledWith({ code: "forbidden", message: "denied" });
         expect(database.collections.users.status).not.toBe("loading");
+    });
+
+    it("mints an action id in a non-secure context (crypto.randomUUID unavailable)", async () => {
+        expect.hasAssertions();
+
+        // Simulate a plain-HTTP dev/LAN origin: `crypto.randomUUID` is gated
+        // (undefined) but `crypto.getRandomValues` still works, so `safeRandomUUID`
+        // must fall back. A bare `crypto.randomUUID()` here would throw and break
+        // every `db.actions.*` call.
+        // eslint-disable-next-line n/no-unsupported-features/node-builtins -- test stubs globalThis.crypto to exercise the non-secure-context fallback
+        const realCrypto = globalThis.crypto;
+        const nonSecureCrypto = new Proxy(realCrypto, {
+            get(target, property) {
+                if (property === "randomUUID") {
+                    return undefined;
+                }
+
+                const value = Reflect.get(target, property) as unknown;
+
+                // eslint-disable-next-line @typescript-eslint/no-unsafe-return -- Reflect.get over a stubbed crypto proxy
+                return typeof value === "function" ? value.bind(target) : value;
+            },
+        });
+
+        vi.stubGlobal("crypto", nonSecureCrypto);
+
+        try {
+            // Keep the send in-flight so the optimistic row isn't settled away.
+            const { client } = makeClient(
+                () =>
+                    new Promise(() => {
+                        /* never settles */
+                    }),
+            );
+            const database = build(client);
+
+            database.collections.messages.subscribeChanges(() => {});
+            database.scope.messages({ channelId: "c1" });
+            await database.executor.waitForInit();
+            await flush();
+
+            const { id } = database.actions.messages({ channelId: "c1", text: "hi" });
+            await flush();
+
+            expect(id).toBeTypeOf("string");
+            expect(id.length).toBeGreaterThan(0);
+            expect(database.collections.messages.get(id)).toMatchObject({ channelId: "c1", text: "hi" });
+        } finally {
+            vi.unstubAllGlobals();
+        }
     });
 });

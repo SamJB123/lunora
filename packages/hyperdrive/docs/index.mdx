@@ -157,6 +157,165 @@ export const syncOrder = action.input({ id: v.string() }).action(async ({ ctx, a
 });
 ```
 
+### Per-agent shape ingest (multitenant Postgres → per-tenant DOs)
+
+A common shape of the pattern above: a **multitenant** Postgres is the source of
+truth, and you want each tenant (or agent) to work against **only its own slice**,
+materialized into its own sharded Durable Object — with clients riding the same
+live slice. `.shardBy()` gives each tenant a private DO + SQLite; `pullSourceRows`
+(read side) and `materializeExternalRows` (write side) bridge the Postgres slice
+into it; `defineShape` carries it to clients with no extra wiring.
+
+```ts
+// lunora/schema.ts — one DO per tenant, plus a shape clients subscribe to
+export default defineSchema({
+    documents: defineTable({ title: v.string(), body: v.string(), orgId: v.string() }).shardBy("orgId").externallyManaged(), // rows are written by the ingest bridge, not user mutations
+});
+
+export const tenantDocs = defineShape({ table: "documents", where: () => ({}) });
+```
+
+```ts
+// The action pulls THIS tenant's slice (the shard key binds into the WHERE — the
+// tenant-isolation boundary), then a mutation materializes it.
+import { createHyperdrive, fromPostgresJs, pullSourceRows } from "@lunora/hyperdrive";
+import postgres from "postgres";
+
+import { api } from "@/lunora/_generated/api";
+import { action, mutation, v } from "@/lunora/_generated/server";
+import { materializeExternalRows } from "@lunora/do";
+
+export const refreshTenant = action.input({ orgId: v.string() }).action(async ({ ctx, args: { orgId } }) => {
+    const { connectionString } = createHyperdrive(ctx.env.HYPERDRIVE);
+    ctx.sql = fromPostgresJs(postgres(connectionString));
+
+    const docs = await pullSourceRows(ctx.sql, {
+        query: 'select id, title, body, org_id as "orgId" from documents where org_id = $1',
+        params: [orgId], // ← tenant scope. NEVER omit this on a sharded source.
+        map: (row) => ({ body: row.body, orgId: row.orgId, title: row.title }),
+    });
+
+    await ctx.runMutation(api.documents.ingest, { orgId, docs });
+});
+
+export const ingest = mutation.input({ orgId: v.string(), docs: v.array(v.any()) }).mutation(async ({ ctx, args: { docs } }) => {
+    // Empty baseline = upsert-only (inserts + updates, no deletes). The materialized
+    // rows append to the CDC log, so `tenantDocs` subscribers are poked live.
+    await materializeExternalRows(ctx.db, docs, new Map(), { table: "documents" });
+});
+```
+
+Clients consume the same slice with the shape they'd use over any table:
+
+```ts
+const docs = useShape(api.shapes.tenantDocs, {}); // RLS-filtered, live, per-tenant
+```
+
+Refresh on a schedule with `@lunora/scheduler` (`ctx.scheduler.runAfter(...)` /
+a cron) so each tenant's slice stays current.
+
+> **Tenant scoping is the correctness boundary.** Per-shard SQLite isolation only
+> controls _where_ rows land — not _what the query pulls_. The shard key MUST bind
+> into the source `WHERE` (as a parameter), or every tenant's DO would replicate the
+> whole table. **Deletes:** the empty-baseline call above is upsert-only; to
+> propagate upstream deletes, pass the table's current membership as the baseline so
+> `materializeExternalRows` can diff it.
+
+### Or skip the boilerplate: the declarative `.source()` modifier
+
+The manual bridge above is the escape hatch. For the common case, declare the
+source on the table and Lunora runs the whole loop for you — full-pull diff, tenant
+scoping, and a poll cadence — on the DO's alarm (no action/mutation/cron to write):
+
+```ts
+// lunora/schema.ts
+export default defineSchema({
+    documents: defineTable({ title: v.string(), body: v.string(), orgId: v.string() })
+        .shardBy("orgId")
+        .source({
+            binding: "HYPERDRIVE_DOCS",
+            query: 'select id, title, body, org_id as "orgId" from documents where org_id = $1',
+            tenantBy: (shardKey) => [shardKey], // mandatory under .shardBy() — the tenant boundary
+        }),
+});
+
+export const tenantDocs = defineShape({ table: "documents", where: () => ({}) });
+```
+
+You provide the driver once, when constructing the shard DO — one resolver for every
+sourced binding (build the `SqlClient` exactly as above). Lunora memoizes it per
+binding and polls each tenant's slice on the alarm:
+
+```ts
+createShardDO({
+    sourceClient: (env, binding) => fromPostgresJs(postgres((env[binding] as { connectionString: string }).connectionString)),
+});
+```
+
+Tenant scoping is enforced two ways: `defineSchema` **throws** at load if a sourced
+
+- `.shardBy()` table omits `tenantBy` (the runtime fail-safe), and the
+  `external_source_unscoped` advisor lint flags it earlier, at build time, in your
+  terminal + Studio. `defineSchema` likewise rejects combining `.source()` with
+  `.global()` (contradictory tiers). Clients consume the slice with
+  `useShape(api.shapes.tenantDocs)` — no client change, since it is an ordinary table.
+
+**Refresh cadence.** Omit `refresh` to poll on every DO alarm tick (the floor), or
+pass `refresh: { everyMs }` to throttle a large slice to at most one pull per
+interval. `refresh: "manual"` tells Lunora **not** to auto-poll — use it when you
+drive the refresh yourself (the manual `pullSourceRows` → `materializeExternalRows`
+bridge above, on your own schedule).
+
+**Delete detection: `mode`.** The default `mode: "full-pull"` reads the whole tenant
+slice each tick and diffs it, so upstream deletes are observed for free — but it
+costs a full read per tick (bench ceiling ~10k rows). For a large, low-churn slice
+past that cap, `mode: "incremental"` pulls **only rows changed since a durable
+watermark**:
+
+```ts
+documents: defineTable({ title: v.string(), body: v.string(), orgId: v.string(), updatedAt: v.number() })
+    .shardBy("orgId")
+    .source({
+        binding: "HYPERDRIVE_DOCS",
+        mode: "incremental",
+        query: 'select id, title, body, org_id as "orgId", updated_at as "updatedAt" from documents where org_id = $1',
+        // cursor.query pulls only rows past the watermark — tenantBy params bind first ($1), the watermark last ($2).
+        cursor: {
+            column: "updatedAt",
+            query: 'select id, title, body, org_id as "orgId", updated_at as "updatedAt" from documents where org_id = $1 and updated_at >= $2 order by updated_at',
+        },
+        // Delete visibility — REQUIRED for incremental (pick one):
+        reconcileEveryMs: 3_600_000, // periodic full-pull sweep GCs upstream deletes, OR:
+        // softDeleteColumn: "deletedAt", // upstream tombstone column the cursor query returns
+        tenantBy: (shardKey) => [shardKey],
+    }),
+```
+
+How it runs: the first poll (and every `reconcileEveryMs` sweep) does a full-pull to
+seed membership + the watermark and GC deletes; every other tick binds the stored
+watermark as the cursor query's trailing param and **upserts** the returned slice.
+The watermark (the max `cursor.column` value seen) and the last-reconcile time persist
+per `(table, shard)` in the DO's reserved `__lunora_source_cursor` table, so they
+survive hibernation. Use `>=` in the cursor query (rows sharing a boundary timestamp
+re-pull idempotently rather than being skipped).
+
+Because an incremental slice can't see a delete (an absent row means "unchanged", not
+"deleted"), incremental **requires** a delete-visibility path: `reconcileEveryMs` (a
+periodic full-pull sweep) or `softDeleteColumn` (an upstream tombstone column the
+cursor query returns, turned into a local delete — don't filter it out of the query).
+`defineSchema` throws, and the `external_source_incremental_no_delete_path` advisor
+lint fails the build, if an incremental source declares neither.
+
+The cursor column must be **strictly commit-monotonic** — a value that only ever
+increases as rows become visible, never assigned below the current max after a later
+commit. A plain `updated_at` set from wall-clock time can violate this under clock
+skew or a long transaction (a row commits with a timestamp below a watermark already
+advanced past it), and an incremental slice would then miss it permanently. A
+`reconcileEveryMs` sweep is the backstop that re-establishes such rows; **`softDeleteColumn`
+alone does not** (it only catches deletes, not missed inserts), so prefer
+`reconcileEveryMs` unless your cursor is provably monotonic (e.g. a gapless sequence
+or a logical replication LSN).
+
 ## Reactive `.global()` over Hyperdrive
 
 The `@lunora/hyperdrive/global` subpath is the inverse trade-off: instead of an
@@ -214,13 +373,15 @@ lower-level pieces are also exported:
 
 ## Public API
 
-| Export                                                                                              | Purpose                                                  |
-| --------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
-| `createHyperdrive(binding)`                                                                         | Lift `connectionString` + discrete parts off the binding |
-| `fromPostgresJs(client)`                                                                            | Wrap a postgres.js client as a `SqlClient`               |
-| `fromNodePg(client)`                                                                                | Wrap a `pg` Client/Pool as a `SqlClient`                 |
-| `fromMysql2(connection)`                                                                            | Wrap a `mysql2/promise` connection/pool as a `SqlClient` |
-| `SqlClient`, `HyperdriveLike`, `HyperdriveConnection`, `PostgresJsLike`, `NodePgLike`, `Mysql2Like` | Type-only                                                |
+| Export                                                                                                                                     | Purpose                                                                           |
+| ------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------- |
+| `createHyperdrive(binding)`                                                                                                                | Lift `connectionString` + discrete parts off the binding                          |
+| `fromPostgresJs(client)`                                                                                                                   | Wrap a postgres.js client as a `SqlClient`                                        |
+| `fromNodePg(client)`                                                                                                                       | Wrap a `pg` Client/Pool as a `SqlClient`                                          |
+| `fromMysql2(connection)`                                                                                                                   | Wrap a `mysql2/promise` connection/pool as a `SqlClient`                          |
+| `pullSourceRows(sql, { query, params, idColumn?, map? })`                                                                                  | Run a tenant query + project rows to Lunora docs (read side of the ingest bridge) |
+| `projectSourceRow(row, { idColumn?, map? })`                                                                                               | Project one external row → a document with `_id`                                  |
+| `SqlClient`, `HyperdriveLike`, `HyperdriveConnection`, `PostgresJsLike`, `NodePgLike`, `Mysql2Like`, `ProjectOptions`, `PullSourceOptions` | Type-only                                                                         |
 
 From `@lunora/hyperdrive/global` (reactive `.global()` backend):
 

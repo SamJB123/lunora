@@ -56,18 +56,23 @@ lunora backup <create|list|restore|pitr> [--dir <d>] [--at <iso>]
 ### `lunora init`
 
 Scaffolds a new Lunora project by fetching a template from
-`gh:anolilab/lunora/templates/<type>#<version>`. Pass `-t` / `--template`
-to choose the starting point:
+`gh:anolilab/lunora/templates/<type>#<version>`. `init` (and `add`) resolve
+that release branch to the immutable commit SHA it currently points at — logged
+as `pinned … → <sha>` — so the fetch is reproducible and tamper-evident; if the
+SHA can't be resolved (offline / rate-limited) it falls back to the branch with
+a one-line UNPINNED warning. Pass `-t` / `--template` to choose the starting
+point:
 
-| Template         | Description                                                                                    |
-| ---------------- | ---------------------------------------------------------------------------------------------- |
-| `vite`           | React + Vite + the Lunora plugin (the default)                                                 |
-| `standalone`     | Worker-only, no frontend                                                                       |
-| `astro`          | Astro + the standalone CLI                                                                     |
-| `nuxt`           | Nuxt + the standalone CLI                                                                      |
-| `sveltekit`      | SvelteKit + the standalone CLI                                                                 |
-| `tanstack-start` | TanStack Start + the standalone CLI                                                            |
-| `next`           | Next.js + the standalone CLI — **not yet available**; re-run with `-t vite` or `-t standalone` |
+| Template         | Description                                                           |
+| ---------------- | --------------------------------------------------------------------- |
+| `vite`           | React + Vite + the Lunora plugin (the default)                        |
+| `standalone`     | Worker-only, no frontend                                              |
+| `astro`          | Astro + the standalone CLI                                            |
+| `next`           | Next.js (App Router) + OpenNext on Cloudflare + `@lunora/react`       |
+| `nuxt`           | Nuxt + the standalone CLI                                             |
+| `sveltekit`      | SvelteKit + the standalone CLI                                        |
+| `expo`           | React Native (Expo) app — iOS/Android/web — + a Lunora worker backend |
+| `tanstack-start` | TanStack Start + the standalone CLI                                   |
 
 Additional flags:
 
@@ -101,12 +106,39 @@ Flags: `--provider <auth\|clerk\|auth0>`, `--yes`, `--from <dir>` (local registr
 
 Starts three concurrent processes: `wrangler dev` (Worker), the embedded
 Lunora studio, and codegen in watch mode. All three reload on file changes.
+In a project on `@lunora/vite` it spawns `vite dev` instead — the Vite plugin
+already runs the worker, studio, and codegen inside the Vite dev server.
 
 ```bash
 lunora dev                # default ports: studio 6173, worker 8787
 lunora dev --port 7000    # custom studio port
 lunora dev --no-studio    # Worker + codegen only
 ```
+
+#### Background mode (AI agents)
+
+`--background` starts the dev server as a managed detached process: the
+command blocks until the server accepts requests, prints the URL + PID, then
+returns. A state record at `.lunora/dev.json` acts as a lockfile — starting
+again while a server runs reports the existing instance instead of spawning a
+conflict, and `stop` / `status` / `logs` resolve the running instance from it.
+Every subcommand is idempotent: stopping when nothing runs succeeds silently.
+
+```bash
+lunora dev --background   # detach; blocks until ready, prints URL + PID
+lunora dev status         # URL, PID, uptime (add --json for a machine-readable doc)
+lunora dev logs           # captured output of a background run (--lines n, 0 = all)
+lunora dev stop           # SIGTERM, SIGKILL escalation after 10s; clears the record
+```
+
+When an AI coding agent is detected (Claude Code, Cursor, Codex, Gemini CLI,
+Cline, …) background mode and JSON logging turn on automatically — no flags
+needed in agent workflows. Set `LUNORA_AGENT_MODE=0` to opt out (or `=1` to
+force it). Agents can also poll `GET /_lunora/status` on the running worker —
+a public, secret-free health probe answering `{"ok":true}`.
+
+JSON log lines are available to everyone via `lunora dev --json` or
+`LUNORA_LOG_JSON=1`.
 
 ### `lunora deploy`
 

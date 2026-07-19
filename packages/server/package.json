@@ -1,6 +1,6 @@
 {
     "name": "@lunora/server",
-    "version": "1.0.0-alpha.5",
+    "version": "1.0.0-alpha.27",
     "description": "Server primitives for Lunora: defineSchema, defineTable, query, mutation, and action",
     "keywords": [
         "backend",
@@ -66,8 +66,8 @@
         "build:prod": "pnpm exec packem build --production",
         "lint:eslint": "eslint .",
         "lint:eslint:fix": "eslint . --fix",
-        "lint:prettier": "prettier --check .",
-        "lint:prettier:fix": "prettier --write .",
+        "lint:prettier": "prettier --check . --ignore-path ../../.prettierignore",
+        "lint:prettier:fix": "prettier --write . --ignore-path ../../.prettierignore",
         "lint:types": "tsc --noEmit",
         "test": "vitest run",
         "test:coverage": "vitest run --coverage",
@@ -77,8 +77,9 @@
         "fallow:health": "fallow health --score"
     },
     "dependencies": {
-        "@lunora/scheduler": "1.0.0-alpha.3",
-        "@lunora/values": "1.0.0-alpha.3",
+        "@lunora/errors": "1.0.0-alpha.5",
+        "@lunora/scheduler": "1.0.0-alpha.10",
+        "@lunora/values": "1.0.0-alpha.8",
         "drizzle-orm": "catalog:drizzle",
         "hono": "catalog:http"
     },

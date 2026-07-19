@@ -1,9 +1,19 @@
 /* eslint-disable no-secrets/no-secrets -- emitted builder source: the string fragments are framework API type names (e.g. "SchedulerDeclaration<Env>"), not credentials. */
+import { APP_METHOD_CAPABILITIES } from "./capabilities";
 import { GENERATED_HEADER } from "./emit";
-import type { JurisdictionIR } from "./ir";
+import type { IdentityIR, JurisdictionIR } from "./ir";
 
 /** Which capability methods the generated `defineApp` builder exposes — one flag per package-backed feature the app actually uses. */
 interface EmitAppOptions {
+    /**
+     * Inbound-email agents (`defineAgent({ onEmail })`) → wire the worker's
+     * top-level `email()` handler to `dispatchAgentEmail(...)` (from
+     * `@lunora/agent/inbound`), so received mail starts a durable run. Empty/absent
+     * ⇒ no wiring, byte-identical output for email-free (and agent-free) projects.
+     */
+    emailAgents?: ReadonlyArray<{ bindingName: string; exportName: string }>;
+    /** App depends on `@lunora/cloudflare-access` → emit `.access()` (wire the Cloudflare Access `resolveIdentity`, composed ahead of `@lunora/auth` when both are present). */
+    hasAccess: boolean;
     /** App uses `@lunora/ai` / `ctx.ai` → emit `.ai()` (override the Workers AI binding backing `ctx.ai`). */
     hasAi: boolean;
     /** App uses `@lunora/bindings/analytics` / `ctx.analytics` → emit `.analytics()` (override the dataset backing `ctx.analytics`). */
@@ -38,10 +48,23 @@ interface EmitAppOptions {
     hasVectors: boolean;
     /** App declares Cloudflare Workflows (`defineWorkflow`) → wire `options.workflowsClient` so the studio's workflow-instance proxy can reach the CF REST API. */
     hasWorkflow: boolean;
+    /** App uses `@lunora/x402/pay` / `ctx.x402` → emit `.x402()` (wire the agent-wallet pay rail). */
+    hasX402: boolean;
+    /** The single `defineIdentity(...)` contract in `lunora/identity.ts` (Plan 080) → import it as a VALUE and wire `options.identity`, so the runtime trust boundary validates every resolved identity before it becomes `ctx.auth`. `undefined` ⇒ no wiring, byte-identical output. */
+    identity?: IdentityIR;
     /** Schema declares `.jurisdiction("…")` → pin every DO the worker reaches (shards, fan-out, scheduler, containers) to the Cloudflare data-residency jurisdiction. */
     jurisdiction?: JurisdictionIR;
     /** Project depends on the unscoped `lunorash` umbrella → import the runtime via `lunorash/runtime` instead of `@lunora/runtime`. */
     useUmbrella: boolean;
+
+    /**
+     * Voice-enabled agents (`defineAgent({ voice: … })`) → wire
+     * `options.voiceAgents`, mapping each agent's export name to its `VOICE_*`
+     * Durable Object namespace binding so the runtime exposes
+     * `/_lunora/voice/&lt;exportName>`. Empty/absent ⇒ no wiring, byte-identical
+     * output for voice-free (and agent-free) projects.
+     */
+    voiceAgents?: ReadonlyArray<{ bindingName: string; exportName: string }>;
     /** An OpenAPI spec is emitted (`openapi.ts`) → wire `openApiSpec` into the worker. */
     wantsOpenApi: boolean;
     /** An OpenRPC spec is emitted (`openrpc.ts`) → wire `openRpcSpec` into the worker. */
@@ -55,37 +78,91 @@ interface EmitAppOptions {
  * `env.AI`/`env.KV`/… binding), while `vectors` / `hyperdrive` / `payment`
  * need explicit construction. Each method's parameter is derived from the
  * generated config type, so no per-capability type imports are needed.
- * `[flag, methodName, configKey, doc]`.
+ *
+ * Derived from the single {@link APP_METHOD_CAPABILITIES} table (so it can't
+ * drift from the usage probe / ctx-field seam) into the `[flag, methodName,
+ * configKey, doc]` shape the emitters below consume — the flag is the capability
+ * key's `has&lt;Capitalized>` option (`ai` → `hasAi`, `payments` → `hasPayments`).
  */
-const LONG_TAIL: ReadonlyArray<readonly [keyof EmitAppOptions, string, string, string]> = [
-    ["hasAi", "ai", "ai", "Override the Workers AI binding backing `ctx.ai` (defaults to `env.AI`)."],
-    ["hasAnalytics", "analytics", "analytics", "Override the Analytics Engine dataset backing `ctx.analytics` (defaults to `env.ANALYTICS`)."],
-    ["hasBrowser", "browser", "browser", "Override the Browser Rendering binding backing `ctx.browser` (defaults to `env.BROWSER`)."],
-    [
-        "hasHyperdrive",
-        "hyperdrive",
-        "sql",
-        "Wire the Hyperdrive SQL client backing `ctx.sql` — build it with `createHyperdrive` + `fromPostgresJs`/`fromNodePg`/`fromMysql2`.",
-    ],
-    ["hasImages", "images", "images", "Override the Images binding backing `ctx.images` (defaults to `env.IMAGES`)."],
-    ["hasKv", "kv", "kv", "Override the Workers KV binding backing `ctx.kv` (defaults to `env.KV`)."],
-    ["hasPayments", "payment", "payment", "Wire the payment options backing `ctx.payments`."],
-    [
-        "hasR2sql",
-        "r2sql",
-        "r2sql",
-        "Wire the R2 SQL client backing `ctx.r2sql` — build it with `createR2Sql({ accountId, apiToken, bucket })` (defaults to env `R2_SQL_TOKEN` / `R2_SQL_ACCOUNT_ID` / `R2_SQL_BUCKET`).",
-    ],
-    ["hasVectors", "vectors", "vectors", "Wire the Vectorize index map backing `ctx.vectors`."],
-];
+
+/**
+ * The capability key's `has&lt;Capitalized>` option name (`ai` → `hasAi`, `payments`
+ * → `hasPayments`). The internal `as` is a narrow, provably-correct cast — the
+ * runtime string equals the `has${Capitalize&lt;K>}` template; string methods just
+ * don't preserve the literal type. Correctness of the *flag* (that it names a real
+ * `EmitAppOptions` key) is enforced at {@link LONG_TAIL}'s type annotation below,
+ * not here — so a capability whose flag is missing from `EmitAppOptions` is a
+ * compile error rather than a silently dropped method.
+ */
+const hasFlagKey = <K extends string>(key: K): `has${Capitalize<K>}` => `has${key.charAt(0).toUpperCase()}${key.slice(1)}` as `has${Capitalize<K>}`;
+
+const LONG_TAIL: ReadonlyArray<readonly [keyof EmitAppOptions, string, string, string]> = APP_METHOD_CAPABILITIES.map(
+    ({ appMethod, key }): readonly [keyof EmitAppOptions, string, string, string] => [hasFlagKey(key), appMethod.method, appMethod.configKey, appMethod.doc],
+);
 
 /** Whether any long-tail (`shardExtras`-backed) capability method is emitted. */
 const hasAnyLongTail = (options: EmitAppOptions): boolean => LONG_TAIL.some(([flag]) => options[flag]);
 
+/**
+ * The `defineIdentity(...)` contract import — a VALUE (not `import type`) so it
+ * can be wired onto `options.identity` and actually validate at the runtime
+ * trust boundary. Namespace form mirrors `server.ts` so an arbitrary export name
+ * can never collide with a builder import. Empty when no contract is declared.
+ */
+const buildIdentityImports = (identity: IdentityIR | undefined): string[] => (identity ? [`import * as lunoraIdentityContract from "../identity.js";`] : []);
+
+/** `@lunora/cloudflare-access` imports — `composeResolvers` only when `@lunora/auth` also wires a resolver to fall back to. */
+const buildAccessImports = (hasAccess: boolean, hasAuth: boolean): string[] =>
+    hasAccess
+        ? [
+              `import type { CreateAccessResolverOptions } from "@lunora/cloudflare-access";`,
+              `import { createAccessResolver${hasAuth ? ", composeResolvers" : ""} } from "@lunora/cloudflare-access";`,
+          ]
+        : [];
+
+/** KV-browser import — the zero-config env-scanning introspector factory backing `createWorker({ kvIntrospector })`. */
+const buildKvImports = (hasKv: boolean): string[] => (hasKv ? [`import { createKvIntrospectorFromEnv } from "@lunora/bindings/kv";`] : []);
+
+/** Whether any `onEmail` agents were discovered (⇒ wire the worker `email()` handler). */
+const hasEmailAgents = (options: EmitAppOptions): boolean => (options.emailAgents?.length ?? 0) > 0;
+
+/**
+ * Inbound-email wiring imports: the `dispatchAgentEmail` factory (a VALUE from
+ * `@lunora/agent/inbound`) and the agent definitions as a namespace (so their
+ * `onEmail` mappers are reachable at runtime). Empty when no `onEmail` agent is
+ * declared, keeping email-free output byte-identical. `@lunora/agent` is an
+ * opt-in add-on the umbrella never re-exports, so this is unconditionally
+ * `@lunora/agent/inbound` regardless of `useUmbrella`.
+ */
+const buildInboundImports = (options: EmitAppOptions): string[] =>
+    hasEmailAgents(options) ? [`import { dispatchAgentEmail } from "@lunora/agent/inbound";`] : [];
+
+/**
+ * The agent-definitions namespace import — `import * as lunoraAgentDefinitions
+ * from "../agents.js"` — so each `onEmail` agent's mapper is reachable when the
+ * generated `email()` handler dispatches. Empty (byte-identical output) when no
+ * `onEmail` agent is declared.
+ */
+const buildAgentDefinitionsImport = (options: EmitAppOptions): string[] =>
+    hasEmailAgents(options) ? [`import * as lunoraAgentDefinitions from "../agents.js";`] : [];
+
 /** Import lines — only what the enabled capabilities need. Add-ons via `@lunora/*`; the runtime via the umbrella subpath when the app depends on `lunora`. */
 const buildImportLines = (options: EmitAppOptions): string[] => {
-    const { hasAuth, hasFramework, hasGlobal, hasHyperdriveGlobal, hasQueue, hasScheduler, hasStorage, hasWorkflow, useUmbrella, wantsOpenApi, wantsOpenRpc } =
-        options;
+    const {
+        hasAccess,
+        hasAuth,
+        hasFramework,
+        hasGlobal,
+        hasHyperdriveGlobal,
+        hasKv,
+        hasQueue,
+        hasScheduler,
+        hasStorage,
+        hasWorkflow,
+        useUmbrella,
+        wantsOpenApi,
+        wantsOpenRpc,
+    } = options;
     const runtimeModule = useUmbrella ? "lunorash/runtime" : "@lunora/runtime";
 
     const runtimeTypeImports = ["ExecutionContextLike", "LunoraWorker", "Route", "ScheduledControllerLike", "ShardNamespaceLike", "WorkerOptions"];
@@ -111,6 +188,7 @@ const buildImportLines = (options: EmitAppOptions): string[] => {
                   `import { createAuth, createAuthAdmin, ensureMigrated, handleAuthRequest, lunoraD1Adapter } from "@lunora/auth";`,
               ]
             : []),
+        ...buildAccessImports(hasAccess, hasAuth),
         ...(hasGlobal
             ? [
                   `import type { D1CtxDbOptions, D1DatabaseLike, D1Exec } from "@lunora/d1";`,
@@ -124,6 +202,7 @@ const buildImportLines = (options: EmitAppOptions): string[] => {
                   `import type { SqlCtxDbOptions, SqlExec } from "@lunora/sql-store";`,
               ]
             : []),
+        ...buildKvImports(hasKv),
         ...(hasScheduler
             ? [`import type { DurableObjectNamespaceLike } from "@lunora/scheduler";`, `import { createScheduler } from "@lunora/scheduler";`]
             : []),
@@ -131,13 +210,21 @@ const buildImportLines = (options: EmitAppOptions): string[] => {
             ? [`import type { R2BucketLike, Storage } from "@lunora/storage";`, `import { createBucketStorage, createStorage } from "@lunora/storage";`]
             : []),
         ...(hasWorkflow ? [`import { createWorkflowsRestClient } from "@lunora/workflow";`] : []),
+        ...buildInboundImports(options),
         `import type { ${[...runtimeTypeImports].toSorted((a, b) => a.localeCompare(b)).join(", ")} } from "${runtimeModule}";`,
         `import { ${runtimeValueImports} } from "${runtimeModule}";`,
         ``,
+        ...buildIdentityImports(options.identity),
+        ...buildAgentDefinitionsImport(options),
         ...(hasGlobal || hasHyperdriveGlobal ? [`import schema from "../schema.js";`] : []),
         `import { LUNORA_CRONS } from "./crons.js";`,
         `import { LUNORA_FUNCTIONS } from "./functions.js";`,
-        ...(hasQueue ? [`import { dispatchQueueBatch } from "@lunora/queue";`, `import { LUNORA_QUEUE_REGISTRY } from "./queues.js";`] : []),
+        ...(hasQueue
+            ? [
+                  `import { createQueueCaptureSink, dispatchQueueBatch, shouldCaptureQueue } from "@lunora/queue";`,
+                  `import { LUNORA_QUEUE_REGISTRY } from "./queues.js";`,
+              ]
+            : []),
         ...(wantsOpenApi ? [`import { openApiSpec } from "./openapi.js";`] : []),
         ...(wantsOpenRpc ? [`import { openRpcSpec } from "./openrpc.js";`] : []),
         `import { createShardDO } from "./shard.js";`,
@@ -211,9 +298,10 @@ interface AuthDeclaration<Env> {
 
 /** Builder instance fields (private state recorded by the fluent methods). */
 const buildFieldLines = (options: EmitAppOptions): string[] => [
+    ...(options.hasAccess ? [`    private accessSelector?: Selector<Env, CreateAccessResolverOptions>;`] : []),
     `    private adminToken?: Selector<Env, string>;`,
     ...(options.hasAuth ? [`    private authDeclaration?: AuthDeclaration<Env>;`] : []),
-    `    private readonly extendFns: ((env: Env) => Partial<WorkerOptions>)[] = [];`,
+    `    private readonly extendFns: ((env: Env, derived: Readonly<WorkerOptions>) => Partial<WorkerOptions>)[] = [];`,
     ...(options.hasGlobal ? [`    private globalDeclaration?: GlobalDeclaration<Env>;`] : []),
     ...(options.hasHyperdriveGlobal ? [`    private hyperdriveGlobalDeclaration?: HyperdriveGlobalDeclaration<Env>;`] : []),
     `    private readonly routeMap: Record<string, Route> = {};`,
@@ -236,6 +324,16 @@ const buildLongTailMethods = (options: EmitAppOptions): string[] =>
 
 /** Fluent capability methods (always-on ones plus the feature-gated ones). */
 const buildMethodBlocks = (options: EmitAppOptions): string[] => [
+    ...(options.hasAccess
+        ? [
+              `    /** Wire Cloudflare Access (Zero Trust) — verifies the \`Cf-Access-Jwt-Assertion\` JWT and feeds the identity into \`ctx.auth\` / RLS via \`resolveIdentity\`. When \`.auth(...)\` is also configured, Access is composed ahead of it (Access wins when its JWT is present; everyone else falls through to the app session). */
+    public access(selector: Selector<Env, CreateAccessResolverOptions>): this {
+        this.accessSelector = selector;
+
+        return this;
+    }`,
+          ]
+        : []),
     `    /** Bearer token gating the \`/_lunora/admin/*\` endpoints the studio calls. */
     public admin(selector: Selector<Env, string>): this {
         this.adminToken = selector;
@@ -252,8 +350,8 @@ const buildMethodBlocks = (options: EmitAppOptions): string[] => [
     }`,
           ]
         : []),
-    `    /** Escape hatch — merge raw \`WorkerOptions\` (anything not yet sugared) over the derived options at build time. */
-    public extend(fn: (env: Env) => Partial<WorkerOptions>): this {
+    `    /** Escape hatch — merge raw \`WorkerOptions\` (anything not yet sugared) over the derived options at build time. The second \`derived\` argument is a snapshot of the options assembled so far (after \`.auth(...)\` etc.), so you can compose rather than clobber — e.g. wrap \`derived.resolveIdentity\` instead of replacing it. */
+    public extend(fn: (env: Env, derived: Readonly<WorkerOptions>) => Partial<WorkerOptions>): this {
         this.extendFns.push(fn);
 
         return this;
@@ -447,6 +545,12 @@ const buildWorkerOptionLines = (options: EmitAppOptions): string[] => [
         }`,
           ]
         : []),
+    // The studio's KV browser is wired zero-config: `createKvIntrospectorFromEnv`
+    // scans `env` for every bound Workers KV namespace, so each `kv_namespaces`
+    // entry in wrangler.jsonc appears under its binding name (any name, any count)
+    // with no manual `createKvIntrospector` call. A deployment with no KV binding
+    // yields an empty namespace list rather than crashing.
+    ...(options.hasKv ? [`        options.kvIntrospector = createKvIntrospectorFromEnv(env);`] : []),
     ...(options.hasAuth
         ? [
               `        if (this.authDeclaration) {
@@ -472,12 +576,53 @@ const buildWorkerOptionLines = (options: EmitAppOptions): string[] => [
         }`,
           ]
         : []),
+    // Cloudflare Access — runs AFTER the auth block so it can compose ahead of
+    // the better-auth resolver rather than clobber it. With `.auth()` present,
+    // a request carrying a verified Access JWT is authenticated by Access and
+    // everyone else falls through to the app session; without it, Access is the
+    // sole resolver.
+    ...(options.hasAccess
+        ? [
+              options.hasAuth
+                  ? `        if (this.accessSelector) {
+            const accessResolver = createAccessResolver(this.accessSelector(env));
+            const fallback = options.resolveIdentity;
+
+            options.resolveIdentity = fallback ? composeResolvers(accessResolver, fallback) : accessResolver;
+        }`
+                  : `        if (this.accessSelector) {
+            options.resolveIdentity = createAccessResolver(this.accessSelector(env));
+        }`,
+          ]
+        : []),
+    // Voice-enabled agents: map each export name to its `VOICE_*` Durable Object
+    // namespace so the runtime serves `/_lunora/voice/<exportName>`. Read off
+    // `env` structurally (the binding is provisioned by the config layer's
+    // reconcile step, so it may not be on the generated `Env` type). Emitted only
+    // when at least one agent opted into voice — voice-free output is unchanged.
+    ...(options.voiceAgents && options.voiceAgents.length > 0
+        ? [
+              `        options.voiceAgents = {
+${options.voiceAgents
+    .map(
+        (agent) =>
+            `            ${JSON.stringify(agent.exportName)}: (env as Record<string, unknown>)[${JSON.stringify(agent.bindingName)}] as ShardNamespaceLike,`,
+    )
+    .join("\n")}
+        };`,
+          ]
+        : []),
 ];
 
 /** The `shardDO` + spec fields the worker always (or conditionally) carries. */
 const buildBaseWorkerOptions = (options: EmitAppOptions): string[] => [
     `            cronJobs: LUNORA_CRONS,`,
     `            functions: LUNORA_FUNCTIONS,`,
+    // The declared `defineIdentity(...)` contract — wires the runtime trust
+    // boundary so `wrapResolverWithContract` validates every resolved identity
+    // against it before it becomes `ctx.auth`. Emitted only when the app declares
+    // a contract, so apps without one keep unchanged output.
+    ...(options.identity ? [`            identity: lunoraIdentityContract.${options.identity.exportName},`] : []),
     // Schema `.jurisdiction("…")` pins every DO the worker reaches to the
     // Cloudflare data-residency region. Emitted only when declared, so apps
     // without it keep the un-pinned global namespace (and unchanged output).
@@ -487,11 +632,20 @@ const buildBaseWorkerOptions = (options: EmitAppOptions): string[] => [
     // The push-consumer handler backing the worker's `queue(batch, …)` entry:
     // routes each delivered batch to its `defineQueue` handler. Built from
     // `@lunora/queue` here (keeping the runtime decoupled) and wired only when the
-    // app declares push queues in `lunora/queues.ts`.
+    // app declares push queues in `lunora/queues.ts`. In a dev environment (or with
+    // `LUNORA_QUEUE_CAPTURE`), every consumed message is recorded into the studio's
+    // Queues log via the root shard's `recordQueueMessage` admin RPC.
     ...(options.hasQueue
         ? [
               `            queue: (batch: unknown, queueEnv: unknown, _context: ExecutionContextLike): Promise<void> =>`,
-              `                dispatchQueueBatch(batch as Parameters<typeof dispatchQueueBatch>[0], LUNORA_QUEUE_REGISTRY, { env: queueEnv as Record<string, unknown> }),`,
+              `                dispatchQueueBatch(batch as Parameters<typeof dispatchQueueBatch>[0], LUNORA_QUEUE_REGISTRY, {`,
+              `                    capture: shouldCaptureQueue(queueEnv as Record<string, unknown>)`,
+              `                        ? createQueueCaptureSink(queueEnv as Record<string, unknown>${
+                  options.jurisdiction ? `, { jurisdiction: ${JSON.stringify(options.jurisdiction)} }` : ""
+              })`,
+              `                        : undefined,`,
+              `                    env: queueEnv as Record<string, unknown>,`,
+              `                }),`,
           ]
         : []),
     `            routes: this.routeMap,`,
@@ -676,6 +830,22 @@ const emitApp = (options: EmitAppOptions): string => {
         : `        const buildWorker = (env: Env): LunoraWorker => createWorker(this.buildWorkerOptions(env, ${getAuthArgument}));`;
     const assembleParameter = options.hasFramework ? `host?: FrameworkHostHandler` : ``;
 
+    // Auto-wire the worker's `email()` handler for `defineAgent({ onEmail })`
+    // agents: received mail starts a durable run via `dispatchAgentEmail`
+    // (`@lunora/agent/inbound`). Emitted as the DEFAULT `composed.email`, ahead of
+    // the manual `.onEmail(...)` override below, so a hand-registered handler still
+    // wins. Empty when no `onEmail` agent is declared — email-free (and agent-free)
+    // output stays byte-identical.
+    const emailAgents = options.emailAgents ?? [];
+    const emailAgentsBlock =
+        emailAgents.length > 0
+            ? `        composed.email = dispatchAgentEmail([
+${emailAgents.map((agent) => `            { agent: lunoraAgentDefinitions.${agent.exportName}, binding: ${JSON.stringify(agent.bindingName)} },`).join("\n")}
+        ]);
+
+`
+            : "";
+
     // Public terminals: always `build()`; `.buildFrameworkWorker(host)` only when
     // a worker-composition framework adapter is a dependency.
     const buildTerminals = `    /** Materialise the standalone Cloudflare worker + \`ShardDO\` class. */
@@ -760,7 +930,7 @@ ${buildWorkerLine}
             }
         };
 
-        if (this.emailHandler) {
+${emailAgentsBlock}        if (this.emailHandler) {
             const handler = this.emailHandler;
 
             composed.email = (message, rawEnv, context) => handler(rawEnv as Env)(message, rawEnv, context);
@@ -780,7 +950,7 @@ ${buildBaseWorkerOptions(options).join("\n")}
         }
 
 ${workerOptionLines.join("\n\n")}${workerOptionLines.length > 0 ? "\n\n" : ""}        for (const fn of this.extendFns) {
-            Object.assign(options, fn(env));
+            Object.assign(options, fn(env, { ...options }));
         }
 
         return options;

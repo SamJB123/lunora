@@ -1,3 +1,5 @@
+import { createRequire } from "node:module";
+
 import { cloudflare } from "@cloudflare/vite-plugin";
 import errorOverlayPlugin from "@visulima/vite-overlay";
 import type { Plugin } from "vite";
@@ -5,12 +7,13 @@ import type { Plugin } from "vite";
 import agentRulesHintPlugin from "./agent-rules-hint-plugin";
 import codegenPlugin from "./codegen-plugin";
 import containerLogsPlugin from "./container-logs-plugin";
+import devStatePlugin from "./dev-state-plugin";
 import devVariablesPlugin from "./dev-variables-plugin";
 import { createCommandProbe, withDevWorkerEnv } from "./dev-worker-env";
 import { frameworkComposePlugin } from "./framework-compose-plugin";
 import { createPluginContext, frameworkDetectPlugin } from "./framework-detect-plugin";
 import logStreamPlugin from "./log-stream-plugin";
-import { planViteRemoteBindings, remoteBindingsCleanupPlugin, withRemoteBindings } from "./remote-bindings-plugin";
+import { planViteRemoteBindings, remoteBindingsCleanupPlugin, remoteBindingsConfigPlugin } from "./remote-bindings-plugin";
 import { lunoraSolutionFinders } from "./solution-finders";
 import { studioPlugin } from "./studio-plugin";
 import type { CloudflarePluginOptions, LunoraPluginOptions, LunoraPlugins, OverlayPluginOptions, ResolvedLunoraPluginOptions } from "./types";
@@ -61,6 +64,7 @@ const resolveOptions = (options: LunoraPluginOptions | undefined): ResolvedLunor
     }
 
     return {
+        allowUnauthenticatedShardAccess: input.allowUnauthenticatedShardAccess ?? false,
         apiSpec: input.apiSpec ?? "openapi",
         cloudflare: cloudflareOption,
         studio: input.studio ?? true,
@@ -110,6 +114,9 @@ const lunora = (options?: LunoraPluginOptions): LunoraPlugins => {
         devVariablesPlugin(resolved),
         codegenPlugin(resolved),
         logStreamPlugin(),
+        // Registers the running dev server in `.lunora/dev.json` so
+        // `lunora dev --background|stop|status|logs` manage Vite projects too.
+        devStatePlugin(resolved),
         agentRulesHintPlugin(resolved),
     ];
 
@@ -137,12 +144,22 @@ const lunora = (options?: LunoraPluginOptions): LunoraPlugins => {
         // point the cloudflare plugin's `configPath` at it. DO shards stay local.
         const remotePlan = planViteRemoteBindings({ projectRoot: resolved.projectRoot });
 
-        if (remotePlan.enabled && remotePlan.configPath !== undefined) {
-            // Register a cleanup that unlinks the temp config when the dev server closes.
-            plugins.push(remoteBindingsCleanupPlugin(remotePlan.cleanup));
-        }
+        // The dev worker env var (`WORKER_ENV=development`) is deferred correctly
+        // inside its own `config` customizer; the remote `configPath` injection is
+        // deferred to `remoteBindingsConfigPlugin`'s `config` hook below (the
+        // resolved `serve`/`build` command is unknown at this factory-time call).
+        const cloudflareOptions = withDevWorkerEnv(resolved.cloudflare, isServe);
 
-        const cloudflareOptions = withRemoteBindings(withDevWorkerEnv(resolved.cloudflare, isServe), isServe, remotePlan);
+        if (remotePlan.enabled) {
+            if (remotePlan.configPath !== undefined) {
+                // Register a cleanup that unlinks the temp config when the dev server closes.
+                plugins.push(remoteBindingsCleanupPlugin(remotePlan.cleanup));
+            }
+
+            // Injects `configPath` at hook time (serve only) by mutating
+            // `cloudflareOptions` in place before the cloudflare plugin reads it.
+            plugins.push(remoteBindingsConfigPlugin(cloudflareOptions, remotePlan));
+        }
 
         // Wrap the Cloudflare plugins' startup hooks so a Worker-entry evaluation
         // failure (e.g. a circular import in `lunora/`) surfaces an actionable
@@ -153,7 +170,11 @@ const lunora = (options?: LunoraPluginOptions): LunoraPlugins => {
     return plugins;
 };
 
-const VERSION = "0.0.0";
+// Read the real published version from the package manifest at load time rather
+// than a hardcoded `"0.0.0"` (which lied to anyone introspecting the plugin for
+// support diagnostics). `../package.json` resolves to this package's manifest
+// from both `src/index.ts` (tsc/vitest) and the bundled `dist/index.mjs`.
+const VERSION: string = (createRequire(import.meta.url)("../package.json") as { version: string }).version;
 
 export { default as codegenPlugin } from "./codegen-plugin";
 export { default as containerLogsPlugin } from "./container-logs-plugin";
@@ -161,6 +182,7 @@ export type { ReconcileResult } from "./cron-sync";
 export { reconcileWranglerCrons } from "./cron-sync";
 export type { DetectedFramework, FrameworkClass, FrameworkDetection } from "./detect-framework";
 export { detectFramework } from "./detect-framework";
+export { default as devStatePlugin } from "./dev-state-plugin";
 export { default as devVariablesPlugin } from "./dev-variables-plugin";
 export { createCommandProbe, DEV_WORKER_ENV_VALUE, DEV_WORKER_ENV_VAR, withDevWorkerEnv } from "./dev-worker-env";
 // Class-A composition surface. `LUNORA_WORKER_VIRTUAL_ID` is the virtual entry a
@@ -170,13 +192,16 @@ export { createCommandProbe, DEV_WORKER_ENV_VALUE, DEV_WORKER_ENV_VAR, withDevWo
 // `isAutoComposable` / `CLASS_A_WIRING` are exported for the CLI + tests.
 export type { ClassAWiring } from "./framework-compose-plugin";
 export { buildWorkerEntrySource, CLASS_A_WIRING, frameworkComposePlugin, isAutoComposable, LUNORA_WORKER_VIRTUAL_ID } from "./framework-compose-plugin";
+// The custom HMR event the codegen plugin sends on the client environment's hot
+// channel after a successful codegen run (in place of a blanket browser reload).
+export { default as LUNORA_API_UPDATED_EVENT } from "./hmr-events";
 // `framework-detect-plugin` (the `LunoraPluginContext` bag + `createPluginContext`
 // + the plugin itself) stays internal plumbing — it is wired into `lunora()`
 // here and consumed only there + in tests until a second reader (PLAN4 M4
 // composition) justifies a public surface. Only `detectFramework` (above) is public.
 export { default as logStreamPlugin } from "./log-stream-plugin";
 export type { PlanViteRemoteOptions, ViteRemotePlan } from "./remote-bindings-plugin";
-export { planViteRemoteBindings, remoteBindingsCleanupPlugin, withRemoteBindings } from "./remote-bindings-plugin";
+export { planViteRemoteBindings, remoteBindingsCleanupPlugin, remoteBindingsConfigPlugin, withRemoteBindings } from "./remote-bindings-plugin";
 // The error→solution rule table itself lives in `@lunora/codegen` (shared with
 // the standalone `lunora dev` CLI); `@lunora/vite` only wraps it as an overlay
 // finder. Import `findLunoraSolution` / `LUNORA_SOLUTION_RULES` from `@lunora/codegen`.

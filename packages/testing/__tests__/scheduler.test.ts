@@ -1,9 +1,9 @@
 import { defineSchema, defineTable, initLunora, v } from "@lunora/server";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { lunoraTest } from "../src/index";
 
-const { internalMutation, mutation, query } = initLunora.dataModel().create();
+const { internalAction, internalMutation, mutation, query } = initLunora.dataModel().create();
 
 const schema = defineSchema({
     log: defineTable({
@@ -24,8 +24,46 @@ const scheduleAppendAt = mutation
     .input({ atMs: v.number(), message: v.string() })
     .mutation(({ args, ctx }) => ctx.scheduler.runAt(args.atMs, "log:appendLog", { message: args.message }));
 
+/** Mutation that schedules `appendLog` relative to `ctx.now` (the harness's virtual clock). */
+const scheduleRelativeToNow = mutation
+    .input({ delayMs: v.number(), message: v.string() })
+    .mutation(({ args, ctx }) => ctx.scheduler.runAt(ctx.now + args.delayMs, "log:appendLog", { message: args.message }));
+
+/**
+ * Internal mutation that cancels every pending `log:appendLog` job — used as a
+ * scheduled job that cancels a sibling job due in the same sweep.
+ */
+const cancelPendingAppends = internalMutation.mutation(async ({ ctx }) => {
+    const jobs = await ctx.scheduler.list();
+
+    for (const job of jobs) {
+        if (job.functionPath === "log:appendLog") {
+            // eslint-disable-next-line no-await-in-loop -- sequential cancels over a small snapshot; ordering is irrelevant
+            await ctx.scheduler.cancel(job.id);
+        }
+    }
+});
+
 /** Mutation that schedules the throwing batch via ctx.scheduler.runAfter. */
 const scheduleThrow = mutation.mutation(({ ctx }) => ctx.scheduler.runAfter(0, "log:appendThenThrow", {}));
+
+/**
+ * Internal action that calls `ctx.fetch` and then writes the response status via
+ * `ctx.runMutation` — used as a scheduled target to prove the fake scheduler
+ * dispatches a scheduled **action** with a real `ActionCtx` (`ctx.fetch` and
+ * `ctx.runMutation` both available), not the `MutationCtx` it used to hand every
+ * scheduled job regardless of kind.
+ */
+const pingViaFetch = internalAction.input({ url: v.string() }).action(async ({ args, ctx }) => {
+    const response = await ctx.fetch(args.url);
+
+    await ctx.runMutation(appendLog, { message: `status:${String(response.status)}` });
+});
+
+/** Mutation that schedules `pingViaFetch` via ctx.scheduler.runAfter. */
+const scheduleFetchPing = mutation
+    .input({ delayMs: v.number(), url: v.string() })
+    .mutation(({ args, ctx }) => ctx.scheduler.runAfter(args.delayMs, "log:pingViaFetch", { url: args.url }));
 
 /** Mutation that cancels a job by id. */
 const cancelJob = mutation.input({ id: v.string() }).mutation(({ args, ctx }) => ctx.scheduler.cancel(args.id));
@@ -67,12 +105,23 @@ const functions = {
     "log:appendLog": appendLog,
     "log:appendOrThrow": appendOrThrow,
     "log:appendThenThrow": appendThenThrow,
+    "log:cancelPendingAppends": cancelPendingAppends,
+    "log:pingViaFetch": pingViaFetch,
 };
 
 const open: ReturnType<typeof lunoraTest>[] = [];
 
 const start = (): ReturnType<typeof lunoraTest> => {
     const t = lunoraTest(schema, { functions });
+
+    open.push(t);
+
+    return t;
+};
+
+/** Same as {@link start}, but injects `options.fetch` for scheduled-action tests. */
+const startWithFetch = (fetchImpl: typeof globalThis.fetch): ReturnType<typeof lunoraTest> => {
+    const t = lunoraTest(schema, { fetch: fetchImpl, functions });
 
     open.push(t);
 
@@ -185,6 +234,56 @@ describe("fake scheduler", () => {
         const log = await t.query(readLog, {});
 
         expect(log).toHaveLength(0);
+    });
+
+    it("does not execute a job cancelled by an earlier job in the same sweep", async () => {
+        expect.assertions(3);
+
+        const t = start();
+
+        // Enqueue the canceller FIRST so it dispatches before the target within the
+        // sweep, then the appendLog target. Both are due at 0.
+        await t.run(async (ctx) => {
+            await ctx.scheduler.runAfter(0, "log:cancelPendingAppends", {});
+            await ctx.scheduler.runAfter(0, "log:appendLog", { message: "should-not-run" });
+        });
+
+        const executed = await t.scheduler.runPending();
+
+        // Only the canceller ran; the appendLog job was removed mid-sweep and skipped
+        // (its handler must not run, honouring cancel's `{ cancelled: true }`), so it
+        // is not counted as executed either.
+        expect(executed).toBe(1);
+        expect(t.scheduler.list()).toHaveLength(0);
+
+        await expect(t.query(readLog, {})).resolves.toHaveLength(0);
+    });
+
+    it("seeds the virtual clock from options.now so ctx.now-relative scheduling is deterministic", async () => {
+        expect.assertions(3);
+
+        // A fixed `now` far below the wall clock. Before the fix the scheduler seeded
+        // its virtual clock from Date.now() (~2026) while ctx.now was this value
+        // (~2023), so a `runAt(ctx.now + delay)` job sat far below virtual now and
+        // advance(1) fired it immediately.
+        const fixedNow = 1_700_000_000_000;
+        const t = lunoraTest(schema, { functions, now: fixedNow });
+
+        open.push(t);
+
+        await t.mutation(scheduleRelativeToNow, { delayMs: 60_000, message: "relative" });
+
+        // Advancing less than the delay must NOT fire it.
+        const early = await t.scheduler.advance(1);
+
+        expect(early).toBe(0);
+
+        // Advancing past the delay fires it.
+        const late = await t.scheduler.advance(60_000);
+
+        expect(late).toBe(1);
+
+        await expect(t.query(readLog, {})).resolves.toHaveLength(1);
     });
 
     it("cancel returns cancelled: false for an unknown id", async () => {
@@ -369,6 +468,28 @@ describe("fake scheduler", () => {
 
         expect(failures).toHaveLength(2);
         expect(failures.map((f) => (f.error as Error).message).toSorted((a, b) => a.localeCompare(b))).toEqual(["boom:boom-a", "boom:boom-b"]);
+    });
+
+    it("dispatches a scheduled action with a real ActionCtx — ctx.fetch (injected via options.fetch) is reachable, not a MutationCtx", async () => {
+        expect.assertions(3);
+
+        const fakeFetch = vi.fn<typeof globalThis.fetch>().mockResolvedValue(Response.json({ ok: true }, { status: 200 }));
+
+        const t = startWithFetch(fakeFetch);
+
+        await t.mutation(scheduleFetchPing, { delayMs: 0, url: "https://example.test/scheduled-ping" });
+
+        // Before the fix, dispatchJob always handed the fake scheduler's
+        // mutationContext to the handler — a scheduled action calling ctx.fetch
+        // would throw `ctx.fetch is not a function` here.
+        const executed = await t.scheduler.runPending();
+
+        expect(executed).toBe(1);
+        expect(fakeFetch).toHaveBeenCalledWith("https://example.test/scheduled-ping");
+
+        const log = await t.query(readLog, {});
+
+        expect(log).toMatchObject([{ message: "status:200" }]);
     });
 
     it("with throwOnError: false the sweep resolves and failures are observable via failures()", async () => {

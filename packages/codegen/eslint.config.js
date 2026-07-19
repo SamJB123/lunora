@@ -20,6 +20,14 @@ export default createConfig(
             "**/_generated/**",
             "**/__fixtures__/**",
             "**/fixtures/**",
+            // Throwaway design-spike scripts (see plans/131-phase0-design.md) — not
+            // part of the package's build or public API, and deliberately outside
+            // tsconfig.json's `include` (they self-import the package's own BUILT
+            // public entry, which needs no `paths` hack precisely because they're
+            // never part of the tsc program). Type-aware linting can't parse a file
+            // outside the project program, so skip linting them entirely rather than
+            // widen the tsconfig to bring them back in.
+            "**/scripts/**",
             "**/test-results/**",
             "**/coverage/**",
             "**/.wrangler/**",

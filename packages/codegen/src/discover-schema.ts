@@ -1,8 +1,9 @@
+import { LunoraError } from "@lunora/errors";
 import type { CallExpression, Expression, Node as TsNode, ObjectLiteralExpression, Project, SourceFile } from "ts-morph";
 import { Node, SyntaxKind } from "ts-morph";
 
 import { diagnosticAt } from "./diagnostics";
-import type { IndexIR, RankIndexIR, RankSortKeyIR, RelationIR, SchemaIR, SearchIndexIR, TableIR, ValidatorIR, VectorIndexIR } from "./ir";
+import type { ExternalSourceIR, IndexIR, RankIndexIR, RankSortKeyIR, RelationIR, SchemaIR, SearchIndexIR, TableIR, ValidatorIR, VectorIndexIR } from "./ir";
 import { parseObjectShape } from "./parse-validator";
 import { resolvePackageExtension } from "./resolve-package-extension";
 
@@ -309,8 +310,10 @@ const parseGlobalBackend = (args: ReadonlyArray<Node>): TableIR["globalBackend"]
 /** Accumulator the builder-chain walk mutates as it unwinds a `defineTable(...)` chain. */
 interface TableBuilderAccumulator {
     externallyManaged: boolean;
+    externalSource?: ExternalSourceIR;
     globalBackend?: TableIR["globalBackend"];
     indexes: IndexIR[];
+    isPublic: boolean;
     rankIndexes: RankIndexIR[];
     relations: RelationIR[];
     searchIndexes: SearchIndexIR[];
@@ -336,6 +339,74 @@ const softDeleteFieldOf = (optionsArgument: Node | undefined): string => {
     return "deletedAt";
 };
 
+/** Read a string-literal property off an object literal, or `undefined` when absent/non-literal. */
+const stringPropertyOf = (object: ObjectLiteralExpression, property: string): string | undefined => {
+    const node = object.getProperty(property);
+
+    if (node && Node.isPropertyAssignment(node)) {
+        const initializer = node.getInitializer();
+
+        if (initializer && Node.isStringLiteral(initializer)) {
+            return initializer.getLiteralText();
+        }
+    }
+
+    return undefined;
+};
+
+/** Read a string-array-literal property off an object literal, or `undefined`. */
+const stringArrayPropertyOf = (object: ObjectLiteralExpression, property: string): string[] | undefined => {
+    const node = object.getProperty(property);
+
+    if (node && Node.isPropertyAssignment(node)) {
+        const initializer = node.getInitializer();
+
+        if (initializer && Node.isArrayLiteralExpression(initializer)) {
+            const items = initializer
+                .getElements()
+                .filter((element) => Node.isStringLiteral(element))
+                .map((element) => element.getLiteralText());
+
+            return items.length > 0 ? items : undefined;
+        }
+    }
+
+    return undefined;
+};
+
+/**
+ * Parse a `.source({ ... })` call into {@link ExternalSourceIR} — the
+ * statically-knowable bits only. `map`/`tenantBy` are functions, so only their
+ * presence is recorded (`hasTenantBy`/`hasReconcile`/`hasSoftDelete`);
+ * `binding`/`query`/`idColumn`/`mode`/`columns` are read when they are string (or
+ * string-array) literals.
+ *
+ * When the argument is **not** a static object literal (e.g. `.source(buildConfig())`),
+ * the fields can't be read — but the source still exists, so we return an
+ * `unanalyzable` sentinel rather than `undefined`. Returning `undefined` here would
+ * make a dynamic source indistinguishable from no `.source()` at all, silently
+ * dropping it from `hasSourcedTables` (no poll override emitted) and from the
+ * `external_source_unscoped` / `external_source_on_global` security lints.
+ */
+const parseSourceCall = (args: ReadonlyArray<Node>): ExternalSourceIR => {
+    const first = args[0];
+
+    if (!first || !Node.isObjectLiteralExpression(first)) {
+        return { binding: "", hasTenantBy: false, unanalyzable: true };
+    }
+
+    return {
+        binding: stringPropertyOf(first, "binding") ?? "",
+        columns: stringArrayPropertyOf(first, "columns"),
+        hasReconcile: first.getProperty("reconcileEveryMs") !== undefined,
+        hasSoftDelete: first.getProperty("softDeleteColumn") !== undefined,
+        hasTenantBy: first.getProperty("tenantBy") !== undefined,
+        idColumn: stringPropertyOf(first, "idColumn"),
+        mode: stringPropertyOf(first, "mode"),
+        query: stringPropertyOf(first, "query"),
+    };
+};
+
 /** Apply one chained method call (`.index`, `.shardBy`, …) to the accumulator. */
 const applyTableMethod = (accumulator: TableBuilderAccumulator, method: string, args: ReadonlyArray<Node>, name: string): void => {
     switch (method) {
@@ -354,6 +425,12 @@ const applyTableMethod = (accumulator: TableBuilderAccumulator, method: string, 
 
         case "index": {
             accumulator.indexes.push(parseIndexCall(args));
+
+            break;
+        }
+
+        case "public": {
+            accumulator.isPublic = true;
 
             break;
         }
@@ -396,6 +473,16 @@ const applyTableMethod = (accumulator: TableBuilderAccumulator, method: string, 
             break;
         }
 
+        case "source": {
+            // `.source({ ... })` — capture the statically-knowable config and, like
+            // the runtime builder, imply `.externallyManaged()` (rows come from the
+            // ingest loop, not a discoverable `ctx.db.insert`).
+            accumulator.externalSource = parseSourceCall(args);
+            accumulator.externallyManaged = true;
+
+            break;
+        }
+
         case "vectorize": {
             const vectorIndex = parseVectorizeCall(args, name);
 
@@ -416,6 +503,7 @@ const parseTableBuilder = (expression: Expression, name: string): TableIR => {
     const accumulator: TableBuilderAccumulator = {
         externallyManaged: false,
         indexes: [],
+        isPublic: false,
         rankIndexes: [],
         relations: [],
         searchIndexes: [],
@@ -457,8 +545,10 @@ const parseTableBuilder = (expression: Expression, name: string): TableIR => {
 
     return {
         externallyManaged: accumulator.externallyManaged,
+        externalSource: accumulator.externalSource,
         globalBackend: accumulator.shardMode === "global" ? (accumulator.globalBackend ?? "d1") : undefined,
         indexes: accumulator.indexes,
+        isPublic: accumulator.isPublic,
         name,
         rankIndexes: accumulator.rankIndexes,
         relations: accumulator.relations,
@@ -931,18 +1021,23 @@ const extendCallsOf = (defineSchemaCall: CallExpression): CallExpression[] => {
     return calls;
 };
 
-/** Recognised Cloudflare DO data-residency jurisdictions — the literals a `.jurisdiction("…")` call may carry. */
-const JURISDICTIONS = new Set<SchemaIR["jurisdiction"]>(["eu", "fedramp", "us"]);
-
 /**
- * Walk the builder chain wrapping a `defineSchema(...)` call for a
- * `.jurisdiction("…")` link and return its string-literal argument. Mirrors
- * {@link extendCallsOf}'s parent-walk so the call is found regardless of where
- * it sits in the chain (`defineSchema(...).rls(...).jurisdiction("us").extend(...)`).
- * Returns `undefined` when absent; throws on an unrecognised literal so a typo
- * fails loudly rather than emitting an invalid jurisdiction.
+ * Walk the builder chain wrapping `defineSchemaCall` for a `.&lt;methodName>("literal")`
+ * link and return its validated string-literal argument, or `undefined` when the
+ * method is absent from the chain (found regardless of where it sits, e.g.
+ * `defineSchema(...).rls("required").jurisdiction("us").extend(...)`). Shared by
+ * {@link jurisdictionOf} and {@link rlsModeOf}, which differ only in the method
+ * name, the allowed-literal `Set`, and the diagnostic phrasing. Throws (via
+ * {@link diagnosticAt}) on a non-literal argument or an unrecognised literal, so a
+ * typo fails loudly rather than silently mis-modelling the schema.
  */
-const jurisdictionOf = (defineSchemaCall: CallExpression): SchemaIR["jurisdiction"] => {
+const chainedStringLiteralArgument = <T extends string>(
+    defineSchemaCall: CallExpression,
+    methodName: string,
+    noun: string,
+    allowed: ReadonlySet<T>,
+    expected: string,
+): T | undefined => {
     let current: TsNode = defineSchemaCall;
 
     for (;;) {
@@ -958,17 +1053,17 @@ const jurisdictionOf = (defineSchemaCall: CallExpression): SchemaIR["jurisdictio
             break;
         }
 
-        if (parent.getName() === "jurisdiction") {
+        if (parent.getName() === methodName) {
             const argument = callParent.getArguments()[0];
 
             if (!argument || !Node.isStringLiteral(argument)) {
-                throw diagnosticAt(callParent, '`.jurisdiction(...)` expects a string literal ("eu", "us", or "fedramp")');
+                throw diagnosticAt(callParent, `\`.${methodName}(...)\` expects a string literal (${expected})`);
             }
 
-            const value = argument.getLiteralText() as SchemaIR["jurisdiction"];
+            const value = argument.getLiteralText() as T;
 
-            if (!JURISDICTIONS.has(value)) {
-                throw diagnosticAt(argument, `unknown jurisdiction ${JSON.stringify(value)} — expected "eu", "us", or "fedramp"`);
+            if (!allowed.has(value)) {
+                throw diagnosticAt(argument, `unknown ${noun} ${JSON.stringify(value)} — expected ${expected}`);
             }
 
             return value;
@@ -979,6 +1074,30 @@ const jurisdictionOf = (defineSchemaCall: CallExpression): SchemaIR["jurisdictio
 
     return undefined;
 };
+
+/** Recognised Cloudflare DO data-residency jurisdictions — the literals a `.jurisdiction("…")` call may carry. */
+const JURISDICTIONS = new Set<NonNullable<SchemaIR["jurisdiction"]>>(["eu", "fedramp", "us"]);
+
+/**
+ * The `.jurisdiction("…")` link's literal on the chain wrapping a `defineSchema(...)`
+ * call (`defineSchema(...).rls(...).jurisdiction("us").extend(...)`), or `undefined`
+ * when absent. Throws on an unrecognised literal so a typo fails loudly rather than
+ * emitting an invalid jurisdiction. See {@link chainedStringLiteralArgument}.
+ */
+const jurisdictionOf = (defineSchemaCall: CallExpression): SchemaIR["jurisdiction"] =>
+    chainedStringLiteralArgument(defineSchemaCall, "jurisdiction", "jurisdiction", JURISDICTIONS, '"eu", "us", or "fedramp"');
+
+/** Recognised `.rls(...)` mode literals — currently only `"required"`. */
+const RLS_MODES = new Set<NonNullable<SchemaIR["rlsMode"]>>(["required"]);
+
+/**
+ * The `.rls("required")` link's literal on the chain wrapping a `defineSchema(...)`
+ * call (`defineSchema(...).rls("required").extend(...)`), or `undefined` when absent.
+ * Throws on an unrecognised literal so a typo fails loudly rather than silently
+ * treating the schema as RLS-unenforced. See {@link chainedStringLiteralArgument}.
+ */
+const rlsModeOf = (defineSchemaCall: CallExpression): SchemaIR["rlsMode"] =>
+    chainedStringLiteralArgument(defineSchemaCall, "rls", "rls mode", RLS_MODES, '"required"');
 
 /** Parse the base `defineSchema({ table: defineTable(...) })` object literal into {@link TableIR}s. */
 const parseBaseTables = (object: ObjectLiteralExpression): TableIR[] => {
@@ -1053,7 +1172,7 @@ const discoverSchema = (project: Project, schemaPath: string, projectRoot?: stri
     });
 
     if (!defineSchemaCall) {
-        throw new Error(`defineSchema() not found in ${schemaPath}`);
+        throw new LunoraError("INTERNAL", `defineSchema() not found in ${schemaPath}`);
     }
 
     const argument = defineSchemaCall.getArguments()[0];
@@ -1077,7 +1196,7 @@ const discoverSchema = (project: Project, schemaPath: string, projectRoot?: stri
     // plus extension-contributed standalone vector indexes.
     const vectorIndexes: VectorIndexIR[] = [...tables.flatMap((table) => table.vectorIndexes), ...standaloneVectorIndexes, ...extensionStandaloneVectorIndexes];
 
-    return { jurisdiction: jurisdictionOf(defineSchemaCall), tables, vectorIndexes };
+    return { jurisdiction: jurisdictionOf(defineSchemaCall), rlsMode: rlsModeOf(defineSchemaCall), tables, vectorIndexes };
 };
 
 export default discoverSchema;

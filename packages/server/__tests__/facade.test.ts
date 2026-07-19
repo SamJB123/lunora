@@ -1,3 +1,4 @@
+import { LunoraError } from "@lunora/errors";
 import { describe, expect, it, vi } from "vitest";
 
 import type { FacadeWriterLike } from "../src/facade";
@@ -11,37 +12,41 @@ import { bindTableFacade } from "../src/facade";
  * onto the writer's `{ id, patch }` shape.
  */
 const makeWriter = () => {
-    const deleteMany = vi.fn();
-    const patchMany = vi.fn();
-    const insertMany = vi.fn();
-    const deleteOne = vi.fn();
-    const patchOne = vi.fn();
+    const deleteMany = vi.fn<NonNullable<FacadeWriterLike["deleteMany"]>>();
+    const deleteWhere = vi.fn<NonNullable<FacadeWriterLike["deleteWhere"]>>();
+    const patchMany = vi.fn<NonNullable<FacadeWriterLike["patchMany"]>>();
+    const patchWhere = vi.fn<NonNullable<FacadeWriterLike["patchWhere"]>>();
+    const insertMany = vi.fn<NonNullable<FacadeWriterLike["insertMany"]>>();
+    const deleteOne = vi.fn<FacadeWriterLike["delete"]>();
+    const patchOne = vi.fn<FacadeWriterLike["patch"]>();
 
     const writer = {
-        aggregate: vi.fn(),
-        count: vi.fn(),
+        aggregate: vi.fn<FacadeWriterLike["aggregate"]>(),
+        count: vi.fn<FacadeWriterLike["count"]>(),
         delete: deleteOne,
         deleteMany,
-        findFirst: vi.fn(),
-        findFirstOrThrow: vi.fn(),
-        findMany: vi.fn(),
-        get: vi.fn(),
-        groupBy: vi.fn(),
-        insert: vi.fn(),
+        deleteWhere,
+        findFirst: vi.fn<FacadeWriterLike["findFirst"]>(),
+        findFirstOrThrow: vi.fn<FacadeWriterLike["findFirstOrThrow"]>(),
+        findMany: vi.fn<FacadeWriterLike["findMany"]>(),
+        get: vi.fn<FacadeWriterLike["get"]>(),
+        groupBy: vi.fn<FacadeWriterLike["groupBy"]>(),
+        insert: vi.fn<FacadeWriterLike["insert"]>(),
         insertMany,
         patch: patchOne,
         patchMany,
-        query: vi.fn(),
-        rank: vi.fn(),
-        rankPage: vi.fn(),
-        replace: vi.fn(),
+        patchWhere,
+        query: vi.fn<FacadeWriterLike["query"]>(),
+        rank: vi.fn<FacadeWriterLike["rank"]>(),
+        rankPage: vi.fn<FacadeWriterLike["rankPage"]>(),
+        replace: vi.fn<FacadeWriterLike["replace"]>(),
     } as unknown as FacadeWriterLike;
 
-    return { deleteMany, deleteOne, entry: bindTableFacade(writer, "messages"), insertMany, patchMany, patchOne };
+    return { deleteMany, deleteOne, deleteWhere, entry: bindTableFacade(writer, "messages"), insertMany, patchMany, patchOne, patchWhere };
 };
 
 describe("bindTableFacade — per-table batch forms", () => {
-    it("deleteMany forwards the bound table as expectedTable", async () => {
+    it("deleteMany(ids) forwards the bound table as expectedTable", async () => {
         expect.assertions(1);
 
         const { deleteMany, entry } = makeWriter();
@@ -51,7 +56,17 @@ describe("bindTableFacade — per-table batch forms", () => {
         expect(deleteMany).toHaveBeenCalledWith(["a", "b"], { limit: 5 }, "messages");
     });
 
-    it("patchMany maps `values` to `{ id, patch }` and forwards the bound table", async () => {
+    it("deleteMany({ where }) routes to the writer's deleteWhere with the bound table", async () => {
+        expect.assertions(1);
+
+        const { deleteWhere, entry } = makeWriter();
+
+        await entry.deleteMany({ where: { authorId: "a1" } });
+
+        expect(deleteWhere).toHaveBeenCalledWith("messages", { authorId: "a1" }, { limit: undefined });
+    });
+
+    it("patchMany([...]) maps `values` to `{ id, patch }` and forwards the bound table", async () => {
         expect.assertions(1);
 
         const { entry, patchMany } = makeWriter();
@@ -59,6 +74,16 @@ describe("bindTableFacade — per-table batch forms", () => {
         await entry.patchMany([{ id: "a", values: { body: "x" } }], { limit: 5 });
 
         expect(patchMany).toHaveBeenCalledWith([{ id: "a", patch: { body: "x" } }], { limit: 5 }, "messages");
+    });
+
+    it("patchMany({ where, values }) routes to the writer's patchWhere with the bound table", async () => {
+        expect.assertions(1);
+
+        const { entry, patchWhere } = makeWriter();
+
+        await entry.patchMany({ where: { authorId: "a1" }, values: { body: "x" } });
+
+        expect(patchWhere).toHaveBeenCalledWith("messages", { where: { authorId: "a1" }, patch: { body: "x" } }, { limit: undefined });
     });
 
     it("insertMany forwards the table as the first argument (table-scoped by construction)", async () => {
@@ -85,32 +110,37 @@ describe("bindTableFacade — per-table batch forms", () => {
 });
 
 /** A ConflictError-shaped value (matched structurally by the facade, no `@lunora/do` import). */
-const uniqueConflict = (): Error => Object.assign(new Error(`unique constraint violation on "users"`), { code: "CONFLICT", kind: "unique" });
+const uniqueConflict = (): LunoraError & { kind: string } => {
+    const err = new LunoraError("CONFLICT", `unique constraint violation on "users"`) as LunoraError & { kind: string };
+    err.kind = "unique";
+
+    return err;
+};
 
 /** A writer with individually-controllable findFirst/insert/patch, bound to the `users` table. */
 const makeComposingWriter = () => {
-    const findFirst = vi.fn();
-    const insert = vi.fn();
-    const patch = vi.fn();
+    const findFirst = vi.fn<FacadeWriterLike["findFirst"]>();
+    const insert = vi.fn<FacadeWriterLike["insert"]>();
+    const patch = vi.fn<FacadeWriterLike["patch"]>();
 
     const writer = {
-        aggregate: vi.fn(),
-        count: vi.fn(),
-        delete: vi.fn(),
-        deleteMany: vi.fn(),
+        aggregate: vi.fn<FacadeWriterLike["aggregate"]>(),
+        count: vi.fn<FacadeWriterLike["count"]>(),
+        delete: vi.fn<FacadeWriterLike["delete"]>(),
+        deleteMany: vi.fn<NonNullable<FacadeWriterLike["deleteMany"]>>(),
         findFirst,
-        findFirstOrThrow: vi.fn(),
-        findMany: vi.fn(),
-        get: vi.fn(),
-        groupBy: vi.fn(),
+        findFirstOrThrow: vi.fn<FacadeWriterLike["findFirstOrThrow"]>(),
+        findMany: vi.fn<FacadeWriterLike["findMany"]>(),
+        get: vi.fn<FacadeWriterLike["get"]>(),
+        groupBy: vi.fn<FacadeWriterLike["groupBy"]>(),
         insert,
-        insertMany: vi.fn(),
+        insertMany: vi.fn<NonNullable<FacadeWriterLike["insertMany"]>>(),
         patch,
-        patchMany: vi.fn(),
-        query: vi.fn(),
-        rank: vi.fn(),
-        rankPage: vi.fn(),
-        replace: vi.fn(),
+        patchMany: vi.fn<NonNullable<FacadeWriterLike["patchMany"]>>(),
+        query: vi.fn<FacadeWriterLike["query"]>(),
+        rank: vi.fn<FacadeWriterLike["rank"]>(),
+        rankPage: vi.fn<FacadeWriterLike["rankPage"]>(),
+        replace: vi.fn<FacadeWriterLike["replace"]>(),
     } as unknown as FacadeWriterLike;
 
     return { entry: bindTableFacade(writer, "users"), findFirst, insert, patch };

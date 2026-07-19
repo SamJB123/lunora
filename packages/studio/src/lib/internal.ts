@@ -1,4 +1,33 @@
-import type { FunctionReference } from "@lunora/client";
+import type { FunctionReference, LunoraClient } from "@lunora/client";
+
+/**
+ * Dispatch a Lunora RPC through the client method that matches the function's
+ * `kind`: an `action` runs via `client.action`, a `mutation` via `client.mutation`,
+ * and everything else (a `query`) via `client.query`. The single home for that
+ * kind→method fan-out, shared by the API "try it" console and the function runner so
+ * a future kind — or a change in how admin surfaces should dispatch a kind — is
+ * fixed in one place. `options` carries the (optional) shard key; `args`/return are
+ * `unknown` because the caller supplies runtime-parsed JSON.
+ */
+export const dispatchByKind = (
+    client: Pick<LunoraClient, "action" | "mutation" | "query">,
+    kind: string | undefined,
+    reference: FunctionReference,
+    args: unknown,
+    options: { shardKey?: string },
+): Promise<unknown> => {
+    switch (kind) {
+        case "action": {
+            return client.action(reference, args, options);
+        }
+        case "mutation": {
+            return client.mutation(reference, args, options);
+        }
+        default: {
+            return client.query(reference, args, options);
+        }
+    }
+};
 
 /**
  * Build a {@link FunctionReference} for a reserved admin RPC path. All admin
@@ -19,6 +48,53 @@ export const callOptions = (shardKey: string): { shardKey?: string } => {
 
 /** Narrow an unknown thrown value to a human-readable message. */
 export const errorMessage = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+/**
+ * Extract an actionable hint (Markdown) carried on a thrown value — a
+ * `LunoraClientError` reconstructed from the server envelope exposes `hint` as a
+ * string or an array of lines. Returns `undefined` when the error carries none.
+ */
+export const errorHint = (error: unknown): string | undefined => {
+    if (error === null || typeof error !== "object" || !("hint" in error)) {
+        return undefined;
+    }
+
+    const { hint } = error as { hint?: unknown };
+
+    if (typeof hint === "string") {
+        return hint;
+    }
+
+    return Array.isArray(hint) ? hint.filter((line): line is string => typeof line === "string").join("\n") : undefined;
+};
+
+/**
+ * Extract a documentation URL (the wire `docsUrl` field) carried on a thrown
+ * value (a `LunoraClientError`), or `undefined`. Only `http(s)` URLs are
+ * returned — a `javascript:`/`data:` scheme would be an XSS sink once rendered
+ * as an `href`, so anything else is dropped even though `docsUrl` normally comes
+ * from the trusted catalog (defense-in-depth against a crafted error envelope).
+ */
+export const errorDocumentationUrl = (error: unknown): string | undefined => {
+    if (error === null || typeof error !== "object" || !("docsUrl" in error)) {
+        return undefined;
+    }
+
+    const value = (error as { docsUrl?: unknown }).docsUrl;
+
+    if (typeof value !== "string") {
+        return undefined;
+    }
+
+    try {
+        const { protocol } = new URL(value);
+
+        return protocol === "http:" || protocol === "https:" ? value : undefined;
+    } catch {
+        // Not an absolute URL (or unparseable) → don't render it as a link.
+        return undefined;
+    }
+};
 
 /**
  * Render a single table-cell value as text without throwing on objects or null.
@@ -67,17 +143,45 @@ export const fireAndForget = (promise: Promise<unknown>, onError?: (error: unkno
 };
 
 /**
- * Copy `text` to the clipboard when the browser exposes one; a no-op under
- * SSR/tests without `navigator`. The single home for the studio's copy buttons
- * so the (browser-only) guard and its lint exception live in one place.
+ * The Worker origin the studio is served from — what an API caller (or an MCP
+ * client's `LUNORA_URL`) points at. An `explicit` value wins when provided;
+ * otherwise falls back to `location.origin`, then the dev-server origin under
+ * SSR/tests. The single home for that dev-origin constant so it can't drift
+ * between call sites.
  */
-export const copyToClipboard = (text: string): void => {
+export const resolveOrigin = (explicit?: string): string => {
+    if (explicit !== undefined && explicit !== "") {
+        return explicit;
+    }
+
+    const loc = (globalThis as { location?: { origin?: string } }).location;
+
+    if (loc?.origin !== undefined && loc.origin !== "") {
+        return loc.origin;
+    }
+
+    return "http://localhost:5173";
+};
+
+/**
+ * Copy `text` to the clipboard when the browser exposes one; a no-op under
+ * SSR/tests or an insecure context without `navigator.clipboard`. The single
+ * home for the studio's copy buttons so the (browser-only) guard and its lint
+ * exception live in one place. Returns whether a clipboard was available (the
+ * write was kicked off) so callers can skip a "Copied" acknowledgement when it
+ * wasn't.
+ */
+export const copyToClipboard = (text: string): boolean => {
     // eslint-disable-next-line n/no-unsupported-features/node-builtins -- browser-only clipboard, guarded by the "navigator" in globalThis check
     const clipboard: Clipboard | undefined = "navigator" in globalThis ? globalThis.navigator.clipboard : undefined;
 
-    if (clipboard !== undefined) {
-        fireAndForget(clipboard.writeText(text));
+    if (clipboard === undefined) {
+        return false;
     }
+
+    fireAndForget(clipboard.writeText(text));
+
+    return true;
 };
 
 /**

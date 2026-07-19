@@ -11,12 +11,13 @@ import {
     useRouterState,
     useSearch,
 } from "@tanstack/react-router";
-import type { ReactElement, ReactNode } from "react";
-import { createContext, use, useEffect } from "react";
+import type { ComponentType, ReactElement, ReactNode } from "react";
+import { createContext, lazy, Suspense, use, useEffect, useMemo } from "react";
 
 import BrandMark from "../components/brand-mark";
 import { ErrorBoundary } from "../components/error-boundary";
 import RulesBanner from "../components/rules-banner";
+import { EnsureThemeProvider } from "../components/theme-provider";
 import { ThemeToggle } from "../components/theme-toggle";
 import { Badge } from "../components/ui/badge";
 import { Input } from "../components/ui/input";
@@ -38,67 +39,113 @@ import {
     useSidebar,
 } from "../components/ui/sidebar";
 import { Skeleton } from "../components/ui/skeleton";
-import { InsightsPanel } from "../features/advisors/insights-panel";
-import RlsPanel from "../features/advisors/rls-panel";
-import SecurityAdvisorPanel from "../features/advisors/security-advisor-panel";
-import { AnalyticsPanel } from "../features/analytics/analytics-panel";
-import ApiTab from "../features/api/api-tab";
-import { AuthConfigPanel } from "../features/auth/auth-config-panel";
-import { AuthSessionsPanel } from "../features/auth/auth-sessions-panel";
-import { OrganizationsPanel } from "../features/auth/organizations-panel";
-import { UsersPanel } from "../features/auth/users-panel";
-import { TableEditor } from "../features/data/table-editor";
-import { ExportImportPanel } from "../features/database/export-import";
-import { MigrationsPanel } from "../features/database/migrations";
-import { PitrPanel } from "../features/database/pitr-panel";
-import { FunctionRunner } from "../features/functions/function-runner";
-import { FunctionStatsPanel } from "../features/functions/function-stats";
+// Home stays a static (eager) import so the landing route paints synchronously;
+// every other feature panel is a route-level `React.lazy` boundary defined below
+// so it — and its heavy deps (`@xyflow/react`, `recharts`, the SQL editor, the
+// data grid) — loads in its own on-demand `chunk-*.js`, not in Home's first load.
 import { HomePanel } from "../features/home/home-panel";
-import { AuditPanel } from "../features/logs/audit-panel";
-import { LogDrainsPanel } from "../features/logs/log-drains-panel";
-import { LogsPanel } from "../features/logs/logs-panel";
-import { MailPanel } from "../features/logs/mail-panel";
 import type { SchedulePanelProps } from "../features/logs/schedule-panel";
-import { SchedulePanel } from "../features/logs/schedule-panel";
-import SubscriptionsPanel from "../features/logs/subscriptions-panel";
-import { PaymentsPanel } from "../features/payments/payments-panel";
-import { PermissionsPanel } from "../features/permissions/permissions-panel";
-import QueuesPanel from "../features/queues/queues-panel";
-import DashboardsPanel from "../features/reports/dashboards-panel";
-import { HealthPanel } from "../features/reports/health-panel";
-import { MetricsPanel } from "../features/reports/metrics-panel";
-import { SchemaViewer } from "../features/schema/schema-viewer";
-import { SettingsPanel } from "../features/settings/settings-panel";
-import { SqlEditorPanel } from "../features/sql/sql-editor-panel";
-import { FileBrowser } from "../features/storage/file-browser";
-import { StorageRulesPanel } from "../features/storage/storage-rules-panel";
-import { VectorBrowser } from "../features/vectors/vector-browser";
-import WorkflowsPanel from "../features/workflows/workflows-panel";
 import useStudioFeatures from "../hooks/use-studio-features";
 import { useT } from "../i18n/i18n-context";
 import { StudioI18nProvider } from "../i18n/i18n-provider";
 import type { StudioFeaturesResult } from "../lib/admin";
+import { validateDataViewSearch } from "../lib/data-view-params";
 import { fireAndForget } from "../lib/internal";
 import type { FunctionDescriptor } from "../lib/types";
 import { cn } from "../lib/utils";
 import { CommandPalette, openCommandPalette } from "./command-palette";
 
+// Route-level lazy panels. Each becomes its own on-demand `chunk-*.js` under
+// `dist/standalone/` (esbuild `splitting` in `scripts/build-standalone.mjs`),
+// so a user landing on Home never downloads the SQL editor, the data grid, the
+// schema diagram (`@xyflow/react`), the reports charts (`recharts`), or the
+// other ~30 panels — they load only when their tab is visited. The `React.lazy`
+// identities live at module scope so they stay stable across router rebuilds;
+// the routed `<Outlet>` is wrapped in `<Suspense>` (see {@link StudioLayout}).
+//
+// `React.lazy` wants a `{ default }` module; {@link lazyNamed} unwraps a named
+// export to that shape (preserving the component's props), so the many
+// named-export panels stay one-liners. Default-exporting panels pass straight to
+// `lazy`. The literal `import("…")` specifier MUST stay inline in the loader —
+// esbuild's code-splitting keys off the static string, so never hoist it to a
+// variable.
+const lazyNamed = <P, K extends string>(load: () => Promise<Record<K, ComponentType<P>>>, key: K) =>
+    lazy(() =>
+        load().then((loaded) => {
+            return { default: loaded[key] };
+        }),
+    );
+
+const InsightsPanel = lazyNamed(() => import("../features/advisors/insights-panel"), "InsightsPanel");
+const RlsPanel = lazy(() => import("../features/advisors/rls-panel"));
+const SecurityAdvisorPanel = lazy(() => import("../features/advisors/security-advisor-panel"));
+const AgentsPanel = lazyNamed(() => import("../features/agents/agents-panel"), "AgentsPanel");
+const AnalyticsPanel = lazyNamed(() => import("../features/analytics/analytics-panel"), "AnalyticsPanel");
+const ApiTab = lazy(() => import("../features/api/api-tab"));
+const AuthConfigPanel = lazyNamed(() => import("../features/auth/auth-config-panel"), "AuthConfigPanel");
+const AuthSessionsPanel = lazyNamed(() => import("../features/auth/auth-sessions-panel"), "AuthSessionsPanel");
+const OrganizationsPanel = lazyNamed(() => import("../features/auth/organizations-panel"), "OrganizationsPanel");
+const UsersPanel = lazyNamed(() => import("../features/auth/users-panel"), "UsersPanel");
+const ContainersPanel = lazyNamed(() => import("../features/containers/containers-panel"), "ContainersPanel");
+const TableEditor = lazyNamed(() => import("../features/data/table-editor"), "TableEditor");
+const ExportImportPanel = lazyNamed(() => import("../features/database/export-import"), "ExportImportPanel");
+const MigrationsPanel = lazyNamed(() => import("../features/database/migrations"), "MigrationsPanel");
+const PitrPanel = lazyNamed(() => import("../features/database/pitr-panel"), "PitrPanel");
+const FlagsPanel = lazyNamed(() => import("../features/flags/flags-panel"), "FlagsPanel");
+const FunctionRunner = lazyNamed(() => import("../features/functions/function-runner"), "FunctionRunner");
+const FunctionStatsPanel = lazyNamed(() => import("../features/functions/function-stats"), "FunctionStatsPanel");
+const IssuesPanel = lazyNamed(() => import("../features/issues/issues-panel"), "IssuesPanel");
+const AuditPanel = lazyNamed(() => import("../features/logs/audit-panel"), "AuditPanel");
+const LogDrainsPanel = lazyNamed(() => import("../features/logs/log-drains-panel"), "LogDrainsPanel");
+// `logs-panel` re-exports several types alongside the component, which trips the
+// generic prop inference in `lazyNamed` (it mis-infers the panel's props). The
+// explicit unwrap keeps `LogsPanel`'s exact props type.
+const LogsPanel = lazy(() =>
+    import("../features/logs/logs-panel").then((m) => {
+        return { default: m.LogsPanel };
+    }),
+);
+const MailPanel = lazyNamed(() => import("../features/logs/mail-panel"), "MailPanel");
+const SchedulePanel = lazyNamed(() => import("../features/logs/schedule-panel"), "SchedulePanel");
+const SubscriptionsPanel = lazy(() => import("../features/logs/subscriptions-panel"));
+const KvBrowser = lazyNamed(() => import("../features/kv/kv-browser"), "KvBrowser");
+const PaymentsPanel = lazyNamed(() => import("../features/payments/payments-panel"), "PaymentsPanel");
+const PermissionsPanel = lazyNamed(() => import("../features/permissions/permissions-panel"), "PermissionsPanel");
+const QueuesPanel = lazy(() => import("../features/queues/queues-panel"));
+const DashboardsPanel = lazy(() => import("../features/reports/dashboards-panel"));
+const FanoutPanel = lazy(() => import("../features/reports/fanout-panel"));
+const HealthPanel = lazyNamed(() => import("../features/reports/health-panel"), "HealthPanel");
+const MetricsPanel = lazyNamed(() => import("../features/reports/metrics-panel"), "MetricsPanel");
+const SchemaViewer = lazyNamed(() => import("../features/schema/schema-viewer"), "SchemaViewer");
+const SettingsPanel = lazyNamed(() => import("../features/settings/settings-panel"), "SettingsPanel");
+const SqlEditorPanel = lazyNamed(() => import("../features/sql/sql-editor-panel"), "SqlEditorPanel");
+const FileBrowser = lazyNamed(() => import("../features/storage/file-browser"), "FileBrowser");
+const StorageRulesPanel = lazyNamed(() => import("../features/storage/storage-rules-panel"), "StorageRulesPanel");
+const VectorBrowser = lazyNamed(() => import("../features/vectors/vector-browser"), "VectorBrowser");
+const WorkflowsPanel = lazy(() => import("../features/workflows/workflows-panel"));
+
 /** Identifier for each built-in studio tab. */
 type StudioTab =
+    | "agents"
     | "analytics"
     | "api"
     | "audit"
     | "authConfig"
     | "authSessions"
+    | "containers"
     | "dashboards"
     | "data"
     | "drains"
     | "export"
+    | "fanout"
     | "files"
+    | "flags"
     | "functions"
     | "health"
     | "home"
     | "insights"
+    | "issues"
+    | "kv"
     | "logs"
     | "mail"
     | "metrics"
@@ -257,18 +304,28 @@ const TAB_ICONS: Record<StudioTab, ReactNode> = {
     authConfig: (
         <path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm7.4-3a7.4 7.4 0 0 0-.1-1.2l2-1.6-2-3.4-2.4 1a7.3 7.3 0 0 0-2-1.2l-.4-2.6h-3.6l-.4 2.6a7.3 7.3 0 0 0-2 1.2l-2.4-1-2 3.4 2 1.6a7.4 7.4 0 0 0 0 2.4l-2 1.6 2 3.4 2.4-1a7.3 7.3 0 0 0 2 1.2l.4 2.6h3.6l.4-2.6a7.3 7.3 0 0 0 2-1.2l2.4 1 2-3.4-2-1.6a7.4 7.4 0 0 0 .1-1.2Z" />
     ),
+    agents: (
+        <path d="M12 8V5m0 0a2 2 0 1 0 0-4 2 2 0 0 0 0 4ZM6 8h12a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-6a2 2 0 0 1 2-2Zm3 5h.01M15 13h.01M9 21h6" />
+    ),
     authSessions: <path d="M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18Zm0-13.5V12l4 2" />,
+    containers: <path d="M3 7.5 12 3l9 4.5v9L12 21l-9-4.5v-9Zm0 0 9 4.5m0 0 9-4.5m-9 4.5V21" />,
     dashboards: <path d="M4 5h7v6H4V5Zm9 0h7v4h-7V5ZM4 14h7v5H4v-5Zm9-1h7v6h-7v-6Z" />,
     drains: <path d="M5 5h14M7 5v6a5 5 0 0 0 10 0V5M10 16h4v3h-4zM12 19v2" />,
     data: (
         <path d="M5 6c0-1.4 3.1-2.5 7-2.5s7 1.1 7 2.5-3.1 2.5-7 2.5S5 7.4 5 6Zm0 0v12c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5V6M5 12c0 1.4 3.1 2.5 7 2.5s7-1.1 7-2.5" />
     ),
     export: <path d="M12 3v11m0 0 4-4m-4 4-4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" />,
+    fanout: (
+        <path d="M12 5a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm-7 16a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm14 0a2 2 0 1 0 0-4 2 2 0 0 0 0 4ZM12 7v3.5M12 10.5 6 17m6-6.5 6 6.5" />
+    ),
     files: <path d="M4 7a2 2 0 0 1 2-2h3l2 2.5h7a2 2 0 0 1 2 2V18a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7Z" />,
+    flags: <path d="M6 21V4m0 0h11l-2 3 2 3H6" />,
     functions: <path d="m9 8-4 4 4 4m6-8 4 4-4 4" />,
     health: <path d="M3 12h4l2 6 4-14 2 8h6" />,
     home: <path d="M3 11.5 12 4l9 7.5M5 10v9a1 1 0 0 0 1 1h4v-6h4v6h4a1 1 0 0 0 1-1v-9" />,
     insights: <path d="M12 3a6 6 0 0 0-3.6 10.8c.5.4.8.9.9 1.5l.2 1.2h5l.2-1.2c.1-.6.4-1.1.9-1.5A6 6 0 0 0 12 3ZM9.5 20.5h5M10 18h4" />,
+    issues: <path d="M10.3 4.3 2.5 18a2 2 0 0 0 1.7 3h15.6a2 2 0 0 0 1.7-3L13.7 4.3a2 2 0 0 0-3.4 0ZM12 9v4m0 3v.01" />,
+    kv: <path d="M5 5h14v4H5V5Zm0 5h14v4H5v-4Zm0 5h14v4H5v-4Z" />,
     logs: <path d="M5 6h14M5 10h14M5 14h9M5 18h11" />,
     mail: <path d="M4 5h16v14H4V5Zm0 1.5 8 6 8-6" />,
     payments: <path d="M3 7h18v10H3V7Zm0 3h18M7 14h4" />,
@@ -307,12 +364,12 @@ type NavGroup = { readonly key: NavGroupKey; readonly tabs: ReadonlyArray<Studio
 const NAV_GROUPS: readonly [NavGroup, ...NavGroup[]] = [
     { key: "overview", tabs: ["home", "dashboards"] },
     { key: "database", tabs: ["data", "sql", "schema", "migrations", "vectors", "pitr", "export"] },
-    { key: "functions", tabs: ["functions", "api", "workflows", "queues"] },
+    { key: "functions", tabs: ["functions", "api", "workflows", "agents", "queues"] },
     { key: "auth", tabs: ["users", "organizations", "authSessions", "authConfig"] },
-    { key: "storage", tabs: ["files", "storageRules"] },
-    { key: "observability", tabs: ["logs", "audit", "realtime", "metrics", "analytics", "health"] },
+    { key: "storage", tabs: ["files", "storageRules", "kv"] },
+    { key: "observability", tabs: ["issues", "logs", "audit", "realtime", "fanout", "containers", "metrics", "analytics", "health"] },
     { key: "advisors", tabs: ["security", "rls", "permissions", "insights"] },
-    { key: "operations", tabs: ["schedule", "mail", "drains", "payments"] },
+    { key: "operations", tabs: ["schedule", "mail", "drains", "payments", "flags"] },
     { key: "settings", tabs: ["settings"] },
 ];
 
@@ -327,12 +384,20 @@ const NAV_GROUPS: readonly [NavGroup, ...NavGroup[]] = [
  * the access-rules view; `scheduler` gates the scheduled-jobs view.
  */
 const TAB_FEATURE: Partial<Record<StudioTab, keyof StudioFeaturesResult>> = {
+    analytics: "analytics",
+    authConfig: "auth",
+    authSessions: "auth",
+    containers: "containers",
     files: "storage",
+    flags: "flags",
+    kv: "kv",
     mail: "mail",
+    organizations: "auth",
     payments: "payments",
     queues: "queues",
     schedule: "scheduler",
     storageRules: "storage",
+    users: "auth",
     vectors: "vectors",
     workflows: "workflows",
 };
@@ -359,15 +424,27 @@ const TabIcon = ({ tab }: { readonly tab: StudioTab }): ReactElement => (
     </svg>
 );
 
+/**
+ * Compile-time route-coverage guard: the identity call typechecks only when
+ * `tabs` contains every {@link StudioTab}. The route table is built from
+ * {@link TABS} while the sidebar renders from {@link NAV_GROUPS}, so a tab
+ * missing from `TABS` still shows its nav link but the click falls through to
+ * {@link NotFoundRedirect} and bounces to Home (how `/fanout` regressed). A
+ * missing tab now fails `tsc` at the `TABS` declaration instead.
+ */
+const exhaustiveRouteTabs = <const T extends ReadonlyArray<StudioTab>>(tabs: ([StudioTab] extends [T[number]] ? unknown : never) & T): T => tabs;
+
 /** Flat list of every tab, in sidebar order; drives the route table. */
-const TABS = [
+const TABS = exhaustiveRouteTabs([
     "home",
     "data",
     "sql",
     "functions",
     "api",
     "workflows",
+    "agents",
     "queues",
+    "containers",
     "schema",
     "migrations",
     "vectors",
@@ -379,6 +456,7 @@ const TABS = [
     "authConfig",
     "files",
     "storageRules",
+    "kv",
     "dashboards",
     "metrics",
     "analytics",
@@ -387,15 +465,18 @@ const TABS = [
     "rls",
     "permissions",
     "insights",
+    "issues",
     "logs",
     "realtime",
+    "fanout",
     "mail",
     "payments",
     "audit",
     "schedule",
     "drains",
+    "flags",
     "settings",
-] as const;
+]);
 
 /**
  * Tabs that own the full panel height (a flush full-height table/query sidebar +
@@ -678,6 +759,22 @@ const StudioSidebar = ({ chrome, connected, current, groupLabel, groups, selectT
 };
 
 /**
+ * Skeleton shown while a route resolves — the brief first paint after mount, a
+ * lazy panel's chunk streaming in (the {@link Suspense} fallback below), and any
+ * future panel with a router loader — so the content area never flashes empty.
+ * Renders inside the layout's panel region during navigation.
+ */
+const RoutePending = (): ReactElement => (
+    <div className="flex flex-col gap-4" data-testid="dash-pending">
+        <div className="flex items-center gap-2">
+            <Skeleton className="h-8 w-40" />
+            <Skeleton className="h-8 w-24" />
+        </div>
+        <Skeleton className="h-72 w-full" />
+    </div>
+);
+
+/**
  * Persistent shell rendered by the router's root route: the grouped sidebar
  * ({@link StudioSidebar}) and the routed panel area (`&lt;Outlet />`). The active
  * tab is derived from the URL, so deep links and the browser back/forward
@@ -713,42 +810,50 @@ const StudioLayout = (): ReactElement => {
 
     // Memoised on `t` (stable per locale) so the maps re-localise when the active
     // locale changes but aren't rebuilt on every unrelated render.
-    const tabLabel = {
-        analytics: t("Analytics"),
-        api: t("API"),
-        audit: t("Audit"),
-        authConfig: t("Configuration"),
-        authSessions: t("Sessions"),
-        dashboards: t("Dashboards"),
-        data: t("Data"),
-        drains: t("Log drains"),
-        export: t("Export / Import"),
-        files: t("Files"),
-        functions: t("Functions"),
-        health: t("Health"),
-        home: t("Home"),
-        insights: t("Performance"),
-        logs: t("Logs"),
-        metrics: t("Metrics"),
-        migrations: t("Migrations"),
-        organizations: t("Organizations"),
-        pitr: t("Time Travel"),
-        mail: t("Mail"),
-        payments: t("Payments"),
-        permissions: t("Permissions"),
-        queues: t("Queues"),
-        realtime: t("Realtime"),
-        rls: t("RLS Policies"),
-        schedule: t("Scheduled"),
-        schema: t("Schema"),
-        security: t("Security"),
-        settings: t("Settings"),
-        sql: t("SQL editor"),
-        storageRules: t("Access Rules"),
-        users: t("Users"),
-        vectors: t("Vectors"),
-        workflows: t("Workflows"),
-    };
+    const tabLabel = useMemo(() => {
+        return {
+            agents: t("Agents"),
+            analytics: t("Analytics"),
+            api: t("API"),
+            audit: t("Audit"),
+            authConfig: t("Configuration"),
+            authSessions: t("Sessions"),
+            containers: t("Containers"),
+            dashboards: t("Dashboards"),
+            data: t("Data"),
+            drains: t("Log drains"),
+            export: t("Export / Import"),
+            fanout: t("Fan-out"),
+            files: t("Files"),
+            flags: t("Flags"),
+            functions: t("Functions"),
+            health: t("Health"),
+            home: t("Home"),
+            insights: t("Performance"),
+            issues: t("Issues"),
+            kv: t("KV"),
+            logs: t("Logs"),
+            metrics: t("Metrics"),
+            migrations: t("Migrations"),
+            organizations: t("Organizations"),
+            pitr: t("Time Travel"),
+            mail: t("Mail"),
+            payments: t("Payments"),
+            permissions: t("Permissions"),
+            queues: t("Queues"),
+            realtime: t("Realtime"),
+            rls: t("RLS Policies"),
+            schedule: t("Scheduled"),
+            schema: t("Schema"),
+            security: t("Security"),
+            settings: t("Settings"),
+            sql: t("SQL editor"),
+            storageRules: t("Access Rules"),
+            users: t("Users"),
+            vectors: t("Vectors"),
+            workflows: t("Workflows"),
+        };
+    }, [t]);
 
     const groupLabel = {
         advisors: t("Advisors"),
@@ -764,20 +869,25 @@ const StudioLayout = (): ReactElement => {
 
     // One-line section descriptions for the page header.
     const tabDescription = {
+        agents: t("Inspect agent threads, message timelines, tool calls, and token usage."),
         analytics: t("Usage and latency from Analytics Engine — request volume, p50/p95, and hot shards."),
         api: t("Interactive OpenAPI reference and copy-paste snippets for your functions."),
         audit: t("A durable log of admin state-changing operations."),
         authConfig: t("Enabled plugins and session config (read-only)."),
         authSessions: t("Browse and revoke active sessions across all users."),
+        containers: t("Live Cloudflare Containers — current lifecycle state per instance from the log stream."),
         dashboards: t("Chart widgets backed by saved read-only SQL queries."),
         data: t("Browse and edit rows across your shard and global tables."),
         drains: t("Forward logs to Logpush, Tail Workers, or a webhook collector."),
         export: t("Export a shard to NDJSON, or import rows from it."),
+        fanout: t("Realtime fan-out cost and per-topic subscriber counts for this shard."),
         files: t("Browse objects in your R2 storage buckets."),
+        flags: t("Inspect feature flags and their live evaluation under a targeting context."),
         functions: t("Run registered queries, mutations, and actions."),
         health: t("At-a-glance connection, error, and shard signals."),
         home: t("Connection, health, and advisor summary for your deployment."),
         insights: t("Surface slow functions, error spikes, and cache problems."),
+        issues: t("Grouped error triage — Worker throws and container crashes folded by fingerprint."),
         logs: t("A live stream of recent function logs."),
         metrics: t("Per-shard health and aggregate metrics."),
         migrations: t("Review migration status and run them."),
@@ -794,6 +904,7 @@ const StudioLayout = (): ReactElement => {
         security: t("Review admin gates, credentials, and log redaction."),
         settings: t("Read-only deployment config — vars, secrets, and bindings."),
         sql: t("Run read-only SQL against a shard."),
+        kv: t("Browse and edit key-value pairs in your Workers KV namespaces."),
         storageRules: t("Inspect storage access rules — per bucket, operation, and key prefix."),
         users: t("Manage auth users — roles, bans, sessions, and identity."),
         vectors: t("Browse Vectorize indexes and run similarity searches."),
@@ -906,7 +1017,12 @@ const StudioLayout = (): ReactElement => {
                             label={tabLabel[current]}
                             retryLabel={t("Try again")}
                         >
-                            <Outlet />
+                            {/* Every routed panel except Home is a `React.lazy` boundary, so its
+                                chunk streams in behind this Suspense fallback; Home (the index
+                                route) is eager and paints without suspending. */}
+                            <Suspense fallback={<RoutePending />}>
+                                <Outlet />
+                            </Suspense>
                         </ErrorBoundary>
                     </div>
                 </div>
@@ -914,21 +1030,6 @@ const StudioLayout = (): ReactElement => {
         </SidebarProvider>
     );
 };
-
-/**
- * Skeleton shown while a route resolves — the brief first paint after mount and
- * any future panel with a router loader — so the content area never flashes
- * empty. Renders inside the layout's panel region during navigation.
- */
-const RoutePending = (): ReactElement => (
-    <div className="flex flex-col gap-4" data-testid="dash-pending">
-        <div className="flex items-center gap-2">
-            <Skeleton className="h-8 w-40" />
-            <Skeleton className="h-8 w-24" />
-        </div>
-        <Skeleton className="h-72 w-full" />
-    </div>
-);
 
 /**
  * Schema tab wrapper that lifts the optional `?table=&lt;name>` search param off
@@ -981,16 +1082,21 @@ const buildRouter = ({
     const rootRoute = createRootRoute({ component: StudioLayout });
 
     const panels: Record<StudioTab, ReactElement> = {
+        agents: <AgentsPanel initialShardKey={initialShardKey} />,
         analytics: <AnalyticsPanel />,
         api: <ApiTab functions={functions} initialShardKey={initialShardKey} openApiSpec={openApiSpec} openRpcSpec={openRpcSpec} />,
         audit: <AuditPanel initialShardKey={initialShardKey} />,
         authConfig: <AuthConfigPanel />,
         authSessions: <AuthSessionsPanel />,
+        containers: <ContainersPanel />,
         dashboards: <DashboardsPanel initialShardKey={initialShardKey} />,
         data: <TableEditor editable={dataEditable} initialShardKey={initialShardKey} />,
         drains: <LogDrainsPanel />,
         export: <ExportImportPanel initialShardKey={initialShardKey} />,
+        fanout: <FanoutPanel initialShardKey={initialShardKey} />,
         files: <FileBrowser />,
+        kv: <KvBrowser />,
+        flags: <FlagsPanel initialShardKey={initialShardKey} />,
         functions: (
             <div className="flex flex-col gap-8">
                 <FunctionStatsPanel functions={functions} initialShardKey={initialShardKey} />
@@ -1000,6 +1106,7 @@ const buildRouter = ({
         health: <HealthPanel initialShardKey={initialShardKey} />,
         home: <HomePanel initialShardKey={initialShardKey} />,
         insights: <InsightsPanel initialShardKey={initialShardKey} />,
+        issues: <IssuesPanel initialShardKey={initialShardKey} />,
         logs: <LogsPanel initialShardKey={initialShardKey} />,
         metrics: <MetricsPanel initialShardKey={initialShardKey} />,
         migrations: <MigrationsPanel initialShardKey={initialShardKey} />,
@@ -1030,13 +1137,29 @@ const buildRouter = ({
         path: "/",
     });
 
-    const tabRoutes = TABS.map((tab) =>
-        createRoute({
+    const tabRoutes = TABS.map((tab) => {
+        // The data browser stores its whole view (table / tier / shard / search /
+        // sort / filters) in the URL; the `/data` route validates + normalises
+        // those params at the router boundary (`validateDataViewSearch`) so
+        // malformed or legacy links are sanitised once and the panel reads a typed,
+        // trustworthy search instead of a raw record. Branched (rather than a
+        // spread into one `createRoute`) because the route-property-order lint can't
+        // analyse a spread element.
+        if (tab === "data") {
+            return createRoute({
+                component: () => panels[tab],
+                getParentRoute: () => rootRoute,
+                path: `/${tab}`,
+                validateSearch: validateDataViewSearch,
+            });
+        }
+
+        return createRoute({
             component: () => panels[tab],
             getParentRoute: () => rootRoute,
             path: `/${tab}`,
-        }),
-    );
+        });
+    });
 
     const routeTree = rootRoute.addChildren([indexRoute, ...tabRoutes]);
     // Browser when a DOM `window` exists; an in-memory history under SSR/tests.
@@ -1128,21 +1251,26 @@ export const Studio = ({
     scheduledCron,
     scheduledLoad,
 }: StudioProps): ReactElement => {
+    // The header's <ThemeToggle> needs a theme context. `StudioApp` mounts one;
+    // a bare `<Studio>` embed (a public export) gets its own here — inherit-or-own,
+    // exactly like the i18n provider below.
     const shell = (
-        <StudioShell
-            basePath={basePath}
-            chrome={chrome}
-            dataEditable={dataEditable}
-            functions={functions}
-            initialShardKey={initialShardKey}
-            openApiSpec={openApiSpec}
-            openRpcSpec={openRpcSpec}
-            runAsIdentity={runAsIdentity}
-            scheduledCancel={scheduledCancel}
-            scheduledCron={scheduledCron}
-            scheduledLoad={scheduledLoad}
-            schemaEditable={schemaEditable}
-        />
+        <EnsureThemeProvider>
+            <StudioShell
+                basePath={basePath}
+                chrome={chrome}
+                dataEditable={dataEditable}
+                functions={functions}
+                initialShardKey={initialShardKey}
+                openApiSpec={openApiSpec}
+                openRpcSpec={openRpcSpec}
+                runAsIdentity={runAsIdentity}
+                scheduledCancel={scheduledCancel}
+                scheduledCron={scheduledCron}
+                scheduledLoad={scheduledLoad}
+                schemaEditable={schemaEditable}
+            />
+        </EnsureThemeProvider>
     );
 
     if (i18n === undefined && locale === undefined) {

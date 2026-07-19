@@ -12,6 +12,7 @@
  * barrel, tests) are unchanged.
  */
 
+import { encodeWire } from "../../../shared/wire-codec";
 import type { MutationDelta } from "./types";
 
 /** Identity field every Lunora document row carries. */
@@ -127,7 +128,13 @@ const collectUpsertDeltas = (previous: RowIndex, next: RowIndex, deltaTable: str
     for (const id of next.order) {
         const nextRow = next.byId.get(id) as Record<string, unknown>;
         const previousRow = previous.byId.get(id);
-        const nextFingerprint = JSON.stringify(nextRow);
+        // `nextRow` is the raw query row (may hold `bigint`/`ArrayBuffer`), so
+        // wire-encode it before fingerprinting/framing — `JSON.stringify` alone
+        // throws on a bigint and drops a buffer to `{}`. `previousRow` comes from
+        // the already-encoded baseline (see the `data`-frame `json`), so it is NOT
+        // re-encoded. For a pure-JSON row `encodeWire` is structurally identical,
+        // so the fingerprint compare and the frame stay byte-identical.
+        const nextFingerprint = JSON.stringify(encodeWire(nextRow));
         const previousFingerprint = previousRow === undefined ? undefined : JSON.stringify(previousRow);
 
         if (previousFingerprint === nextFingerprint) {
@@ -257,4 +264,30 @@ const sendDeltaFrames = (ws: WebSocket, subId: string, deltaFrames: ReadonlyArra
     return delivered;
 };
 
-export { sendDeltaFrames, subscriptionListDeltas, trySendFrame };
+/**
+ * Defensive WS backpressure helper. When the runtime exposes `bufferedAmount`
+ * on the socket, pause iteration whenever the outbound buffer is past 1 MiB;
+ * otherwise treat the socket as drained. Capped at 100 sleeps of 20 ms (≈ 2 s
+ * total) so a permanently-stuck buffer can't pin the iterator forever — past
+ * that we drop through and let the next `ws.send` surface the failure.
+ */
+const awaitWsDrain = async (ws: WebSocket): Promise<void> => {
+    let attempts = 0;
+
+    while (attempts < 100) {
+        attempts += 1;
+
+        const buffered = (ws as { bufferedAmount?: unknown }).bufferedAmount;
+
+        if (typeof buffered !== "number" || buffered < 1_048_576) {
+            return;
+        }
+
+        // eslint-disable-next-line no-await-in-loop -- intentional backpressure poll: sleep, then re-check the drained buffer on the next iteration
+        await new Promise((resolve) => {
+            setTimeout(resolve, 20);
+        });
+    }
+};
+
+export { awaitWsDrain, sendDeltaFrames, subscriptionListDeltas, trySendFrame };

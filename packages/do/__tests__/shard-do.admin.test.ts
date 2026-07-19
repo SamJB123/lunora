@@ -1,3 +1,4 @@
+import { LunoraError } from "@lunora/errors";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { AggregateIndexDefinitionLike } from "../src/aggregates";
@@ -5,8 +6,18 @@ import type { DatabaseWriterLike, SchemaLike, SqlExec } from "../src/ctx-db";
 import { applyCdcChanges, createShardCtxDb as createShardContextDatabase, runShardMigrations } from "../src/ctx-db";
 import type { DataMigrationLike, MigrationRunResult } from "../src/data-migration";
 import { runDataMigration } from "../src/data-migration";
-import type { AdvisoryFinding, QueueMetadata, StudioFeaturesResult } from "../src/introspect";
+import type {
+    AdvisoryFinding,
+    FanoutMetricsResult,
+    FanoutPathCounters,
+    FanoutTopicStat,
+    FlagEvaluation,
+    FlagsResult,
+    QueueMetadata,
+    StudioFeaturesResult,
+} from "../src/introspect";
 import { ADMIN_FUNCTIONS } from "../src/introspect";
+import type { QueueMessageRow, RecordQueueMessageInput } from "../src/queue-catcher";
 import type { RankIndexDefinitionLike, ShardRankPageResult } from "../src/rank";
 import { rankKeyFromDoc } from "../src/rank";
 import type {
@@ -30,7 +41,20 @@ import createSqliteExec from "./_helpers/node-sqlite";
  * `StudioFeaturesResult` without updating this tuple — and there if the studio
  * copy drifts — forcing both packages to move together.
  */
-const STUDIO_FEATURE_KEYS = ["mail", "payments", "queues", "scheduler", "storage", "vectors", "workflows"] as const;
+const STUDIO_FEATURE_KEYS = [
+    "analytics",
+    "auth",
+    "containers",
+    "flags",
+    "kv",
+    "mail",
+    "payments",
+    "queues",
+    "scheduler",
+    "storage",
+    "vectors",
+    "workflows",
+] as const;
 
 /** `true` only when `Keys` and `Canonical` are mutually assignable (the exact same key set). */
 type KeysMatch<Keys extends string, Canonical extends string> = [Keys] extends [Canonical] ? ([Canonical] extends [Keys] ? true : never) : never;
@@ -46,6 +70,85 @@ const STUDIO_FEATURES_KEY_GUARD: KeysMatch<keyof StudioFeaturesResult, (typeof S
 const QUEUE_METADATA_KEYS = ["binding", "deadLetterQueue", "exportName", "mode", "name"] as const;
 
 const QUEUE_METADATA_KEY_GUARD: KeysMatch<keyof QueueMetadata, (typeof QUEUE_METADATA_KEYS)[number]> = true;
+
+/**
+ * Canonical key set of `QueueMessageRow` (the `getQueueMessages` consumed-message
+ * log row), duplicated by `@lunora/studio`'s hand mirror the same way as the types
+ * above. Forces both packages' copies of the log-row wire shape to move together —
+ * `error`/`exportName` are optional.
+ */
+const QUEUE_MESSAGE_ROW_KEYS = [
+    "attempts",
+    "body",
+    "capturedAt",
+    "deadLettered",
+    "error",
+    "exportName",
+    "id",
+    "messageId",
+    "outcome",
+    "queue",
+    "timestamp",
+] as const;
+
+const QUEUE_MESSAGE_ROW_KEY_GUARD: KeysMatch<keyof QueueMessageRow, (typeof QUEUE_MESSAGE_ROW_KEYS)[number]> = true;
+
+/**
+ * Canonical key set of `RecordQueueMessageInput` — the `recordQueueMessage`
+ * admin-RPC payload the worker's capture sink POSTs. `@lunora/queue`'s
+ * `CapturedQueueMessage` is its structural mirror across the deliberate
+ * no-dependency-edge boundary and duplicates this exact tuple in its own drift
+ * guard, so a field added to / dropped from either side fails that side's build
+ * before a capture write silently loses (or forges) a column. `deadLettered` /
+ * `error` / `exportName` are optional.
+ */
+const RECORD_QUEUE_MESSAGE_INPUT_KEYS = ["attempts", "body", "deadLettered", "error", "exportName", "messageId", "outcome", "queue", "timestamp"] as const;
+
+const RECORD_QUEUE_MESSAGE_INPUT_KEY_GUARD: KeysMatch<keyof RecordQueueMessageInput, (typeof RECORD_QUEUE_MESSAGE_INPUT_KEYS)[number]> = true;
+
+/**
+ * Canonical key sets of `FlagEvaluation` / `FlagsResult`, duplicated by
+ * `@lunora/studio`'s hand mirror the same way as the types above. Forces both
+ * packages' copies of the `listFlags` wire shape to move together — so dropping
+ * an optional field (`errorCode`/`reason`/`variant`) on one side fails the
+ * build rather than silently shipping a missing studio cell.
+ */
+const FLAG_EVALUATION_KEYS = ["errorCode", "key", "reason", "type", "value", "variant"] as const;
+
+const FLAG_EVALUATION_KEY_GUARD: KeysMatch<keyof FlagEvaluation, (typeof FLAG_EVALUATION_KEYS)[number]> = true;
+
+const FLAGS_RESULT_KEYS = ["configured", "flags"] as const;
+
+const FLAGS_RESULT_KEY_GUARD: KeysMatch<keyof FlagsResult, (typeof FLAGS_RESULT_KEYS)[number]> = true;
+
+/**
+ * Canonical key sets of the `getFanoutMetrics` wire shapes (plan 075 Phase 1),
+ * duplicated by `@lunora/studio`'s hand mirror the same way as the types above.
+ * Forces both packages' copies of the fan-out observability payload to move
+ * together — adding or dropping a counter/topic field fails the build rather than
+ * silently shipping a missing studio cell.
+ */
+const FANOUT_TOPIC_STAT_KEYS = ["kind", "subscribers", "topic"] as const;
+
+const FANOUT_TOPIC_STAT_KEY_GUARD: KeysMatch<keyof FanoutTopicStat, (typeof FANOUT_TOPIC_STAT_KEYS)[number]> = true;
+
+const FANOUT_PATH_COUNTERS_KEYS = ["maxMs", "passes", "peakSocketsIterated", "socketsDelivered", "socketsIterated", "totalMs"] as const;
+
+const FANOUT_PATH_COUNTERS_KEY_GUARD: KeysMatch<keyof FanoutPathCounters, (typeof FANOUT_PATH_COUNTERS_KEYS)[number]> = true;
+
+const FANOUT_METRICS_RESULT_KEYS = [
+    "maxRelays",
+    "peakSubscribers",
+    "promoted",
+    "relayCount",
+    "shapePoke",
+    "sinceMs",
+    "topics",
+    "totalConnections",
+    "whisper",
+] as const;
+
+const FANOUT_METRICS_RESULT_KEY_GUARD: KeysMatch<keyof FanoutMetricsResult, (typeof FANOUT_METRICS_RESULT_KEYS)[number]> = true;
 
 /**
  * A real-SQLite-backed ShardDO whose `handleRpc` throws — proving the admin
@@ -165,6 +268,16 @@ describe("shardDO admin introspection", () => {
             method: "POST",
         });
     };
+
+    /** Shape of a `getQueueMessages` admin response — `Response.json()` is `unknown` under strict TS. */
+    interface QueueMessagesRead {
+        result: { entries: { id: string; messageId: string }[] };
+    }
+
+    // Typing the param's `json()` as `Promise<unknown>` keeps the narrowing assertion
+    // necessary under BOTH tsc (workers-types `.json()` is `unknown`) and ESLint's
+    // typed program (DOM lib `.json()` is `any`, which would flag an inline cast).
+    const readQueueMessages = async (response: { json: () => Promise<unknown> }): Promise<QueueMessagesRead> => (await response.json()) as QueueMessagesRead;
 
     it("lists tables when a valid admin bearer is presented", async () => {
         expect.assertions(2);
@@ -344,13 +457,31 @@ describe("shardDO admin introspection", () => {
         const baseResponse = await base.fetch(adminRequest(ADMIN_FUNCTIONS.studioFeatures, {}, ADMIN_TOKEN));
 
         await expect(baseResponse.json()).resolves.toEqual({
-            result: { mail: false, payments: false, queues: false, scheduler: false, storage: false, vectors: false, workflows: false },
+            result: {
+                analytics: false,
+                auth: false,
+                containers: false,
+                flags: false,
+                kv: false,
+                mail: false,
+                payments: false,
+                queues: false,
+                scheduler: false,
+                storage: false,
+                vectors: false,
+                workflows: false,
+            },
         });
 
         // The codegen subclass overrides `studioFeatures()` with the discovered flags.
         class FeaturedShard extends AdminShard {
             // eslint-disable-next-line class-methods-use-this -- test stub mirroring the codegen override
             protected override studioFeatures(): {
+                analytics: boolean;
+                auth: boolean;
+                containers: boolean;
+                flags: boolean;
+                kv: boolean;
                 mail: boolean;
                 payments: boolean;
                 queues: boolean;
@@ -359,7 +490,20 @@ describe("shardDO admin introspection", () => {
                 vectors: boolean;
                 workflows: boolean;
             } {
-                return { mail: false, payments: true, queues: true, scheduler: true, storage: false, vectors: false, workflows: true };
+                return {
+                    analytics: false,
+                    auth: false,
+                    containers: true,
+                    flags: true,
+                    kv: false,
+                    mail: false,
+                    payments: true,
+                    queues: true,
+                    scheduler: true,
+                    storage: false,
+                    vectors: false,
+                    workflows: true,
+                };
             }
         }
 
@@ -367,7 +511,52 @@ describe("shardDO admin introspection", () => {
         const response = await featured.fetch(adminRequest(ADMIN_FUNCTIONS.studioFeatures, {}, ADMIN_TOKEN));
 
         await expect(response.json()).resolves.toEqual({
-            result: { mail: false, payments: true, queues: true, scheduler: true, storage: false, vectors: false, workflows: true },
+            result: {
+                analytics: false,
+                auth: false,
+                containers: true,
+                flags: true,
+                kv: false,
+                mail: false,
+                payments: true,
+                queues: true,
+                scheduler: true,
+                storage: false,
+                vectors: false,
+                workflows: true,
+            },
+        });
+    });
+
+    it("reports no flags from the base listFlags hook, and the subclass evaluation when overridden", async () => {
+        expect.assertions(2);
+
+        // Base ShardDO wires no provider, so listFlags reports unconfigured.
+        const base = new AdminShard(state, { LUNORA_ADMIN_TOKEN: ADMIN_TOKEN });
+        const baseResponse = await base.fetch(adminRequest(ADMIN_FUNCTIONS.listFlags, {}, ADMIN_TOKEN));
+
+        await expect(baseResponse.json()).resolves.toEqual({ result: { configured: false, flags: [] } });
+
+        // The codegen subclass overrides `evaluateFlags` with live evaluation; it
+        // receives the editable targeting context the studio supplies.
+        class FlaggedShard extends AdminShard {
+            // eslint-disable-next-line class-methods-use-this -- test stub mirroring the codegen override
+            protected override evaluateFlags(context?: Record<string, unknown>): Promise<{
+                configured: boolean;
+                flags: { key: string; reason: string; type: "boolean" | "number" | "object" | "string"; value: unknown }[];
+            }> {
+                return Promise.resolve({
+                    configured: true,
+                    flags: [{ key: "dark-mode", reason: "TARGETING_MATCH", type: "boolean", value: context?.plan === "premium" }],
+                });
+            }
+        }
+
+        const flagged = new FlaggedShard(state, { LUNORA_ADMIN_TOKEN: ADMIN_TOKEN });
+        const response = await flagged.fetch(adminRequest(ADMIN_FUNCTIONS.listFlags, { context: { plan: "premium" } }, ADMIN_TOKEN));
+
+        await expect(response.json()).resolves.toEqual({
+            result: { configured: true, flags: [{ key: "dark-mode", reason: "TARGETING_MATCH", type: "boolean", value: true }] },
         });
     });
 
@@ -377,7 +566,20 @@ describe("shardDO admin introspection", () => {
         // The compile-time guard (STUDIO_FEATURES_KEY_GUARD) is what actually fails
         // the build on drift; this asserts the tuple matches the wire shape at runtime too.
         expect(STUDIO_FEATURES_KEY_GUARD).toBe(true);
-        expect([...STUDIO_FEATURE_KEYS]).toStrictEqual(["mail", "payments", "queues", "scheduler", "storage", "vectors", "workflows"]);
+        expect([...STUDIO_FEATURE_KEYS]).toStrictEqual([
+            "analytics",
+            "auth",
+            "containers",
+            "flags",
+            "kv",
+            "mail",
+            "payments",
+            "queues",
+            "scheduler",
+            "storage",
+            "vectors",
+            "workflows",
+        ]);
     });
 
     it("keeps QueueMetadata's keys in lockstep with the studio's hand-mirror", () => {
@@ -385,6 +587,72 @@ describe("shardDO admin introspection", () => {
 
         expect(QUEUE_METADATA_KEY_GUARD).toBe(true);
         expect([...QUEUE_METADATA_KEYS]).toStrictEqual(["binding", "deadLetterQueue", "exportName", "mode", "name"]);
+    });
+
+    it("keeps QueueMessageRow's keys in lockstep with the studio's hand-mirror", () => {
+        expect.assertions(2);
+
+        expect(QUEUE_MESSAGE_ROW_KEY_GUARD).toBe(true);
+        expect([...QUEUE_MESSAGE_ROW_KEYS]).toStrictEqual([
+            "attempts",
+            "body",
+            "capturedAt",
+            "deadLettered",
+            "error",
+            "exportName",
+            "id",
+            "messageId",
+            "outcome",
+            "queue",
+            "timestamp",
+        ]);
+    });
+
+    it("keeps RecordQueueMessageInput's keys in lockstep with @lunora/queue's CapturedQueueMessage", () => {
+        expect.assertions(2);
+
+        expect(RECORD_QUEUE_MESSAGE_INPUT_KEY_GUARD).toBe(true);
+        expect([...RECORD_QUEUE_MESSAGE_INPUT_KEYS]).toStrictEqual([
+            "attempts",
+            "body",
+            "deadLettered",
+            "error",
+            "exportName",
+            "messageId",
+            "outcome",
+            "queue",
+            "timestamp",
+        ]);
+    });
+
+    it("keeps FlagEvaluation/FlagsResult keys in lockstep with the studio's hand-mirror", () => {
+        expect.assertions(4);
+
+        expect(FLAG_EVALUATION_KEY_GUARD).toBe(true);
+        expect([...FLAG_EVALUATION_KEYS]).toStrictEqual(["errorCode", "key", "reason", "type", "value", "variant"]);
+        expect(FLAGS_RESULT_KEY_GUARD).toBe(true);
+        expect([...FLAGS_RESULT_KEYS]).toStrictEqual(["configured", "flags"]);
+    });
+
+    it("keeps the getFanoutMetrics wire shapes in lockstep with the studio's hand-mirror", () => {
+        expect.assertions(6);
+
+        expect(FANOUT_TOPIC_STAT_KEY_GUARD).toBe(true);
+        expect([...FANOUT_TOPIC_STAT_KEYS]).toStrictEqual(["kind", "subscribers", "topic"]);
+        expect(FANOUT_PATH_COUNTERS_KEY_GUARD).toBe(true);
+        expect([...FANOUT_PATH_COUNTERS_KEYS]).toStrictEqual(["maxMs", "passes", "peakSocketsIterated", "socketsDelivered", "socketsIterated", "totalMs"]);
+        expect(FANOUT_METRICS_RESULT_KEY_GUARD).toBe(true);
+        expect([...FANOUT_METRICS_RESULT_KEYS]).toStrictEqual([
+            "maxRelays",
+            "peakSubscribers",
+            "promoted",
+            "relayCount",
+            "shapePoke",
+            "sinceMs",
+            "topics",
+            "totalConnections",
+            "whisper",
+        ]);
     });
 
     it("serves declared-workflow metadata from the codegen-overridden hook", async () => {
@@ -428,6 +696,286 @@ describe("shardDO admin introspection", () => {
                 ],
             },
         });
+    });
+
+    it("records consumed messages and reads them back newest-first", async () => {
+        expect.assertions(4);
+
+        const shard = new AdminShard(state, { LUNORA_ADMIN_TOKEN: ADMIN_TOKEN });
+
+        const recordResponse = await shard.fetch(
+            adminRequest(
+                ADMIN_FUNCTIONS.recordQueueMessage,
+                {
+                    messages: [
+                        { attempts: 1, body: { n: 1 }, exportName: "emailQueue", messageId: "cf-1", outcome: "ack", queue: "email", timestamp: 10 },
+                        {
+                            attempts: 3,
+                            body: { n: 2 },
+                            deadLettered: true,
+                            error: "kaboom",
+                            exportName: "emailQueue",
+                            messageId: "cf-2",
+                            outcome: "error",
+                            queue: "email",
+                            timestamp: 20,
+                        },
+                    ],
+                },
+                ADMIN_TOKEN,
+            ),
+        );
+
+        await expect(recordResponse.json()).resolves.toEqual({ result: { recorded: 2 } });
+
+        const readResponse = await shard.fetch(adminRequest(ADMIN_FUNCTIONS.getQueueMessages, {}, ADMIN_TOKEN));
+        const read = await readQueueMessages(readResponse);
+
+        expect(read.result.entries).toHaveLength(2);
+
+        // Both were captured in one batch (shared `capturedAt`), so index order is
+        // undefined — assert each row by its message id.
+        const byId = new Map(read.result.entries.map((entry) => [entry.messageId, entry]));
+
+        expect(byId.get("cf-1")).toMatchObject({ attempts: 1, deadLettered: false, outcome: "ack" });
+        expect(byId.get("cf-2")).toMatchObject({ attempts: 3, deadLettered: true, error: "kaboom", outcome: "error" });
+    });
+
+    it("sends a single message through the declared producer binding", async () => {
+        expect.assertions(3);
+
+        const sent: { body: unknown; options?: unknown }[] = [];
+        const binding = {
+            send: (body: unknown, options?: unknown) => {
+                sent.push({ body, options });
+
+                return Promise.resolve();
+            },
+            sendBatch: () => Promise.reject(new Error("sendBatch must not run for a single send")),
+        };
+
+        const shard = new DeclaredQueueShard(state, { LUNORA_ADMIN_TOKEN: ADMIN_TOKEN, QUEUE_EMAIL: binding });
+        const response = await shard.fetch(
+            adminRequest(ADMIN_FUNCTIONS.sendQueueMessage, { body: { hi: true }, delaySeconds: 5, exportName: "emailQueue" }, ADMIN_TOKEN),
+        );
+
+        await expect(response.json()).resolves.toEqual({ result: { sent: 1 } });
+        expect(sent).toHaveLength(1);
+        expect(sent[0]).toStrictEqual({ body: { hi: true }, options: { contentType: undefined, delaySeconds: 5 } });
+    });
+
+    it("sends a batch through the declared producer binding", async () => {
+        expect.assertions(2);
+
+        const batches: unknown[] = [];
+        const binding = {
+            send: () => Promise.reject(new Error("send must not run for a batch")),
+            sendBatch: (messages: Iterable<unknown>) => {
+                batches.push([...messages]);
+
+                return Promise.resolve();
+            },
+        };
+
+        const shard = new DeclaredQueueShard(state, { LUNORA_ADMIN_TOKEN: ADMIN_TOKEN, QUEUE_EMAIL: binding });
+        const response = await shard.fetch(
+            adminRequest(ADMIN_FUNCTIONS.sendQueueMessage, { batch: [{ a: 1 }, { a: 2 }], exportName: "emailQueue" }, ADMIN_TOKEN),
+        );
+
+        await expect(response.json()).resolves.toEqual({ result: { sent: 2 } });
+        expect(batches).toStrictEqual([
+            [
+                { body: { a: 1 }, contentType: undefined, delaySeconds: undefined },
+                { body: { a: 2 }, contentType: undefined, delaySeconds: undefined },
+            ],
+        ]);
+    });
+
+    it("rejects an empty batch with a 400 before touching the queue binding", async () => {
+        expect.assertions(2);
+
+        const binding = {
+            send: () => Promise.reject(new Error("send must not run for an invalid batch")),
+            sendBatch: () => Promise.reject(new Error("sendBatch must not run for an empty batch")),
+        };
+
+        const shard = new DeclaredQueueShard(state, { LUNORA_ADMIN_TOKEN: ADMIN_TOKEN, QUEUE_EMAIL: binding });
+        const response = await shard.fetch(adminRequest(ADMIN_FUNCTIONS.sendQueueMessage, { batch: [], exportName: "emailQueue" }, ADMIN_TOKEN));
+
+        expect(response.status).toBe(400);
+        await expect(response.text()).resolves.toMatch(/between 1 and 100/u);
+    });
+
+    it("rejects a batch larger than 100 messages with a 400", async () => {
+        expect.assertions(1);
+
+        const binding = {
+            send: () => Promise.reject(new Error("send must not run for an oversized batch")),
+            sendBatch: () => Promise.reject(new Error("sendBatch must not run for an oversized batch")),
+        };
+
+        const shard = new DeclaredQueueShard(state, { LUNORA_ADMIN_TOKEN: ADMIN_TOKEN, QUEUE_EMAIL: binding });
+        const oversized = Array.from({ length: 101 }, (_unused, index) => {
+            return { n: index };
+        });
+        const response = await shard.fetch(adminRequest(ADMIN_FUNCTIONS.sendQueueMessage, { batch: oversized, exportName: "emailQueue" }, ADMIN_TOKEN));
+
+        expect(response.status).toBe(400);
+    });
+
+    it("rejects sending to an undeclared queue with a 400", async () => {
+        expect.assertions(1);
+
+        const shard = new DeclaredQueueShard(state, { LUNORA_ADMIN_TOKEN: ADMIN_TOKEN });
+        const response = await shard.fetch(adminRequest(ADMIN_FUNCTIONS.sendQueueMessage, { body: {}, exportName: "ghost" }, ADMIN_TOKEN));
+
+        expect(response.status).toBe(400);
+    });
+
+    it("rejects sending to a declared queue whose binding is absent with a 400", async () => {
+        expect.assertions(1);
+
+        const shard = new DeclaredQueueShard(state, { LUNORA_ADMIN_TOKEN: ADMIN_TOKEN });
+        const response = await shard.fetch(adminRequest(ADMIN_FUNCTIONS.sendQueueMessage, { body: {}, exportName: "emailQueue" }, ADMIN_TOKEN));
+
+        expect(response.status).toBe(400);
+    });
+
+    it("replays a captured message back onto the queue it came from", async () => {
+        expect.assertions(2);
+
+        const sent: unknown[] = [];
+        const binding = {
+            send: (body: unknown) => {
+                sent.push(body);
+
+                return Promise.resolve();
+            },
+            sendBatch: () => Promise.reject(new Error("sendBatch must not run for a replay")),
+        };
+
+        const shard = new DeclaredQueueShard(state, { LUNORA_ADMIN_TOKEN: ADMIN_TOKEN, QUEUE_EMAIL: binding });
+
+        await shard.fetch(
+            adminRequest(
+                ADMIN_FUNCTIONS.recordQueueMessage,
+                { messages: [{ attempts: 1, body: { replay: "me" }, messageId: "cf-9", outcome: "ack", queue: "email", timestamp: 0 }] },
+                ADMIN_TOKEN,
+            ),
+        );
+
+        const readResponse = await shard.fetch(adminRequest(ADMIN_FUNCTIONS.getQueueMessages, {}, ADMIN_TOKEN));
+        const read = await readQueueMessages(readResponse);
+        const [captured] = read.result.entries;
+        const response = await shard.fetch(adminRequest(ADMIN_FUNCTIONS.replayQueueMessage, { id: captured?.id }, ADMIN_TOKEN));
+
+        // `email` resolves to its producer export `emailQueue`.
+        await expect(response.json()).resolves.toEqual({ result: { sent: 1, target: "emailQueue" } });
+        expect(sent).toStrictEqual([{ replay: "me" }]);
+    });
+
+    it("redrives a dead-lettered message onto its parent queue", async () => {
+        expect.assertions(2);
+
+        const sent: unknown[] = [];
+        const binding = {
+            send: (body: unknown) => {
+                sent.push(body);
+
+                return Promise.resolve();
+            },
+            sendBatch: () => Promise.reject(new Error("sendBatch must not run for a redrive")),
+        };
+
+        const shard = new DeclaredQueueShard(state, { LUNORA_ADMIN_TOKEN: ADMIN_TOKEN, QUEUE_EMAIL: binding });
+
+        // Captured off the DLQ (`email-dlq`); replay should target the parent `emailQueue`.
+        await shard.fetch(
+            adminRequest(
+                ADMIN_FUNCTIONS.recordQueueMessage,
+                {
+                    messages: [
+                        { attempts: 3, body: { dead: true }, deadLettered: true, messageId: "cf-dlq", outcome: "error", queue: "email-dlq", timestamp: 0 },
+                    ],
+                },
+                ADMIN_TOKEN,
+            ),
+        );
+
+        const readResponse = await shard.fetch(adminRequest(ADMIN_FUNCTIONS.getQueueMessages, {}, ADMIN_TOKEN));
+        const read = await readQueueMessages(readResponse);
+        const [captured] = read.result.entries;
+        const response = await shard.fetch(adminRequest(ADMIN_FUNCTIONS.replayQueueMessage, { id: captured?.id }, ADMIN_TOKEN));
+
+        await expect(response.json()).resolves.toEqual({ result: { sent: 1, target: "emailQueue" } });
+        expect(sent).toStrictEqual([{ dead: true }]);
+    });
+
+    it("refuses to replay a truncated (lossy) captured body", async () => {
+        expect.assertions(2);
+
+        const sent: unknown[] = [];
+        const binding = {
+            send: (body: unknown) => {
+                sent.push(body);
+
+                return Promise.resolve();
+            },
+            sendBatch: () => Promise.reject(new Error("sendBatch must not run")),
+        };
+
+        const shard = new DeclaredQueueShard(state, { LUNORA_ADMIN_TOKEN: ADMIN_TOKEN, QUEUE_EMAIL: binding });
+
+        // A body larger than the catcher's per-row cap is stored as a truncated
+        // marker string, so the stored body is no longer the original payload —
+        // replaying it would deliver a corrupted message.
+        await shard.fetch(
+            adminRequest(
+                ADMIN_FUNCTIONS.recordQueueMessage,
+                { messages: [{ attempts: 1, body: "x".repeat(200 * 1024), messageId: "cf-big", outcome: "ack", queue: "email", timestamp: 0 }] },
+                ADMIN_TOKEN,
+            ),
+        );
+
+        const readResponse = await shard.fetch(adminRequest(ADMIN_FUNCTIONS.getQueueMessages, {}, ADMIN_TOKEN));
+        const read = await readQueueMessages(readResponse);
+        const [captured] = read.result.entries;
+        const response = await shard.fetch(adminRequest(ADMIN_FUNCTIONS.replayQueueMessage, { id: captured?.id }, ADMIN_TOKEN));
+
+        expect(response.status).toBe(422);
+        expect(sent).toStrictEqual([]);
+    });
+
+    it("rejects replaying an unknown captured id with a 404", async () => {
+        expect.assertions(1);
+
+        const shard = new DeclaredQueueShard(state, { LUNORA_ADMIN_TOKEN: ADMIN_TOKEN });
+        const response = await shard.fetch(adminRequest(ADMIN_FUNCTIONS.replayQueueMessage, { id: "does-not-exist" }, ADMIN_TOKEN));
+
+        expect(response.status).toBe(404);
+    });
+
+    it("clears the consumed-message log", async () => {
+        expect.assertions(2);
+
+        const shard = new AdminShard(state, { LUNORA_ADMIN_TOKEN: ADMIN_TOKEN });
+
+        await shard.fetch(
+            adminRequest(
+                ADMIN_FUNCTIONS.recordQueueMessage,
+                { messages: [{ attempts: 1, body: 1, messageId: "cf-x", outcome: "ack", queue: "email", timestamp: 0 }] },
+                ADMIN_TOKEN,
+            ),
+        );
+
+        const clearResponse = await shard.fetch(adminRequest(ADMIN_FUNCTIONS.clearQueueMessages, {}, ADMIN_TOKEN));
+
+        await expect(clearResponse.json()).resolves.toEqual({ result: { cleared: true } });
+
+        const readResponse = await shard.fetch(adminRequest(ADMIN_FUNCTIONS.getQueueMessages, {}, ADMIN_TOKEN));
+        const read = await readQueueMessages(readResponse);
+
+        expect(read.result.entries).toHaveLength(0);
     });
 
     it("starts a workflow instance through the declared binding", async () => {
@@ -713,17 +1261,116 @@ describe("shardDO admin introspection", () => {
         await expect(recorded.json()).resolves.toEqual({ result: { recorded: true } });
 
         const logs = await shard.fetch(adminRequest(ADMIN_FUNCTIONS.getLogs, {}, ADMIN_TOKEN));
-        const body = await logs.json<{ result: { entries: { functionPath?: string; level: string; message: string; timestamp: number }[] } }>();
+        const body = await logs.json<{
+            result: { entries: { exitCode?: number; functionPath?: string; instance?: string; level: string; message: string; timestamp: number }[] };
+        }>();
 
         expect(logs.status).toBe(200);
         // `functionPath` groups it as a container source; the message folds the
-        // transition and the detail; the timestamp is the envelope's `ts`.
+        // transition and the detail; the timestamp is the envelope's `ts`; the
+        // per-instance DO id and the `(exit <n>)` code are carried through.
         expect(body.result.entries).toContainEqual({
+            exitCode: 137,
             functionPath: "container:transcoder",
+            instance: "do-abc123",
             level: "info",
             message: "stop: runtime_signal (exit 137)",
             timestamp: 1_700_000_000_000,
         });
+    });
+
+    it("folds an error-level container event into the getIssues stream", async () => {
+        expect.assertions(3);
+
+        const shard = new AdminShard(state, { LUNORA_ADMIN_TOKEN: ADMIN_TOKEN });
+
+        // Two crashes of the same container with different instance ids: they
+        // share the `container:transcoder :: bucket(message)` fingerprint, so
+        // getIssues folds them into one Issue with count 2 — right beside any
+        // Worker error, since both go through the same durable readout.
+        const crash = (instance: string) => {
+            return {
+                container: "transcoder",
+                event: "error",
+                instance,
+                level: "error",
+                message: "OOM killed (exit 137)",
+                source: "lunora",
+                ts: 1_700_000_000_000,
+                type: "container",
+            };
+        };
+
+        const first = await shard.fetch(adminRequest(ADMIN_FUNCTIONS.recordContainerEvent, { event: crash("do-a") }, ADMIN_TOKEN));
+        const second = await shard.fetch(adminRequest(ADMIN_FUNCTIONS.recordContainerEvent, { event: crash("do-b") }, ADMIN_TOKEN));
+
+        expect([first.status, second.status]).toStrictEqual([200, 200]);
+
+        const issues = await shard.fetch(adminRequest(ADMIN_FUNCTIONS.getIssues, {}, ADMIN_TOKEN));
+        const body = await issues.json<{ result: { issues: { count: number; culprit: string; title: string }[] } }>();
+
+        expect(issues.status).toBe(200);
+
+        const issue = body.result.issues.find((candidate) => candidate.culprit === "container:transcoder");
+
+        expect(issue?.count).toBe(2);
+    });
+
+    it("folds a non-zero-exit `stop` (level info) into the getIssues stream", async () => {
+        expect.assertions(3);
+
+        const shard = new AdminShard(state, { LUNORA_ADMIN_TOKEN: ADMIN_TOKEN });
+
+        // A crash-loop's normal signal is a `stop` with a non-zero exit code —
+        // NOT an `error`-level event. The lifecycle envelope carries it as
+        // `level: "info"` with `(exit <n>)` in the message, so the handler must
+        // treat the parsed non-zero exit code as a crash and append an error row.
+        const crashStop = {
+            container: "transcoder",
+            event: "stop",
+            instance: "do-a",
+            level: "info",
+            message: "runtime_signal (exit 137)",
+            source: "lunora",
+            ts: 1_700_000_000_000,
+            type: "container",
+        };
+
+        const recorded = await shard.fetch(adminRequest(ADMIN_FUNCTIONS.recordContainerEvent, { event: crashStop }, ADMIN_TOKEN));
+
+        expect(recorded.status).toBe(200);
+
+        const issues = await shard.fetch(adminRequest(ADMIN_FUNCTIONS.getIssues, {}, ADMIN_TOKEN));
+        const body = await issues.json<{ result: { issues: { count: number; culprit: string }[] } }>();
+
+        expect(issues.status).toBe(200);
+        expect(body.result.issues.find((candidate) => candidate.culprit === "container:transcoder")?.count).toBe(1);
+    });
+
+    it("does NOT fold a clean `stop` (exit 0) into the getIssues stream", async () => {
+        expect.assertions(2);
+
+        const shard = new AdminShard(state, { LUNORA_ADMIN_TOKEN: ADMIN_TOKEN });
+
+        const cleanStop = {
+            container: "transcoder",
+            event: "stop",
+            instance: "do-a",
+            level: "info",
+            message: "graceful shutdown (exit 0)",
+            source: "lunora",
+            ts: 1_700_000_000_000,
+            type: "container",
+        };
+
+        const recorded = await shard.fetch(adminRequest(ADMIN_FUNCTIONS.recordContainerEvent, { event: cleanStop }, ADMIN_TOKEN));
+
+        expect(recorded.status).toBe(200);
+
+        const issues = await shard.fetch(adminRequest(ADMIN_FUNCTIONS.getIssues, {}, ADMIN_TOKEN));
+        const body = await issues.json<{ result: { issues: { culprit: string }[] } }>();
+
+        expect(body.result.issues.some((candidate) => candidate.culprit === "container:transcoder")).toBe(false);
     });
 
     it("rejects (400) a recordContainerEvent with a missing envelope", async () => {
@@ -786,9 +1433,7 @@ class MigrationShard extends ShardDO {
         const migration = MIGRATIONS[args.id];
 
         if (!migration) {
-            return Promise.reject(
-                Object.assign(new Error(`data migration "${args.id}" is not registered`), { code: "MIGRATION_NOT_FOUND", name: "LunoraError", status: 404 }),
-            );
+            return Promise.reject(new LunoraError("MIGRATION_NOT_FOUND", `data migration "${args.id}" is not registered`, { status: 404 }));
         }
 
         const writer = createShardContextDatabase({

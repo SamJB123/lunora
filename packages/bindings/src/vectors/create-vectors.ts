@@ -1,3 +1,5 @@
+import { LunoraError } from "@lunora/errors";
+
 import { concurrentMap, UPSERT_EMBED_CONCURRENCY } from "./concurrent";
 import type {
     LunoraVectors,
@@ -13,10 +15,17 @@ import type {
 } from "./types";
 
 const resolveIndex = (indexes: Record<string, VectorizeIndexLike>, name: string): VectorizeIndexLike => {
+    // Own-property check, not truthiness: a prototype key ("__proto__",
+    // "constructor", …) would otherwise resolve to an inherited Object.prototype
+    // member and slip past the not-found guard. Object.hasOwn keeps unknown
+    // names (including prototype keys) on the controlled LunoraError path.
     const index = indexes[name];
 
-    if (!index) {
-        throw new Error(`@lunora/bindings/vectors: no index registered for "${name}". Known indexes: ${Object.keys(indexes).join(", ") || "(none)"}`);
+    if (!Object.hasOwn(indexes, name) || index === undefined) {
+        throw new LunoraError(
+            "INTERNAL",
+            `@lunora/bindings/vectors: no index registered for "${name}". Known indexes: ${Object.keys(indexes).join(", ") || "(none)"}`,
+        );
     }
 
     return index;
@@ -54,7 +63,7 @@ const MAX_UPSERT_BATCH = 1000;
 
 const createVectors = (options: LunoraVectorsOptions): LunoraVectors => {
     if (Object.keys(options.indexes).length === 0) {
-        throw new Error("@lunora/bindings/vectors: at least one index binding is required");
+        throw new TypeError("@lunora/bindings/vectors: at least one index binding is required");
     }
 
     const upsert = async <TInput>(indexName: string, input: UpsertInput<TInput>): Promise<VectorizeUpsertMutation> => {
@@ -105,7 +114,7 @@ const createVectors = (options: LunoraVectorsOptions): LunoraVectors => {
             values = input.vector;
         } else {
             if (!input.embed || input.input === undefined) {
-                throw new Error("@lunora/bindings/vectors: query requires either `vector` or both `input` and `embed`");
+                throw new TypeError("@lunora/bindings/vectors: query requires either `vector` or both `input` and `embed`");
             }
 
             values = await input.embed(input.input);
@@ -144,7 +153,7 @@ const createVectors = (options: LunoraVectorsOptions): LunoraVectors => {
         const index = resolveIndex(options.indexes, indexName);
 
         if (!index.describe) {
-            throw new Error(`@lunora/bindings/vectors: binding for "${indexName}" does not implement describe()`);
+            throw new LunoraError("INTERNAL", `@lunora/bindings/vectors: binding for "${indexName}" does not implement describe()`);
         }
 
         return index.describe();

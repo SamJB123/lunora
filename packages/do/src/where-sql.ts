@@ -15,6 +15,7 @@
  * path resolves relations to flat clauses upstream and omits the hook.
  */
 /* eslint-disable no-restricted-syntax -- every `sql\`…\`` here is a drizzle tagged-template SQL builder, not a string conversion; the rule misfires on the inner TemplateLiteral. */
+import { LunoraError } from "@lunora/errors";
 import type { SQL } from "drizzle-orm";
 import { sql } from "drizzle-orm";
 
@@ -31,8 +32,11 @@ interface WhereSqlStrategy {
 
     /**
      * Dialect `contains` rendering given the field reference and the (already
-     * bound) search term. Absent ⇒ the portable `… LIKE '%' || term || '%'`
-     * concat form (SQLite/Postgres); MySQL supplies a `CONCAT(...)` variant.
+     * bound, already wildcard-escaped) search term. Absent ⇒ the portable
+     * `… LIKE '%' || term || '%' ESCAPE '\'` concat form (SQLite/Postgres); MySQL
+     * supplies a `CONCAT(...)` variant. The term is escaped by
+     * {@link compileContains}, so an implementation MUST pair it with
+     * `ESCAPE '\'` for the literal-match to hold.
      */
     likeContains?: (reference: SQL, term: SQL) => SQL;
 
@@ -82,11 +86,21 @@ const isOperatorObject = (value: unknown): value is FieldOperators => {
     return keys.length > 0 && keys.every((key) => OPERATOR_KEY_SET.has(key));
 };
 
-/** Render a `contains` substring match, binding the term (never interpolating raw). */
-const compileContains = (reference: SQL, value: unknown, strategy: WhereSqlStrategy): SQL => {
-    const term = sql`${strategy.serialize(value)}`;
+/**
+ * Escape LIKE wildcards (`%`, `_`) and the escape char (`\`) in a `contains`
+ * term so they match literally. Without this a client-supplied term like `%` or
+ * `a%b%c%…` becomes a live pattern — matching every row, or forcing a pathological
+ * pattern scan (a mild DoS). The escaped term pairs with `ESCAPE '\'` on the LIKE.
+ * Non-string values pass through unchanged (a `contains` on a non-string is odd,
+ * but not our concern here).
+ */
+const escapeLikeTerm = (value: unknown): unknown => (typeof value === "string" ? value.replaceAll(/[\\%_]/g, (character) => `\\${character}`) : value);
 
-    return strategy.likeContains ? strategy.likeContains(reference, term) : sql`${reference} LIKE '%' || ${term} || '%'`;
+/** Render a `contains` substring match, binding the (wildcard-escaped) term (never interpolating raw). */
+const compileContains = (reference: SQL, value: unknown, strategy: WhereSqlStrategy): SQL => {
+    const term = sql`${strategy.serialize(escapeLikeTerm(value))}`;
+
+    return strategy.likeContains ? strategy.likeContains(reference, term) : sql`${reference} LIKE '%' || ${term} || '%' ESCAPE '\\'`;
 };
 
 const compileComparator = (reference: SQL, operator: string, comparator: string, value: unknown, strategy: WhereSqlStrategy): SQL => {
@@ -198,7 +212,7 @@ const STRUCTURAL_KEYS = new Set<string>(["AND", "NOT", "OR", RELATION_EXISTS_KEY
 const compileStructuralKey = (key: string, value: unknown, strategy: WhereSqlStrategy): SQL | undefined => {
     if (key === RELATION_EXISTS_KEY) {
         if (!strategy.relationExists) {
-            throw new Error("encountered a relation EXISTS marker without a relationExists strategy hook");
+            throw new LunoraError("INTERNAL", "encountered a relation EXISTS marker without a relationExists strategy hook");
         }
 
         return strategy.relationExists(value);

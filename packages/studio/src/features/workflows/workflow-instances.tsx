@@ -57,8 +57,9 @@ const formatStepPayload = (step: { error?: unknown; output?: unknown }): string 
  * timeline, and (when client-owned) pause / resume / terminate it.
  *
  * Requires the worker to be built with a `workflowsClient` (a Cloudflare account
- * id + API token); absent it, the proxy reports `WORKFLOWS_NOT_CONFIGURED` and
- * this renders a "set credentials" state while the workflows keep running.
+ * id + API token); absent it, the list responds with `configured: false` (an
+ * older worker reports `WORKFLOWS_NOT_CONFIGURED` instead) and this renders a
+ * "set credentials" state while the workflows keep running.
  *
  * Works under `&lt;LunoraProvider>` via the client's workflow methods; pass the
  * loader props to override the transport (a custom `loadInstances` ⇒ read-only).
@@ -74,13 +75,6 @@ export const WorkflowInstanceHistory = ({ loadDetail, loadInstances, readOnly, r
     const [notConfigured, setNotConfigured] = useState(false);
     const [busyId, setBusyId] = useState<null | string>(null);
 
-    const listImpl =
-        loadInstances ??
-        (async (arguments_: { name: string; status?: WorkflowInstanceStatus }) => {
-            const page = await client.listWorkflowInstances(arguments_);
-
-            return page.instances;
-        });
     const detailImpl = loadDetail ?? ((arguments_: { id: string; name: string }) => client.getWorkflowInstance(arguments_));
     // Lifecycle actions are available only when the list is client-sourced (a
     // custom `loadInstances` ⇒ read-only) or an explicit `runAction` is supplied.
@@ -94,8 +88,31 @@ export const WorkflowInstanceHistory = ({ loadDetail, loadInstances, readOnly, r
         setError(null);
         setNotConfigured(false);
 
+        const status = statusFilter === "" ? undefined : statusFilter;
+
         try {
-            setInstances(await listImpl({ name: workflowName, status: statusFilter === "" ? undefined : statusFilter }));
+            // The client-owned path reads the page's `configured` flag: a current
+            // worker reports "unconfigured" as a 200 sentinel (no failed request in
+            // the console), while an older worker still throws the
+            // `WORKFLOWS_NOT_CONFIGURED` code — caught below for back-compat. A
+            // custom `loadInstances` override only yields summaries, so it can't be
+            // unconfigured.
+            if (loadInstances === undefined) {
+                const page = await client.listWorkflowInstances({ name: workflowName, status });
+
+                if (page.configured === false) {
+                    setInstances(null);
+                    setNotConfigured(true);
+
+                    return;
+                }
+
+                setInstances(page.instances);
+
+                return;
+            }
+
+            setInstances(await loadInstances({ name: workflowName, status }));
         } catch (error_) {
             setInstances(null);
 
@@ -108,7 +125,7 @@ export const WorkflowInstanceHistory = ({ loadDetail, loadInstances, readOnly, r
     };
 
     useEffect(() => {
-        // eslint-disable-next-line react-x/set-state-in-effect -- intentionally close any open detail when the workflow/filter changes
+        // eslint-disable-next-line react-x/set-state-in-effect, react-you-might-not-need-an-effect/no-chain-state-updates, react-you-might-not-need-an-effect/no-adjust-state-on-prop-change -- the effect drives an async reload; closing any open detail is coupled to that fetch (no render-derivable value, and a key-reset would remount and drop the status filter)
         setDetail(null);
         fireAndForget(load());
         // eslint-disable-next-line react-hooks/exhaustive-deps -- reload when the workflow or status filter changes

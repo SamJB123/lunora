@@ -1,6 +1,6 @@
 {
     "name": "@lunora/do",
-    "version": "1.0.0-alpha.7",
+    "version": "1.0.0-alpha.33",
     "description": "Lunora Durable Objects: ShardDO (SQLite, OCC, hibernated WebSocket subscriptions) and SessionDO",
     "keywords": [
         "cloudflare",
@@ -50,8 +50,8 @@
         "build:prod": "pnpm exec packem build --production",
         "lint:eslint": "eslint .",
         "lint:eslint:fix": "eslint . --fix",
-        "lint:prettier": "prettier --check .",
-        "lint:prettier:fix": "prettier --write .",
+        "lint:prettier": "prettier --check . --ignore-path ../../.prettierignore",
+        "lint:prettier:fix": "prettier --write . --ignore-path ../../.prettierignore",
         "lint:types": "tsc --noEmit",
         "test": "vitest run",
         "test:coverage": "vitest run --coverage",
@@ -61,6 +61,8 @@
         "fallow:health": "fallow health --score"
     },
     "dependencies": {
+        "@lunora/errors": "1.0.0-alpha.5",
+        "@lunora/fingerprint": "1.0.0-alpha.3",
         "@visulima/redact": "catalog:redact",
         "drizzle-orm": "catalog:drizzle"
     },
@@ -68,7 +70,7 @@
         "@cloudflare/vitest-pool-workers": "catalog:cloudflare",
         "@cloudflare/workers-types": "catalog:cloudflare",
         "@codspeed/vitest-plugin": "catalog:test",
-        "@lunora/bindings": "1.0.0-alpha.1",
+        "@lunora/bindings": "1.0.0-alpha.8",
         "@types/node": "catalog:types",
         "@visulima/packem": "catalog:build",
         "@vitest/coverage-v8": "catalog:test",

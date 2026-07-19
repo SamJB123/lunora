@@ -1,3 +1,6 @@
+import { LunoraError } from "@lunora/errors";
+
+import { quoteIdentifier } from "../../../shared/quote-identifier";
 import type { AuditEntry } from "./audit-log";
 import type { SqlExec } from "./ctx-db";
 import type { SortDirection } from "./query-args";
@@ -26,6 +29,20 @@ const ADMIN_FUNCTION_PREFIX = "__lunora_admin__:";
 const RELATION_FUNCTION_PREFIX = "__lunora_relation__:";
 
 /**
+ * Reserved `functionPath` prefix for live feature-flag reads. The React client's
+ * `useFlag`/`useFlags` subscribe to `__lunora_flags__:eval` over the same WS
+ * channel as a user query; `ShardDO` intercepts it before user dispatch and
+ * serves it from the codegen-overridden flag-subscription read hook, which
+ * evaluates the flag through the app's OpenFeature provider under the socket's
+ * verified identity. Like the other reserved prefixes it is NOT admin-gated (a
+ * flag read is public, scoped to the subscriber's own targeting context), and
+ * the `__lunora_` namespace is reserved so a real `&lt;file>:&lt;function>` can't
+ * collide. Re-evaluated on every write-flush so values stay live within a
+ * session (provider-side flips with no intervening write surface on reconnect).
+ */
+const FLAGS_FUNCTION_PREFIX = "__lunora_flags__:";
+
+/**
  * Fully-qualified reserved paths the data browser invokes. The
  * `__lunora_admin__:` prefix is spelled out inline rather than interpolated so
  * the values stay emittable under `--isolatedDeclarations`.
@@ -34,6 +51,7 @@ const ADMIN_FUNCTIONS = {
     applyCdc: "__lunora_admin__:applyCdc",
     cdcSync: "__lunora_admin__:cdcSync",
     clearCapturedMail: "__lunora_admin__:clearCapturedMail",
+    clearQueueMessages: "__lunora_admin__:clearQueueMessages",
     clearTable: "__lunora_admin__:clearTable",
     createWorkflowInstance: "__lunora_admin__:createWorkflowInstance",
     deleteRows: "__lunora_admin__:deleteRows",
@@ -45,18 +63,22 @@ const ADMIN_FUNCTIONS = {
     getAuditLog: "__lunora_admin__:getAuditLog",
     getAuthMetrics: "__lunora_admin__:getAuthMetrics",
     getCapturedMail: "__lunora_admin__:getCapturedMail",
+    getFanoutMetrics: "__lunora_admin__:getFanoutMetrics",
     getFunctionStats: "__lunora_admin__:getFunctionStats",
+    getIssues: "__lunora_admin__:getIssues",
     listSubscriptions: "__lunora_admin__:listSubscriptions",
     listTableIndexes: "__lunora_admin__:listTableIndexes",
     getLogs: "__lunora_admin__:getLogs",
     getMetrics: "__lunora_admin__:getMetrics",
     getPitrBookmark: "__lunora_admin__:getPitrBookmark",
+    getQueueMessages: "__lunora_admin__:getQueueMessages",
     getRequestLog: "__lunora_admin__:getRequestLog",
     getSecurityAudit: "__lunora_admin__:getSecurityAudit",
     getSettings: "__lunora_admin__:getSettings",
     // eslint-disable-next-line no-secrets/no-secrets -- reserved admin RPC path constant, not a credential
     getWorkflowInstanceStatus: "__lunora_admin__:getWorkflowInstanceStatus",
     importShard: "__lunora_admin__:importShard",
+    listFlags: "__lunora_admin__:listFlags",
     listQueues: "__lunora_admin__:listQueues",
     listTables: "__lunora_admin__:listTables",
     listWorkflows: "__lunora_admin__:listWorkflows",
@@ -69,10 +91,13 @@ const ADMIN_FUNCTIONS = {
     recordAuthEvent: "__lunora_admin__:recordAuthEvent",
     recordContainerEvent: "__lunora_admin__:recordContainerEvent",
     recordMail: "__lunora_admin__:recordMail",
+    recordQueueMessage: "__lunora_admin__:recordQueueMessage",
+    replayQueueMessage: "__lunora_admin__:replayQueueMessage",
     rlsPolicies: "__lunora_admin__:rlsPolicies",
     runAs: "__lunora_admin__:runAs",
     runMigration: "__lunora_admin__:runMigration",
     runSql: "__lunora_admin__:runSql",
+    sendQueueMessage: "__lunora_admin__:sendQueueMessage",
     sendTestMail: "__lunora_admin__:sendTestMail",
     storageOrphans: "__lunora_admin__:storageOrphans",
     storageReferences: "__lunora_admin__:storageReferences",
@@ -386,6 +411,16 @@ interface StorageRulesResult {
  * package's tests and the studio's fails the build if the two key sets diverge.
  */
 interface StudioFeaturesResult {
+    /** `@lunora/bindings/analytics` / `ctx.analytics` is used, or it is a declared dependency. */
+    analytics: boolean;
+    /** `@lunora/auth` is a declared dependency (backs the Users / Sessions / Organizations / Configuration pages). */
+    auth: boolean;
+    /** `@lunora/container` / `ctx.containers` is used, the app declares containers, or it is a declared dependency. */
+    containers: boolean;
+    /** `@lunora/flags` / `ctx.flags` is used, or it is a declared dependency. */
+    flags: boolean;
+    /** `@lunora/bindings/kv` / `ctx.kv` is used, or it is a declared dependency. */
+    kv: boolean;
     /** `@lunora/mail` is imported by a `lunora/` source or a declared dependency. */
     mail: boolean;
     /** `@lunora/payment` is used (import or `ctx.payments`) or a declared dependency. */
@@ -400,6 +435,42 @@ interface StudioFeaturesResult {
     vectors: boolean;
     /** `@lunora/workflow` / `ctx.workflows` is used, the app declares workflows, or it is a declared dependency. */
     workflows: boolean;
+}
+
+/**
+ * One feature flag evaluated under a supplied targeting context, surfaced by
+ * `__lunora_admin__:listFlags` for the studio's read-only Flags page. The `key`
+ * and `type` are statically discovered by `@lunora/codegen` from the app's
+ * `ctx.flags.&lt;type>("key", …)` reads; `value`/`reason`/`variant`/`errorCode`
+ * come from the live OpenFeature evaluation (the codegen subclass overrides the
+ * base `evaluateFlags` hook). `value` is the resolved flag value as JSON.
+ */
+interface FlagEvaluation {
+    /** OpenFeature `errorCode` when the evaluation failed (the value falls back to the default). */
+    errorCode?: string;
+    /** The discovered flag key (the first argument of a `ctx.flags.&lt;type>(...)` read). */
+    key: string;
+    /** OpenFeature `reason` for the resolution (`TARGETING_MATCH`, `DEFAULT`, `ERROR`, …). */
+    reason?: string;
+    /** The flag's value type, derived from which `ctx.flags.&lt;type>` method read it. */
+    type: "boolean" | "number" | "object" | "string";
+    /** The resolved value (JSON), or the type default when unconfigured / on error. */
+    value: unknown;
+    /** OpenFeature `variant` identifier when the provider reports one. */
+    variant?: string;
+}
+
+/**
+ * Payload of a `__lunora_admin__:listFlags` call: every statically-discovered
+ * flag evaluated under the supplied targeting context. `configured` is `false`
+ * when the app wires no `@lunora/flags` provider (the base hook), so the studio
+ * can distinguish "no flags configured" from "configured but zero flags read".
+ */
+interface FlagsResult {
+    /** `true` when an `@lunora/flags` provider is wired (the codegen override ran). */
+    configured: boolean;
+    /** Each discovered flag evaluated under the request's targeting context. */
+    flags: FlagEvaluation[];
 }
 
 /**
@@ -546,7 +617,13 @@ interface TablePage {
      */
     refs?: Record<string, string>;
     rows: Record<string, unknown>[];
-    total: number;
+
+    /**
+     * Total rows matching the predicate. Absent when the read passed
+     * `skipCount: true` (the caller sources the count from a separate,
+     * predicate-keyed read instead of recomputing it per page).
+     */
+    total?: number;
 }
 
 /** Comparison a {@link FilterClause} applies. `contains` is a case-sensitive substring (LIKE); the rest are direct SQL comparisons. */
@@ -609,6 +686,15 @@ interface ReadTablePageOptions {
      * Empty/whitespace is treated as no filter.
      */
     search?: string;
+
+    /**
+     * Skip the `SELECT COUNT(*)` and return the page with `total` absent. The
+     * data browser splits the row count into a separate predicate-keyed read (one
+     * that excludes `offset`), so paging never re-counts; the page read passes
+     * this to avoid recomputing the same total per offset. Unset → the COUNT runs
+     * (today's behavior) and `total` is populated.
+     */
+    skipCount?: boolean;
     table: string;
 }
 
@@ -747,9 +833,6 @@ const escapeLike = (value: string): string => value.replaceAll(/[\\%_]/g, (chara
  */
 const isInternalTable = (name: string): boolean =>
     name.startsWith("sqlite_") || name.startsWith("_cf_") || name.startsWith("__miniflare") || name.startsWith("__lunora") || name.includes("__fts_");
-
-/** Double-quote a SQL identifier, escaping any embedded double quotes. */
-const quoteIdentifier = (name: string): string => `"${name.replaceAll('"', '""')}"`;
 
 const clamp = (value: number, min: number, max: number): number => Math.min(Math.max(value, min), max);
 
@@ -913,7 +996,7 @@ const readTablePage = (sql: SqlExec, options: ReadTablePageOptions): TablePage =
     const { table } = options;
 
     if (isInternalTable(table) || !tableExists(sql, table)) {
-        throw Object.assign(new Error(`unknown table: ${table}`), { code: "UNKNOWN_TABLE", name: "LunoraError", status: 404 });
+        throw new LunoraError("UNKNOWN_TABLE", `unknown table: ${table}`, { status: 404 });
     }
 
     const limit = clamp(Math.trunc(options.limit ?? DEFAULT_PAGE_SIZE), 1, MAX_PAGE_SIZE);
@@ -928,7 +1011,7 @@ const readTablePage = (sql: SqlExec, options: ReadTablePageOptions): TablePage =
     const needle = options.search?.trim() ?? "";
 
     // Echo only the refs whose column actually surfaces (a UI links those cells).
-    const withReferences = (page: { columns: string[]; rows: Record<string, unknown>[]; total: number }): TablePage => {
+    const withReferences = (page: { columns: string[]; rows: Record<string, unknown>[]; total?: number }): TablePage => {
         if (options.refs === undefined) {
             return page;
         }
@@ -957,10 +1040,18 @@ const readTablePage = (sql: SqlExec, options: ReadTablePageOptions): TablePage =
     const whereParams = predicate?.parameters ?? [];
     const orderParams = order?.params ?? [];
 
-    const total =
-        predicate === undefined
-            ? countRows(sql, quoted)
-            : Number(sql.exec<{ c: number | bigint }>(`SELECT COUNT(*) AS c FROM ${quoted}${whereSql}`, ...whereParams).one().c);
+    // `skipCount` omits the COUNT entirely (the caller sources `total` from a
+    // separate, predicate-keyed read so paging never re-counts). Otherwise the
+    // COUNT reflects the filtered set so pagination stays honest.
+    let total: number | undefined;
+
+    if (!options.skipCount) {
+        total =
+            predicate === undefined
+                ? countRows(sql, quoted)
+                : Number(sql.exec<{ c: number | bigint }>(`SELECT COUNT(*) AS c FROM ${quoted}${whereSql}`, ...whereParams).one().c);
+    }
+
     const rawRows = sql.exec(`SELECT * FROM ${quoted}${whereSql}${orderSql} LIMIT ? OFFSET ?`, ...whereParams, ...orderParams, limit, offset).toArray();
 
     return withReferences({ ...expandDocumentRows(columns, rawRows), total });
@@ -983,7 +1074,7 @@ const selectMatchingIds = (sql: SqlExec, options: SelectMatchingIdsOptions): { h
     const { table } = options;
 
     if (isInternalTable(table) || !tableExists(sql, table)) {
-        throw Object.assign(new Error(`unknown table: ${table}`), { code: "UNKNOWN_TABLE", name: "LunoraError", status: 404 });
+        throw new LunoraError("UNKNOWN_TABLE", `unknown table: ${table}`, { status: 404 });
     }
 
     const limit = clamp(Math.trunc(options.limit ?? MAX_PAGE_SIZE), 1, MAX_PAGE_SIZE);
@@ -1060,7 +1151,7 @@ const facetColumn = (sql: SqlExec, options: FacetColumnOptions): FacetColumnResu
     const { column, table } = options;
 
     if (isInternalTable(table) || !tableExists(sql, table)) {
-        throw Object.assign(new Error(`unknown table: ${table}`), { code: "UNKNOWN_TABLE", name: "LunoraError", status: 404 });
+        throw new LunoraError("UNKNOWN_TABLE", `unknown table: ${table}`, { status: 404 });
     }
 
     const quoted = quoteIdentifier(table);
@@ -1070,7 +1161,7 @@ const facetColumn = (sql: SqlExec, options: FacetColumnOptions): FacetColumnResu
         .map((info) => info.name);
 
     if (!knownDisplayColumns(sql, quoted, physicalColumns).has(column)) {
-        throw Object.assign(new Error(`unknown column: ${column}`), { code: "UNKNOWN_COLUMN", name: "LunoraError", status: 404 });
+        throw new LunoraError("UNKNOWN_COLUMN", `unknown column: ${column}`, { status: 404 });
     }
 
     const resolved = resolveColumnExpression(column, physicalColumns);
@@ -1078,7 +1169,7 @@ const facetColumn = (sql: SqlExec, options: FacetColumnOptions): FacetColumnResu
     if (resolved === undefined) {
         // Defensive: a known column always resolves; if it somehow doesn't, fail
         // closed rather than build SQL without a bound expression.
-        throw Object.assign(new Error(`unknown column: ${column}`), { code: "UNKNOWN_COLUMN", name: "LunoraError", status: 404 });
+        throw new LunoraError("UNKNOWN_COLUMN", `unknown column: ${column}`, { status: 404 });
     }
 
     const limit = clamp(Math.trunc(options.limit ?? DEFAULT_FACET_LIMIT), 1, MAX_FACET_LIMIT);
@@ -1239,16 +1330,187 @@ const summarizeSubscriptions = (attachments: SocketAttachmentLike[]): Subscripti
     return { connections, totalConnections: connections.length, totalSubscriptions };
 };
 
+/**
+ * One topic or shape with the number of sockets currently subscribed to it, as
+ * surfaced by `__lunora_admin__:getFanoutMetrics`. `subscribers` is the fan-out
+ * **width** one poke/broadcast incurs for this topic — the O(subscribers) cost
+ * the auto-elastic relay tier (plan 075) targets — so a single hot topic is
+ * visible here long before it becomes a bottleneck.
+ */
+interface FanoutTopicStat {
+    /** `"shape"` = a reactive-query shape (poked from SQLite); `"whisper"` = an ephemeral whisper topic. */
+    kind: "shape" | "whisper";
+    /** Connected sockets currently subscribed — the fan-out width one flush/broadcast incurs for this topic. */
+    subscribers: number;
+    /** The shape name (the `defineShape` export) or the whisper topic string. */
+    topic: string;
+}
+
+/**
+ * Running fan-out counters for one delivery path (the reactive shape poke or the
+ * whisper broadcast) since this DO instance woke. In-memory and reset on
+ * hibernation/restart — the same "since this instance woke" granularity as
+ * `getMetrics`/`getFunctionStats`.
+ *
+ * `socketsIterated` is the O(subscribers) loop cost the relay tier targets;
+ * `socketsDelivered` is how many of those iterated sockets actually received a
+ * frame (the rest were visited but had no matching shape, or were the whisper
+ * sender). `totalMs`/`maxMs` are **coarse** wall-clock for the asynchronous
+ * shape-poke path only: a Durable Object's clock advances only across I/O, so
+ * treat them as directional, not exact. They stay `0` for the synchronous
+ * whisper path, which performs no awaited I/O to time.
+ */
+interface FanoutPathCounters {
+    /** Coarse slowest single pass, in ms (shape-poke path only; `0` for whisper). */
+    maxMs: number;
+    /** Fan-out passes that ran (shape-poke flushes / whisper broadcasts). */
+    passes: number;
+    /** Widest single pass — the most sockets iterated in one flush/broadcast. */
+    peakSocketsIterated: number;
+
+    /**
+     * Sockets a frame was sent to, summed across every pass. The shape-poke path
+     * counts only confirmed sends (`sendPoke` returned `true`); the whisper path
+     * counts matched receivers (the best-effort `trySendFrame` may silently no-op
+     * on a socket that closed between the snapshot and the send), so it can very
+     * marginally over-count in that near-impossible race.
+     */
+    socketsDelivered: number;
+    /** Sockets visited, summed across every pass — the O(subscribers) iteration cost. */
+    socketsIterated: number;
+    /** Coarse summed wall-clock across every pass, in ms (shape-poke path only; `0` for whisper). */
+    totalMs: number;
+}
+
+/**
+ * Payload of a `__lunora_admin__:getFanoutMetrics` call: the current per-topic
+ * subscriber counts plus the running fan-out counters for each delivery path.
+ * The point-in-time `topics`/`peakSubscribers`/`totalConnections` are derived
+ * live from `getWebSockets()` + each socket's attachment; the `shapePoke`/
+ * `whisper` counters are the in-memory running tallies (reset on hibernation).
+ * Feeds the Studio fan-out observability panel — the "you can see it scale"
+ * half of plan 075 Phase 1, before any topology change exists.
+ */
+interface FanoutMetricsResult {
+    /** Cost ceiling — the hard cap on relays per shard (`LUNORA_MAX_RELAYS`); the relay tier never spawns more, even for a viral shard. */
+    maxRelays: number;
+    /** Highest current subscriber count across all topics/shapes — the widest single fan-out right now. */
+    peakSubscribers: number;
+    /** `true` once this shard crossed the promotion threshold and is spreading new connections across relays (plan 075 Phase 2). */
+    promoted: boolean;
+    /** How many relays new connections are currently spread across (`0` when owner-served). */
+    relayCount: number;
+    /** Running reactive-shape-poke fan-out counters since this instance woke. */
+    shapePoke: FanoutPathCounters;
+    /** Epoch-ms this instance began collecting (shared with `getMetrics`/`getFunctionStats`). */
+    sinceMs: number;
+    /** Hottest topics/shapes by current subscriber count, busiest first (capped at {@link DEFAULT_FANOUT_TOPIC_LIMIT}). */
+    topics: FanoutTopicStat[];
+    /** Live socket count on this shard. */
+    totalConnections: number;
+    /** Running whisper-broadcast fan-out counters since this instance woke. */
+    whisper: FanoutPathCounters;
+}
+
+/**
+ * One socket's attachment as seen by {@link summarizeFanoutTopics} — the subset
+ * of `./types`' `SocketAttachment` the fan-out summary reads (live `shapes` keyed
+ * by subscription id, and the joined whisper `topics`). Narrowed so the summary
+ * stays a pure, harness-testable function with no dependency on the DO runtime.
+ */
+interface FanoutAttachmentLike {
+    shapes?: Record<string, { name?: string }>;
+    whispers?: string[];
+}
+
+/** Default cap on the number of hot topics {@link summarizeFanoutTopics} returns, so a deployment with thousands of distinct shapes can't return an unbounded list. */
+const DEFAULT_FANOUT_TOPIC_LIMIT = 20;
+
+/** A freshly-zeroed {@link FanoutPathCounters}, for a DO instance waking up. */
+const createFanoutCounters = (): FanoutPathCounters => {
+    return { maxMs: 0, passes: 0, peakSocketsIterated: 0, socketsDelivered: 0, socketsIterated: 0, totalMs: 0 };
+};
+
+/**
+ * Fold one fan-out pass into a running {@link FanoutPathCounters}, returning the
+ * updated counters: bump the pass count, add the iterated/delivered socket
+ * totals, and lift the peak-width and slowest-pass high-water marks. Pure (a new
+ * object, no mutation) so it stays trivially testable; the caller swaps the
+ * stored counters for the result. `ms` is `0` for the synchronous whisper path
+ * (nothing awaited to time).
+ */
+const recordFanoutPass = (counters: FanoutPathCounters, iterated: number, delivered: number, ms: number): FanoutPathCounters => {
+    return {
+        maxMs: Math.max(counters.maxMs, ms),
+        passes: counters.passes + 1,
+        peakSocketsIterated: Math.max(counters.peakSocketsIterated, iterated),
+        socketsDelivered: counters.socketsDelivered + delivered,
+        socketsIterated: counters.socketsIterated + iterated,
+        totalMs: counters.totalMs + ms,
+    };
+};
+
+/**
+ * Fold a per-socket list of attachments into the point-in-time half of a
+ * {@link FanoutMetricsResult}: current subscriber count per shape (grouped by
+ * `defineShape` name) and per whisper topic, the busiest `limit` of them, the
+ * peak width across all of them, and the live socket count. Pure — the DO method
+ * feeds it `getWebSockets().map(readAttachment)` and merges in the running
+ * counters.
+ */
+const summarizeFanoutTopics = (
+    attachments: FanoutAttachmentLike[],
+    limit: number = DEFAULT_FANOUT_TOPIC_LIMIT,
+): { peakSubscribers: number; topics: FanoutTopicStat[]; totalConnections: number } => {
+    const shapeCounts = new Map<string, number>();
+    const whisperCounts = new Map<string, number>();
+
+    for (const attachment of attachments) {
+        for (const shape of Object.values(attachment.shapes ?? {})) {
+            const key = shape.name ?? "(unknown shape)";
+
+            shapeCounts.set(key, (shapeCounts.get(key) ?? 0) + 1);
+        }
+
+        for (const topic of attachment.whispers ?? []) {
+            whisperCounts.set(topic, (whisperCounts.get(topic) ?? 0) + 1);
+        }
+    }
+
+    const topics: FanoutTopicStat[] = [
+        ...[...shapeCounts].map(([topic, subscribers]): FanoutTopicStat => {
+            return { kind: "shape", subscribers, topic };
+        }),
+        ...[...whisperCounts].map(([topic, subscribers]): FanoutTopicStat => {
+            return { kind: "whisper", subscribers, topic };
+        }),
+    ];
+
+    // Busiest first; ties broken by name so the order is stable across reads.
+    topics.sort((a, b) => b.subscribers - a.subscribers || a.topic.localeCompare(b.topic));
+
+    // The peak is the head of the busiest-first list — and it is the FULL list,
+    // so the global max survives the `slice(0, limit)` truncation below.
+    const peakSubscribers = topics[0]?.subscribers ?? 0;
+
+    return { peakSubscribers, topics: topics.slice(0, limit), totalConnections: attachments.length };
+};
+
 export {
     ADMIN_FUNCTION_PREFIX,
     ADMIN_FUNCTIONS,
+    createFanoutCounters,
+    DEFAULT_FANOUT_TOPIC_LIMIT,
     facetColumn,
     findStorageReferences,
+    FLAGS_FUNCTION_PREFIX,
     listTables,
     MAX_PAGE_SIZE,
     readTablePage,
+    recordFanoutPass,
     RELATION_FUNCTION_PREFIX,
     selectMatchingIds,
+    summarizeFanoutTopics,
     summarizeSubscriptions,
 };
 export type {
@@ -1261,8 +1523,13 @@ export type {
     FacetColumnOptions,
     FacetColumnResult,
     FacetValue,
+    FanoutMetricsResult,
+    FanoutPathCounters,
+    FanoutTopicStat,
     FilterClause,
     FilterOperator,
+    FlagEvaluation,
+    FlagsResult,
     FunctionCallStat,
     FunctionScanAttribution,
     FunctionStatsResult,

@@ -309,6 +309,156 @@ describe("paginatedQuery pending-page rebalance guard (BUG 2 regression)", () =>
     });
 });
 
+describe("paginatedQuery rebalance result migration (FINDING 1 & 2 regression)", () => {
+    it("a JOIN carries the surviving result to the merged page instead of dropping it or resurrecting stale data", async () => {
+        const subscribeCalls: { args: Record<string, unknown>; callback: (data: unknown) => void }[] = [];
+
+        const client = {
+            subscribe: (_fn: FunctionReference, args: Record<string, unknown>, callback: (data: unknown) => void) => {
+                subscribeCalls.push({ args, callback });
+
+                return () => undefined;
+            },
+        } as unknown as import("@lunora/client").LunoraClient;
+
+        // JOIN fires below 0.5 × numItems; SPLIT above 2 × numItems. With
+        // initialNumItems 4, JOIN triggers when a bounded page drops below 2.
+        const NUM = 4;
+        const pushTo = (args: Record<string, unknown>, value: unknown): void => {
+            const key = JSON.stringify(args);
+            const call = subscribeCalls.find((c) => JSON.stringify(c.args) === key);
+
+            call?.callback(value);
+        };
+
+        const { loadMore, results } = paginatedQuery(client, fn, {}, { initialNumItems: NUM });
+
+        const stopResults = results.subscribe(() => {});
+
+        // First (open-tail) page delivers a full 4-item page → CanLoadMore.
+        pushTo(
+            { paginationOpts: { cursor: null, endCursor: null, numItems: NUM } },
+            { continueCursor: "c1", isDone: false, page: [{ id: "1" }, { id: "2" }, { id: "3" }, { id: "4" }] },
+        );
+        await flushAsync();
+
+        // loadMore pins page-1 as `{null → c1}` and opens an open tail `{c1 → null}`.
+        loadMore(NUM);
+        await flushAsync();
+
+        // Page-2 resolves and is exhausted.
+        pushTo({ paginationOpts: { cursor: "c1", endCursor: null, numItems: NUM } }, { continueCursor: null, isDone: true, page: [{ id: "5" }, { id: "6" }] });
+        await flushAsync();
+
+        // Now the pinned page-1 shrinks to a single item (< JOIN threshold of 2).
+        // rebalance JOINs page-1 with the tail → the merged page's key is exactly
+        // the ORIGINAL open-tail key `{null → null}`.
+        pushTo({ paginationOpts: { cursor: null, endCursor: "c1", numItems: NUM } }, { continueCursor: "c1", isDone: false, page: [{ id: "x" }] });
+        await flushAsync();
+
+        // FINDING 1: the merged page must carry the surviving page-1 result — not
+        // emit `undefined` and blank the feed (`length` would be 0).
+        // FINDING 2: the merged key must NOT serve the stale pre-loadMore 4-item
+        // result (`length` would be 4) — the loadMore re-key pruned that entry.
+        expect(get(results)).toStrictEqual([{ id: "x" }]);
+
+        stopResults();
+    });
+});
+
+/**
+ * A `LunoraClient` stand-in whose `subscribe` replays a preseeded cached value
+ * to the new subscriber SYNCHRONOUSLY — the callback fires before `subscribe`
+ * returns, exactly like the real client (`lunora-client.ts` replays `lastValue`
+ * before handing back the unsubscribe handle). This is the trigger for the
+ * reentrant-`syncSubscriptions` bug the guard fixes.
+ */
+interface ReplaySub {
+    args: Record<string, unknown>;
+    key: string;
+    push: (value: unknown) => void;
+    unsubscribed: boolean;
+}
+
+const createReplayFake = (): { cache: Map<string, unknown>; client: LunoraClient; subs: ReplaySub[] } => {
+    const subs: ReplaySub[] = [];
+    const cache = new Map<string, unknown>();
+
+    const client = {
+        subscribe: (_function: FunctionReference, args: Record<string, unknown>, callback: (value: unknown) => void): Unsubscribe => {
+            const key = JSON.stringify(args);
+            const sub: ReplaySub = { args, key, push: callback, unsubscribed: false };
+
+            subs.push(sub);
+
+            if (cache.has(key)) {
+                // Synchronous replay — fires before this `subscribe` call returns.
+                callback(cache.get(key));
+            }
+
+            return () => {
+                sub.unsubscribed = true;
+            };
+        },
+    };
+
+    return { cache, client: client as unknown as LunoraClient, subs };
+};
+
+describe("paginatedQuery reentrancy (BUG: leaked WS subscription regression)", () => {
+    it("reentrant rebalance during a synchronous cached replay does not orphan or duplicate page subscriptions", () => {
+        const fake = createReplayFake();
+
+        const numItems = 2; // SPLIT_FACTOR (2) × numItems = 4 → a 5-item page splits.
+        const { loadMore, results } = paginatedQuery(fake.client, fn, {}, { initialNumItems: numItems });
+
+        // Open the lazy readable so the first page subscribes.
+        const stopResults = results.subscribe(() => {});
+
+        // Resolve the first (open-ended) page so the feed can `loadMore`.
+        const firstKey = JSON.stringify({ paginationOpts: { cursor: null, endCursor: null, numItems } });
+
+        for (const sub of fake.subs) {
+            if (sub.key === firstKey && !sub.unsubscribed) {
+                sub.push({ continueCursor: "c1", isDone: false, page: [{ id: "a" }, { id: "b" }] });
+            }
+        }
+
+        // Preseed an OVERSIZED cached result for the page `loadMore` pins, so its
+        // fresh subscription replays synchronously and triggers a split mid-sync.
+        const pinnedKey = JSON.stringify({ paginationOpts: { cursor: null, endCursor: "c1", numItems } });
+
+        fake.cache.set(pinnedKey, {
+            continueCursor: "c1",
+            isDone: false,
+            page: [{ id: "a" }, { id: "b" }, { id: "c" }, { id: "d" }, { id: "e" }],
+            splitCursor: "mid",
+        });
+
+        loadMore(numItems);
+
+        // The pinned page split into (null,"mid"] + ("mid","c1"], leaving three live
+        // pages: the two split halves and the open-ended tail.
+        const open = fake.subs.filter((sub) => !sub.unsubscribed);
+
+        expect(open).toHaveLength(3);
+
+        // No subscription survives for the now-dead pre-split pinned key…
+        expect(open.some((sub) => sub.key === pinnedKey)).toBe(false);
+
+        // …and the open-ended tail is covered exactly once (no reentrant duplicate).
+        const tailKey = JSON.stringify({ paginationOpts: { cursor: "c1", endCursor: null, numItems } });
+
+        expect(open.filter((sub) => sub.key === tailKey)).toHaveLength(1);
+
+        // Every handle is tracked: unsubscribing the last store subscriber tears
+        // every one of them down — none orphaned.
+        stopResults();
+
+        expect(fake.subs.every((sub) => sub.unsubscribed)).toBe(true);
+    });
+});
+
 describe("infiniteQuery (Svelte)", () => {
     it("first page loads as first page array", async () => {
         const fake = createFakePaginatedClient();

@@ -25,6 +25,8 @@
  * this reader expects are the {@link AE_METRIC_EVENTS} constants below; the
  * un-sampled count is AE's `sum(_sample_interval)`.
  */
+import { LunoraError } from "@lunora/errors";
+
 import type { AdvisorIndexHit, AdvisorTableScan } from "./index-usage";
 import type { AdvisorShardTraffic } from "./shard-traffic";
 import type { LintContext } from "./types";
@@ -112,7 +114,7 @@ const toText = (value: unknown): string => {
  */
 const assertDataset = (dataset: string): void => {
     if (!DATASET_NAME_PATTERN.test(dataset)) {
-        throw new Error(`@lunora/advisor: invalid Analytics Engine dataset name "${dataset}" — expected a bare table identifier.`);
+        throw new LunoraError("INTERNAL", `@lunora/advisor: invalid Analytics Engine dataset name "${dataset}" — expected a bare table identifier.`);
     }
 };
 
@@ -201,9 +203,9 @@ const loadIndexHits = async (source: AnalyticsMetricsSource, options: AnalyticsM
         return hits;
     }
 
-    const seen = new Set(hits.map((hit) => `${hit.table} ${hit.index}`));
+    const seen = new Set(hits.map((hit) => `${hit.table}\0${hit.index}`));
     const zeros = options.declaredIndexes
-        .filter((declared) => !seen.has(`${declared.table} ${declared.index}`))
+        .filter((declared) => !seen.has(`${declared.table}\0${declared.index}`))
         .map((declared) => {
             return { index: declared.index, reads: 0, table: declared.table };
         });

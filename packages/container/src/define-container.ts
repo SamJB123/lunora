@@ -5,6 +5,8 @@
  * names, binding names, and wrangler image fields from the exact same logic
  * the runtime uses.
  */
+import { LunoraError } from "@lunora/errors";
+
 import type { ContainerConfig, ContainerDefinition, ContainerImageSource, NormalizedContainerImage } from "./types";
 
 const NAMED_INSTANCE_TYPES = new Set(["basic", "lite", "standard-1", "standard-2", "standard-3", "standard-4"]);
@@ -67,6 +69,7 @@ const dirname = (path: string): string => {
  * `Dockerfile.dev` also counts) is used as-is with its directory as the build
  * context; any other path is treated as the build-context directory and the
  * Dockerfile is expected at `&lt;dir>/Dockerfile`.
+ * @experimental
  */
 const normalizeContainerImage = (image: ContainerImageSource): NormalizedContainerImage => {
     if (typeof image !== "string") {
@@ -93,6 +96,7 @@ const normalizeContainerImage = (image: ContainerImageSource): NormalizedContain
  * `transcoder` → `TranscoderContainer`. wrangler's `containers[].class_name`
  * and the Durable Object binding's `class_name` both reference it, so codegen
  * and the config layer MUST derive it identically — always via this helper.
+ * @experimental
  */
 const containerClassName = (exportName: string): string => `${exportName.charAt(0).toUpperCase()}${exportName.slice(1)}Container`;
 
@@ -101,6 +105,7 @@ const containerClassName = (exportName: string): string => `${exportName.charAt(
  * `CONTAINER_TRANSCODER`, `imageResizer` → `CONTAINER_IMAGE_RESIZER`. The
  * `CONTAINER_` prefix namespaces these away from `SHARD`/`SESSION`/`SCHEDULER`
  * so a container export can never collide with the built-in bindings.
+ * @experimental
  */
 const containerBindingName = (exportName: string): string => `CONTAINER_${exportName.replaceAll(/(?<=[a-z0-9])(?=[A-Z])/g, "_").toUpperCase()}`;
 
@@ -110,6 +115,7 @@ const containerBindingName = (exportName: string): string => `CONTAINER_${export
  * it as the wrangler `containers[].image`, and `lunora deploy` builds that tag
  * with Railpack and `wrangler containers push`es it before deploying — so all
  * three derive the tag from this one helper and can never disagree.
+ * @experimental
  */
 const containerBuildTag = (exportName: string): string => `lunora-${exportName.replaceAll(/(?<=[a-z0-9])(?=[A-Z])/g, "-").toLowerCase()}:build`;
 
@@ -164,10 +170,31 @@ const assertValidImage = (image: ContainerConfig["image"]): void => {
 };
 
 /**
- * Validate `env`/`buildArgs`/`secrets` naming and reject a name declared in both
- * `env` and `secrets` (where the secret would silently overwrite the static env
- * value at start). All three name sets must be valid env-var names; the
- * collision is rejected at authoring time so the runtime resolver never has to.
+ * Validate the `secretsStore` env → binding map: each env name must be a valid
+ * env-var name, each binding a non-empty string, and no env name may collide
+ * with an `env`/`secrets` source (which one would silently win at start).
+ */
+const assertValidSecretsStore = (config: ContainerConfig, envNames: ReadonlySet<string>, secretNames: ReadonlySet<string>): void => {
+    for (const [envName, binding] of Object.entries(config.secretsStore ?? {})) {
+        if (!ENV_NAME_PATTERN.test(envName)) {
+            throw new TypeError(`defineContainer: secretsStore env name "${envName}" is not a valid environment variable name`);
+        }
+
+        if (typeof binding !== "string" || binding.trim().length === 0) {
+            throw new TypeError(`defineContainer: \`secretsStore["${envName}"]\` must be a non-empty Secrets Store binding name`);
+        }
+
+        if (envNames.has(envName) || secretNames.has(envName)) {
+            throw new TypeError(`defineContainer: "${envName}" is declared in both \`secretsStore\` and \`env\`/\`secrets\` — pick one source for the value`);
+        }
+    }
+};
+
+/**
+ * Validate `env`/`buildArgs`/`secrets`/`secretsStore` naming and reject a name
+ * declared by more than one source (where one would silently overwrite the
+ * other at start). All name sets must be valid env-var names; the collisions
+ * are rejected at authoring time so the runtime resolver never has to.
  */
 const assertValidEnvAndSecrets = (config: ContainerConfig): void => {
     for (const name of Object.keys(config.env ?? {})) {
@@ -183,6 +210,7 @@ const assertValidEnvAndSecrets = (config: ContainerConfig): void => {
     }
 
     const envNames = new Set(Object.keys(config.env ?? {}));
+    const secretNames = new Set(config.secrets);
 
     for (const secret of config.secrets ?? []) {
         if (!ENV_NAME_PATTERN.test(secret)) {
@@ -195,6 +223,8 @@ const assertValidEnvAndSecrets = (config: ContainerConfig): void => {
             );
         }
     }
+
+    assertValidSecretsStore(config, envNames, secretNames);
 };
 
 /** Validate a port is an integer in the TCP range, with a directed error naming the field. */
@@ -299,6 +329,10 @@ const assertValidContainerRuntimeFields = (config: ContainerConfig): void => {
     assertValidReadyOnChecks(config);
 };
 
+/**
+ * `defineContainer` is part of the experimental `@lunora/container` API and may change without a major version bump.
+ * @experimental
+ */
 const defineContainer = (config: ContainerConfig): ContainerDefinition => {
     assertValidImage(config.image);
 
@@ -322,9 +356,15 @@ const defineContainer = (config: ContainerConfig): ContainerDefinition => {
         );
     }
 
-    if (typeof config.sleepAfter === "string" && !SLEEP_AFTER_PATTERN.test(config.sleepAfter)) {
+    if (typeof config.sleepAfter === "string") {
+        if (!SLEEP_AFTER_PATTERN.test(config.sleepAfter)) {
+            throw new TypeError(
+                `defineContainer: \`sleepAfter\` string "${config.sleepAfter}" must be a number of seconds followed by a unit, e.g. "30s", "5m", or "1h"`,
+            );
+        }
+    } else if (config.sleepAfter !== undefined && (!Number.isInteger(config.sleepAfter) || config.sleepAfter < 1)) {
         throw new TypeError(
-            `defineContainer: \`sleepAfter\` string "${config.sleepAfter}" must be a number of seconds followed by a unit, e.g. "30s", "5m", or "1h"`,
+            `defineContainer: \`sleepAfter\` must be a positive integer number of seconds or a duration string like "5m" (got ${String(config.sleepAfter)})`,
         );
     }
 
@@ -335,7 +375,10 @@ const defineContainer = (config: ContainerConfig): ContainerDefinition => {
     return { ...config, isLunoraContainer: true };
 };
 
-/** True when a value is a `defineContainer` result (the runtime brand check). */
+/**
+ * True when a value is a `defineContainer` result (the runtime brand check).
+ * @experimental
+ */
 const isContainerDefinition = (value: unknown): value is ContainerDefinition =>
     typeof value === "object" && value !== null && (value as { isLunoraContainer?: unknown }).isLunoraContainer === true;
 
@@ -344,6 +387,7 @@ const isContainerDefinition = (value: unknown): value is ContainerDefinition =>
  * plus every declared secret resolved from the Worker `env`. A declared secret
  * missing from the Worker env fails fast — starting the container without a
  * credential it was promised yields far worse errors downstream.
+ * @experimental
  */
 const resolveContainerEnvVariables = (definition: ContainerDefinition, workerEnv: Record<string, unknown>, exportName?: string): Record<string, string> => {
     const resolved: Record<string, string> = { ...definition.env };
@@ -354,7 +398,8 @@ const resolveContainerEnvVariables = (definition: ContainerDefinition, workerEnv
         if (typeof value !== "string") {
             const label = exportName === undefined ? "container" : `container "${exportName}"`;
 
-            throw new Error(
+            throw new LunoraError(
+                "INTERNAL",
                 `${label}: declared secret "${secret}" is not set on the Worker environment. Add it to .dev.vars for local dev and run \`wrangler secret put ${secret}\` for production.`,
             );
         }

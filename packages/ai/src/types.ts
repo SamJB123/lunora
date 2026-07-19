@@ -6,6 +6,7 @@ import type { EmbeddingModel, LanguageModel } from "ai";
  * binding satisfies the same shape without importing `@cloudflare/workers-types`
  * into the public surface. Mirrors the `run` method documented at
  * https://developers.cloudflare.com/workers-ai/.
+ * @experimental
  */
 export interface AiBindingLike {
     run: (model: string, inputs: Record<string, unknown>, options?: Record<string, unknown>) => Promise<unknown>;
@@ -17,6 +18,7 @@ export interface AiBindingLike {
  * optional `textEmbeddingModel` factory yields an {@link EmbeddingModel}.
  * Typed structurally so `@lunora/ai` neither re-declares the provider's full
  * surface nor hard-pins its exact type across minor releases.
+ * @experimental
  */
 export interface WorkersAiProviderLike {
     (modelId: string, settings?: Record<string, unknown>): LanguageModel;
@@ -26,12 +28,17 @@ export interface WorkersAiProviderLike {
 /**
  * AI Gateway options forwarded to `createWorkersAI`. Lets inference route
  * through a Cloudflare AI Gateway for caching, rate-limiting, and observability.
+ * @experimental
  */
 export interface AiGatewayOptions {
     [key: string]: unknown;
     id: string;
 }
 
+/**
+ * `LunoraAiOptions` is part of the experimental `@lunora/ai` API and may change without a major version bump.
+ * @experimental
+ */
 export interface LunoraAiOptions {
     /**
      * The Workers `AI` binding (`env.AI`). Required for the zero-config Workers
@@ -41,8 +48,19 @@ export interface LunoraAiOptions {
     binding?: AiBindingLike;
 
     /**
-     * Default Workers AI model id used by `model()` / `embeddingModel()` when no
-     * explicit model is passed. Has no effect on bring-your-own providers.
+     * Default Workers AI **embedding** model id used by `embeddingModel()` when no
+     * explicit model is passed (e.g. `@cf/baai/bge-base-en-v1.5`). Kept separate
+     * from `defaultModel` because a language-model id and an embedding-model
+     * id belong to different Workers AI families and are never interchangeable —
+     * reusing the language-model default here would defer a wrong-family error to
+     * inference time. Has no effect on bring-your-own providers.
+     */
+    defaultEmbeddingModel?: string;
+
+    /**
+     * Default Workers AI **language** model id used by `model()` when no explicit
+     * model is passed. For embeddings, set `defaultEmbeddingModel` instead.
+     * Has no effect on bring-your-own providers.
      */
     defaultModel?: string;
     /** Route Workers AI inference through a Cloudflare AI Gateway. */
@@ -63,12 +81,14 @@ export interface LunoraAiOptions {
  * a string id is the Workers AI convenience path (resolved by `ctx.ai.model`),
  * a built model object is bring-your-own (`@ai-sdk/openai`, `@ai-sdk/anthropic`,
  * `@ai-sdk/google`, OpenRouter, …).
+ * @experimental
  */
 export type ModelInput = LanguageModel;
 
 /**
  * Likewise for embeddings: a Workers AI embedding model id (e.g.
  * `@cf/baai/bge-base-en-v1.5`) or any AI SDK {@link EmbeddingModel}.
+ * @experimental
  */
 export type EmbeddingModelInput = EmbeddingModel | string;
 
@@ -79,6 +99,7 @@ export type EmbeddingModelInput = EmbeddingModel | string;
  * to the AI SDK functions re-exported from `@lunora/ai` (`generateText`,
  * `streamText`, `generateObject`, `embed`, …); `run` is the raw binding escape
  * hatch, and `workersai` is the underlying provider for direct model access.
+ * @experimental
  */
 export interface LunoraAi {
     /** Resolve an {@link EmbeddingModel}: a string → Workers AI, an object → passthrough. */

@@ -10,11 +10,10 @@ const fakeIndex = (overrides: Partial<VectorizeIndexLike> = {}): VectorizeIndexL
         deleteByIds: vi.fn<VectorizeIndexLike["deleteByIds"]>(async (ids: ReadonlyArray<string>): Promise<VectorizeDeleteMutation> => {
             return { count: ids.length, mutationId: `delete-${String(ids.length)}` };
         }),
-        getByIds: vi.fn<VectorizeIndexLike["getByIds"]>(
-            async (ids: ReadonlyArray<string>): Promise<ReadonlyArray<VectorizeVector>> =>
-                ids.map((id) => {
-                    return { id, metadata: { k: id }, values: [1, 2] };
-                }),
+        getByIds: vi.fn<VectorizeIndexLike["getByIds"]>(async (ids: ReadonlyArray<string>): Promise<ReadonlyArray<VectorizeVector>> =>
+            ids.map((id) => {
+                return { id, metadata: { k: id }, values: [1, 2] };
+            }),
         ),
         insert: vi.fn<VectorizeIndexLike["insert"]>(async (vectors): Promise<VectorizeUpsertMutation> => {
             return { mutationId: `insert-${String(vectors.length)}` };
@@ -270,6 +269,63 @@ describe("createVectorSyncHook", () => {
         // Compensation purges this row's id from every index sourced from the table.
         expect(vectors.deletes).toContainEqual(["docs-body", ["d1"]]);
         expect(vectors.deletes).toContainEqual(["docs-fulltext", ["d1"]]);
+    });
+
+    it("runs compensation only after every in-flight upsert has settled (no stale-vector race)", async () => {
+        // Regression for the compensating-delete race: when one index's upsert
+        // fails, a slow SIBLING upsert must fully settle before compensation
+        // fires. Otherwise the sibling's write can land AFTER its index's
+        // compensating delete, leaving a searchable vector for a rolled-back row.
+        expect.assertions(3);
+
+        const events: string[] = [];
+        const original = new Error("docs-b upsert boom");
+
+        const vectors: VectorSearchLike = {
+            deleteByIds: vi.fn<VectorSearchLike["deleteByIds"]>(async (indexName) => {
+                events.push(`delete:${indexName}`);
+            }),
+            getByIds: vi.fn<VectorSearchLike["getByIds"]>(async () => []),
+            query: vi.fn<VectorSearchLike["query"]>(async () => {
+                return { count: 0, matches: [] };
+            }),
+            upsert: vi.fn<VectorSearchLike["upsert"]>(async (indexName) => {
+                if (indexName === "docs-b") {
+                    throw original;
+                }
+
+                // A slow sibling: it must settle before compensation runs.
+                await new Promise((resolve) => {
+                    setTimeout(resolve, 20);
+                });
+                events.push(`upsert-done:${indexName}`);
+            }),
+            upsertNow: vi.fn<VectorSearchLike["upsertNow"]>(async () => {}),
+        };
+
+        const schema: SchemaLike = {
+            tables: {
+                docs: {
+                    vectorIndexes: [
+                        { embed, field: "a", name: "docs-a" },
+                        { embed, field: "b", name: "docs-b" },
+                    ],
+                },
+            },
+            vectorIndexes: {},
+        };
+        const hook = createVectorSyncHook({ allowSharedNamespace: true, schema, vectors });
+
+        await expect(hook({ doc: { a: "aa", b: "bb" }, id: "d1", op: "insert", table: "docs" })).rejects.toBe(original);
+
+        const slowDone = events.indexOf("upsert-done:docs-a");
+        const firstDelete = events.findIndex((event) => event.startsWith("delete:"));
+
+        // The slow sibling upsert was observed as completed (not still pending
+        // when the hook threw) AND completed strictly before any compensating
+        // delete fired — so no write can survive its own compensation.
+        expect(slowDone).toBeGreaterThanOrEqual(0);
+        expect(slowDone).toBeLessThan(firstDelete);
     });
 
     it("warns once when a metadata index is synced without a namespace", async () => {

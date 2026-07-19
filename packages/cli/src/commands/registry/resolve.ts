@@ -5,11 +5,12 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 
+import { LunoraError } from "@lunora/errors";
 import { join } from "@visulima/path";
 import { downloadTemplate } from "giget";
 
 import type { Logger } from "../../util/logger";
-import { resolveSourceRef } from "../../util/source-ref";
+import { resolvePinnedSourceRef, resolveSourceRef } from "../../util/source-ref";
 import parseManifest from "./manifest";
 import type { AddCommandOptions, RegistryManifest, ResolvedItem } from "./types";
 
@@ -29,7 +30,8 @@ const VALID_ITEM_NAME = /^[A-Za-z0-9][\w-]*$/u;
 /** Throw on any item name that isn't a safe single-segment identifier. */
 const assertSafeItemName = (name: string): void => {
     if (!VALID_ITEM_NAME.test(name)) {
-        throw new Error(
+        throw new LunoraError(
+            "INTERNAL",
             `invalid registry item name "${name}" — names must match ${VALID_ITEM_NAME.source} (letters, digits, "-", "_"; no path separators or "..")`,
         );
     }
@@ -94,6 +96,44 @@ const fetchToStaging = async (remote: string, label: string, logger: Logger): Pr
 };
 
 /**
+ * Memoized pinned-ref resolution, keyed by the per-command `options` object.
+ * A single command may fetch several item directories (`resolvePlan` / `view`)
+ * plus the registry root — resolving the moving branch → SHA separately for each
+ * would let the branch advance between calls and mix two commits into one
+ * operation. Caching the (in-flight) promise per `options` guarantees the branch
+ * is pinned exactly ONCE and every fetch in that operation reuses the same SHA.
+ * A fresh `options` object per command means no stale pin leaks across commands.
+ */
+const remoteRefCache = new WeakMap<AddCommandOptions, Promise<string>>();
+
+/**
+ * The ref to append to a remote fetch. When the base is the default
+ * `gh:anolilab/lunora` registry, pin the moving release branch to the immutable
+ * commit it currently points at (supply-chain hardening; logs the SHA, or warns
+ * + falls back to the branch when offline / rate-limited). A custom `--source`
+ * may point at a different repo we can't resolve against, so it stays unpinned.
+ *
+ * Resolution is memoized per `options` (see {@link remoteRefCache}) so one
+ * command pins once and reuses the same SHA for every fetch it performs.
+ */
+const resolveRemoteRef = async (options: AddCommandOptions): Promise<string> => {
+    const cached = remoteRefCache.get(options);
+
+    if (cached !== undefined) {
+        return cached;
+    }
+
+    const pending =
+        options.source !== undefined && options.source.length > 0
+            ? Promise.resolve(resolveSourceRef(options.ref))
+            : resolvePinnedSourceRef(options.ref, options.logger);
+
+    remoteRefCache.set(options, pending);
+
+    return pending;
+};
+
+/**
  * Resolve a single item's directory: straight from `--from` (offline) or by
  * fetching it via giget. Returns the directory + a cleanup callback.
  */
@@ -104,7 +144,7 @@ const resolveItemDirectory = async (name: string, options: AddCommandOptions): P
         const directory = join(options.from, name);
 
         if (!existsSync(directory)) {
-            throw new Error(`registry item not found in local source: ${directory}`);
+            throw new LunoraError("INTERNAL", `registry item not found in local source: ${directory}`);
         }
 
         return { cleanup: () => {}, directory };
@@ -112,7 +152,7 @@ const resolveItemDirectory = async (name: string, options: AddCommandOptions): P
 
     const base = options.source ?? DEFAULT_SOURCE_BASE;
 
-    return fetchToStaging(`${base}/${name}#${resolveSourceRef(options.ref)}`, "item", options.logger);
+    return fetchToStaging(`${base}/${name}#${await resolveRemoteRef(options)}`, "item", options.logger);
 };
 
 /**
@@ -122,14 +162,14 @@ const resolveItemDirectory = async (name: string, options: AddCommandOptions): P
 const resolveRegistryRoot = async (options: AddCommandOptions): Promise<{ cleanup: () => void; root: string }> => {
     if (options.from !== undefined) {
         if (!existsSync(options.from)) {
-            throw new Error(`registry root not found: ${options.from}`);
+            throw new LunoraError("INTERNAL", `registry root not found: ${options.from}`);
         }
 
         return { cleanup: () => {}, root: options.from };
     }
 
     const base = options.source ?? DEFAULT_SOURCE_BASE;
-    const { cleanup, directory } = await fetchToStaging(`${base}#${resolveSourceRef(options.ref)}`, "registry", options.logger);
+    const { cleanup, directory } = await fetchToStaging(`${base}#${await resolveRemoteRef(options)}`, "registry", options.logger);
 
     return { cleanup, root: directory };
 };
@@ -158,7 +198,7 @@ const resolvePlan = async (names: ReadonlyArray<string>, options: AddCommandOpti
         }
 
         if (inProgress.has(name)) {
-            throw new Error(`cyclic registry dependency detected at "${name}"`);
+            throw new LunoraError("INTERNAL", `cyclic registry dependency detected at "${name}"`);
         }
 
         inProgress.add(name);
@@ -201,4 +241,4 @@ const resolvePlan = async (names: ReadonlyArray<string>, options: AddCommandOpti
     return { cleanups, items };
 };
 
-export { isBlockedRemoteSource, isSafeSource, readManifest, resolveItemDirectory, resolvePlan, resolveRegistryRoot, sourceGateError };
+export { isBlockedRemoteSource, isSafeSource, readManifest, resolveItemDirectory, resolvePlan, resolveRegistryRoot, resolveRemoteRef, sourceGateError };

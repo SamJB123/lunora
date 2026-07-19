@@ -1,6 +1,6 @@
 {
     "name": "@lunora/storage",
-    "version": "1.0.0-alpha.3",
+    "version": "1.0.0-alpha.9",
     "description": "R2-backed storage for Lunora: typed buckets and signed URLs",
     "keywords": [
         "cloudflare",
@@ -51,14 +51,17 @@
         "build:prod": "pnpm exec packem build --production",
         "lint:eslint": "eslint .",
         "lint:eslint:fix": "eslint . --fix",
-        "lint:prettier": "prettier --check .",
-        "lint:prettier:fix": "prettier --write .",
+        "lint:prettier": "prettier --check . --ignore-path ../../.prettierignore",
+        "lint:prettier:fix": "prettier --write . --ignore-path ../../.prettierignore",
         "lint:types": "tsc --noEmit",
         "test": "vitest run",
         "test:coverage": "vitest run --coverage",
         "fallow:audit": "fallow audit",
         "fallow:dead-code": "fallow dead-code",
         "fallow:health": "fallow health --score"
+    },
+    "dependencies": {
+        "@lunora/errors": "1.0.0-alpha.5"
     },
     "devDependencies": {
         "@cloudflare/vitest-pool-workers": "catalog:cloudflare",

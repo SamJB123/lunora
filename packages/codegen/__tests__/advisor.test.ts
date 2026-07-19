@@ -45,7 +45,7 @@ describe("lintSchema (codegen → advisor)", () => {
     it("flags an unindexed `one`-relation FK from the discovered IR", () => {
         expect.assertions(3);
 
-        const findings = lintSchema(irFrom(UNINDEXED));
+        const findings = lintSchema({ schema: irFrom(UNINDEXED) });
 
         expect(findings).toHaveLength(1);
         expect(findings[0]?.name).toBe("unindexed_foreign_key");
@@ -55,7 +55,7 @@ describe("lintSchema (codegen → advisor)", () => {
     it("passes once the FK column leads an index", () => {
         expect.assertions(1);
 
-        expect(lintSchema(irFrom(INDEXED))).toHaveLength(0);
+        expect(lintSchema({ schema: irFrom(INDEXED) })).toHaveLength(0);
     });
 });
 
@@ -69,7 +69,7 @@ describe("formatAdvisories", () => {
     it("renders a summary header plus one line per finding", () => {
         expect.assertions(2);
 
-        const out = formatAdvisories(lintSchema(irFrom(UNINDEXED)));
+        const out = formatAdvisories(lintSchema({ schema: irFrom(UNINDEXED) }));
 
         expect(out).toContain("@lunora/codegen: 1 schema advisor finding");
         expect(out).toContain("[INFO] unindexed_foreign_key:");
@@ -144,5 +144,77 @@ describe("runCodegen lint integration", () => {
         expect.assertions(1);
 
         expect(runCodegen({ lint: false, projectRoot: workdir }).generated.shard).toContain("const LUNORA_ADVISORIES: AdvisoryFinding[] = [];");
+    });
+
+    it("flags replication shapes targeting an unknown table and a `.global()` table (full discover → lint path)", () => {
+        expect.assertions(4);
+
+        // A schema with a sharded `messages` (poke-live) and a global `users` (D1 tier).
+        writeFileSync(
+            join(workdir, "lunora", "schema.ts"),
+            `import { defineSchema, defineTable, v } from "@lunora/server";
+export const schema = defineSchema({
+    messages: defineTable({ text: v.string() }).shardBy("text"),
+    users: defineTable({ email: v.string() }).global(),
+});
+`,
+            "utf8",
+        );
+        // One shape over the global table (poll-tier WARN) and one over a typo'd table (unknown ERROR).
+        writeFileSync(
+            join(workdir, "lunora", "shapes.ts"),
+            `import { defineShape } from "@lunora/server";
+export const allUsers = defineShape({ table: "users", where: () => ({}) });
+export const ghost = defineShape({ table: "mesages", where: () => ({}) });
+`,
+            "utf8",
+        );
+
+        const findings = runCodegen({ projectRoot: workdir }).advisories;
+        const byName = (name: string) => findings.filter((finding) => finding.name === name);
+
+        expect(byName("shape_targets_global_table")).toHaveLength(1);
+        expect(byName("shape_targets_global_table")[0]?.metadata).toMatchObject({ exportName: "allUsers", table: "users" });
+        expect(byName("shape_unknown_table")).toHaveLength(1);
+        expect(byName("shape_unknown_table")[0]?.metadata).toMatchObject({ exportName: "ghost", table: "mesages" });
+    });
+
+    it('flags a `.public()` table with a PII column under `.rls("required")` (full discover → lint path)', () => {
+        expect.assertions(2);
+
+        writeFileSync(
+            join(workdir, "lunora", "schema.ts"),
+            `import { defineSchema, defineTable, v } from "@lunora/server";
+export const schema = defineSchema({
+    accounts: defineTable({ email: v.string() }).public(),
+}).rls("required");
+`,
+            "utf8",
+        );
+
+        const findings = runCodegen({ projectRoot: workdir }).advisories;
+        const finding = findings.find((advisory) => advisory.name === "public_table_rls_optout_confusion");
+
+        expect(finding).toBeDefined();
+        expect(finding?.metadata).toMatchObject({ columns: ["email"], table: "accounts" });
+    });
+
+    it("flags `.extend()` enabling allowUnauthenticatedShardAccess on an RLS-gapped schema (full discover → lint path)", () => {
+        expect.assertions(2);
+
+        // The fixture schema (UNINDEXED) never calls `.rls("required")`, so it already has an RLS gap.
+        writeFileSync(
+            join(workdir, "lunora", "server.ts"),
+            `import { defineApp } from "@lunora/runtime";
+export const app = defineApp().extend(() => ({ allowUnauthenticatedShardAccess: true })).build();
+`,
+            "utf8",
+        );
+
+        const findings = runCodegen({ projectRoot: workdir }).advisories;
+        const finding = findings.find((advisory) => advisory.name === "allow_unauthenticated_shard_access_enabled");
+
+        expect(finding).toBeDefined();
+        expect(finding?.metadata).toMatchObject({ callee: "extend", file: "server" });
     });
 });

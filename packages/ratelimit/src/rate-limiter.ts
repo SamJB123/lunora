@@ -1,3 +1,5 @@
+import { LunoraError } from "@lunora/errors";
+
 import { availableAt, evaluate } from "./algorithms";
 import RateLimitError from "./error";
 import { createMemoryStore } from "./store";
@@ -19,12 +21,6 @@ interface RateLimiterOptions<Names extends string> {
     normalize?: (key: string) => string;
     /** Clock injection for tests. Defaults to `Date.now`. */
     now?: () => number;
-
-    /**
-     * @deprecated Shard selection is now a deterministic hash of `args.key`,
-     * so this option is unused. Retained for type compatibility.
-     */
-    random?: () => number;
     /** Persistence. Defaults to a per-instance in-memory store. */
     store?: RateLimitStore;
 }
@@ -66,6 +62,16 @@ const shardKeysFor = (name: string, key: string | undefined, shards: number): st
     return shards > 1 ? Array.from({ length: shards }, (_, shard) => `${base}#${String(shard)}`) : [base];
 };
 
+// The single storage key a `(name, key)` pair routes to: the sole bucket when
+// unsharded, or the one shard the deterministic hash selects. `getValue` and
+// `run` must route identically (otherwise a peek reads a different bucket than
+// the consume writes), so both go through here.
+const routeStorageKey = (name: string, key: string | undefined, shards: number): string => {
+    const base = storageKeyFor(name, key);
+
+    return shards > 1 ? `${base}#${String(hashToShard(base, shards))}` : base;
+};
+
 /**
  * Enforces named rate limits over a pluggable store. Construct one per app with
  * a config map; call {@link RateLimiter.limit} to consume and
@@ -92,7 +98,7 @@ class RateLimiter<Names extends string = string> {
 
         for (const [name, config] of Object.entries<RateLimitConfig>(this.config)) {
             if (config.shards !== undefined && (!Number.isInteger(config.shards) || config.shards < 1)) {
-                throw new Error(`rate limit "${name}": shards must be a positive integer`);
+                throw new LunoraError("INTERNAL", `rate limit "${name}": shards must be a positive integer`);
             }
 
             // A zero/negative/non-finite period divides by zero in the token
@@ -100,15 +106,15 @@ class RateLimiter<Names extends string = string> {
             // window starts in the windowed algorithms — silently corrupting
             // every subsequent admit/reject decision. Fail fast at construction.
             if (!Number.isFinite(config.period) || config.period <= 0) {
-                throw new Error(`rate limit "${name}": period must be a positive number`);
+                throw new LunoraError("INTERNAL", `rate limit "${name}": period must be a positive number`);
             }
 
             if (!Number.isFinite(config.rate) || config.rate <= 0) {
-                throw new Error(`rate limit "${name}": rate must be a positive number`);
+                throw new LunoraError("INTERNAL", `rate limit "${name}": rate must be a positive number`);
             }
 
             if (config.capacity !== undefined && (!Number.isFinite(config.capacity) || config.capacity < 0)) {
-                throw new Error(`rate limit "${name}": capacity must be a non-negative number`);
+                throw new LunoraError("INTERNAL", `rate limit "${name}": capacity must be a non-negative number`);
             }
         }
     }
@@ -132,17 +138,11 @@ class RateLimiter<Names extends string = string> {
         const now = this.now();
         const normalizedKey = args.key === undefined ? undefined : this.normalize(args.key);
 
-        if (shards > 1) {
-            // Mirror the exact routing run() uses so getValue reflects the one
-            // bucket this key actually consumes from.
-            const base = storageKeyFor(name, normalizedKey);
-            const storageKey = `${base}#${String(hashToShard(base, shards))}`;
-            const current = availableAt(perShardConfig(config, shards), await this.store.get(storageKey), now);
-
-            return { config, ts: current.ts, value: current.value };
-        }
-
-        const current = availableAt(config, await this.store.get(storageKeyFor(name, normalizedKey)), now);
+        // Route to the exact bucket run() consumes from — for a sharded limit
+        // that is the single shard this key hashes to; summing siblings would
+        // over-report since this key never touches them.
+        const storageKey = routeStorageKey(name, normalizedKey, shards);
+        const current = availableAt(perShardConfig(config, shards), await this.store.get(storageKey), now);
 
         return { config, ts: current.ts, value: current.value };
     }
@@ -167,7 +167,7 @@ class RateLimiter<Names extends string = string> {
         // callers can pass an unconfigured name.
         // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- guards untrusted JS callers despite the keyed type
         if (!config) {
-            throw new Error(`rate limit "${name}" is not configured`);
+            throw new LunoraError("INTERNAL", `rate limit "${name}" is not configured`);
         }
 
         return config;
@@ -197,17 +197,16 @@ class RateLimiter<Names extends string = string> {
         // bucket, so reject anything that isn't a positive integer before it
         // reaches the accounting layer.
         if (!Number.isInteger(count) || count <= 0) {
-            throw new Error(`rate limit "${name}": count must be a positive integer`);
+            throw new LunoraError("INTERNAL", `rate limit "${name}": count must be a positive integer`);
         }
 
         const shards = config.shards ?? 1;
-        const base = storageKeyFor(name, normalizedKey);
         // Deterministic hash routes a given (name, key) to a fixed shard. Per
         // sibling shards are independent — per-key rate is `rate/shards`,
         // aggregate across distinct keys spreads to ~`rate`. Random shard
         // selection (the old behavior) allowed a single key to drain every
         // shard before any of them rate-limited, which defeated the cap.
-        const storageKey = shards > 1 ? `${base}#${String(hashToShard(base, shards))}` : base;
+        const storageKey = routeStorageKey(name, normalizedKey, shards);
         const prior = await this.store.get(storageKey);
         const { status, value } = evaluate(perShardConfig(config, shards), prior, {
             consume,

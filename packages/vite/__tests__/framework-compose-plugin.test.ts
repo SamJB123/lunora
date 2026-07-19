@@ -29,6 +29,7 @@ import type { ResolvedLunoraPluginOptions } from "../src/types";
 
 const baseOptions = (overrides: Partial<ResolvedLunoraPluginOptions> = {}): ResolvedLunoraPluginOptions => {
     return {
+        allowUnauthenticatedShardAccess: false,
         apiSpec: "openapi",
         cloudflare: {},
         generatedDir: "lunora/_generated",
@@ -196,6 +197,35 @@ describe("framework-compose-plugin", () => {
             expect(code).toContain('import * as ssrModule from "@tanstack/react-start/server-entry"');
             expect(code).toContain("httpRouter: ssrModule.default");
             expect(code).toContain("composeWorker(");
+        });
+
+        it("omits allowUnauthenticatedShardAccess by default (shard access stays default-denied)", () => {
+            expect.hasAssertions();
+
+            expect(buildWorkerEntrySource("tanstack-start", "./lunora/_generated")).not.toContain("allowUnauthenticatedShardAccess");
+        });
+
+        it("emits allowUnauthenticatedShardAccess into composeWorker when opted in", () => {
+            expect.hasAssertions();
+
+            const code = buildWorkerEntrySource("tanstack-start", "./lunora/_generated", false, false, true);
+
+            expect(code).toContain("allowUnauthenticatedShardAccess: true,");
+        });
+
+        it("posix-ifies a Windows backslash generatedImportBase in the emitted specifiers", () => {
+            expect.hasAssertions();
+
+            // On Windows `resolve()` yields backslash paths; embedded raw into a JS
+            // string literal `\U` is an invalid unicode escape → SyntaxError, and
+            // `\l`/`\a` silently vanish → unresolvable specifier. The emitter must
+            // convert to forward slashes so the composed worker boots everywhere.
+            const code = buildWorkerEntrySource("tanstack-start", String.raw`C:\Users\dev\app\lunora\_generated`, true);
+
+            expect(code).toContain('"C:/Users/dev/app/lunora/_generated/functions"');
+            expect(code).toContain('"C:/Users/dev/app/lunora/_generated/containers"');
+            // No stray backslash survives into the emitted module source.
+            expect(code).not.toContain("\\");
         });
 
         it("throws for a framework without class-A wiring", () => {

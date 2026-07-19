@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { parse as parseJsonc } from "jsonc-parser";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { runDeployCommand } from "../../src/commands/deploy/handler";
@@ -502,6 +503,57 @@ export const transcoder = defineContainer({ image: "./containers/transcoder" });
             expect(errors.some((line) => line.includes("wrangler d1 create"))).toBe(true);
         });
 
+        it("syncs code-first cron schedules into wrangler.jsonc triggers.crons", async () => {
+            expect.assertions(2);
+
+            writeFileSync(join(workdir, "wrangler.jsonc"), VALID_WRANGLER, "utf8");
+            writeFileSync(
+                join(workdir, "lunora", "crons.ts"),
+                `import { cronJobs } from "@lunora/scheduler";
+import { internal } from "./_generated/api.js";
+
+const crons = cronJobs();
+
+crons.cron("ping", "0 * * * *", internal.messages.list, {});
+
+export default crons;
+`,
+                "utf8",
+            );
+
+            const { spawner } = createRecordingSpawner();
+            const { logger } = silentLogger();
+
+            const result = await runDeployCommand({ cwd: workdir, secretLister: noRemoteSecrets, logger, spawner });
+
+            expect(result.code).toBe(0);
+
+            const written = readFileSync(join(workdir, "wrangler.jsonc"), "utf8");
+
+            expect(written).toContain("0 * * * *");
+        });
+
+        it("clears a stale triggers.crons array when the project declares no crons", async () => {
+            expect.assertions(2);
+
+            writeFileSync(
+                join(workdir, "wrangler.jsonc"),
+                VALID_WRANGLER.replace('"d1_databases"', '"triggers": { "crons": ["0 0 * * *"] },\n    "d1_databases"'),
+                "utf8",
+            );
+
+            const { spawner } = createRecordingSpawner();
+            const { logger } = silentLogger();
+
+            const result = await runDeployCommand({ cwd: workdir, secretLister: noRemoteSecrets, logger, spawner });
+
+            expect(result.code).toBe(0);
+
+            const parsed = parseJsonc(readFileSync(join(workdir, "wrangler.jsonc"), "utf8")) as { triggers?: { crons?: string[] } };
+
+            expect(parsed.triggers?.crons).toEqual([]);
+        });
+
         it("does not run migrations when --migrate is not set", async () => {
             expect.assertions(2);
 
@@ -754,6 +806,39 @@ export const backfillNames = defineMigration({
                 // The mintable secret was generated + pushed (via stdin) before the deploy spawn.
                 expect(argv.some((line) => line.includes("wrangler secret put LUNORA_ADMIN_TOKEN"))).toBe(true);
                 expect(argv.some((line) => line.includes("wrangler deploy"))).toBe(true);
+            });
+
+            it("launches wrangler through npx (secret-push + deploy) when the project declares npm", async () => {
+                expect.assertions(5);
+
+                writeFileSync(join(workdir, "wrangler.jsonc"), VALID_WRANGLER, "utf8");
+                // `detectPackageManager` reads the nearest package.json's `packageManager`.
+                writeFileSync(join(workdir, "package.json"), `{ "packageManager": "npm@10.9.0" }\n`, "utf8");
+
+                const { calls, spawner } = createRecordingSpawner();
+                const { logger } = silentLogger();
+
+                const result = await runDeployCommand({
+                    cwd: workdir,
+                    interactive: true,
+                    logger,
+                    secretConfirm: () => Promise.resolve(true),
+                    secretLister: () => Promise.resolve({ names: [], ok: true }),
+                    spawner,
+                });
+
+                expect(result.code).toBe(0);
+
+                // Every wrangler invocation now goes through `npx -- wrangler …`.
+                const secretPush = calls.find((call) => call.descriptor.args.includes("secret"));
+                const deploySpawn = calls.find((call) => call.descriptor.args.includes("deploy"));
+
+                // The secret value travels over stdin (`input`), never on argv.
+                expect(secretPush?.descriptor).toMatchObject({ args: ["--", "wrangler", "secret", "put", "LUNORA_ADMIN_TOKEN"], command: "npx" });
+                expect(typeof secretPush?.descriptor.input).toBe("string");
+                expect(secretPush?.descriptor.args).not.toContain(secretPush?.descriptor.input);
+
+                expect(deploySpawn?.descriptor).toMatchObject({ args: ["--", "wrangler", "deploy"], command: "npx" });
             });
 
             it("aborts a non-interactive deploy when a required secret is missing on the target", async () => {

@@ -1,6 +1,6 @@
 {
     "name": "@lunora/db",
-    "version": "1.0.0-alpha.3",
+    "version": "1.0.0-alpha.24",
     "description": "TanStack DB binding: typed, live-synced collections and a durable offline outbox over the Lunora client",
     "keywords": [
         "cloudflare",
@@ -40,6 +40,14 @@
             "types": "./dist/index.d.ts",
             "import": "./dist/index.mjs"
         },
+        "./collections": {
+            "types": "./dist/collections/index.d.ts",
+            "import": "./dist/collections/index.mjs"
+        },
+        "./mutators": {
+            "types": "./dist/mutators/index.d.ts",
+            "import": "./dist/mutators/index.mjs"
+        },
         "./package.json": "./package.json"
     },
     "publishConfig": {
@@ -50,8 +58,8 @@
         "build:prod": "pnpm exec packem build --production",
         "lint:eslint": "eslint .",
         "lint:eslint:fix": "eslint . --fix",
-        "lint:prettier": "prettier --check .",
-        "lint:prettier:fix": "prettier --write .",
+        "lint:prettier": "prettier --check . --ignore-path ../../.prettierignore",
+        "lint:prettier:fix": "prettier --write . --ignore-path ../../.prettierignore",
         "lint:types": "tsc --noEmit",
         "test": "vitest run",
         "test:coverage": "vitest run --coverage",
@@ -60,7 +68,8 @@
         "fallow:health": "fallow health --score"
     },
     "dependencies": {
-        "@lunora/client": "1.0.0-alpha.3"
+        "@lunora/client": "1.0.0-alpha.24",
+        "@lunora/errors": "1.0.0-alpha.5"
     },
     "devDependencies": {
         "@tanstack/db": "catalog:frontend",

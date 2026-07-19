@@ -24,8 +24,11 @@ import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 
 import { init as initLexer, parse as lexModule } from "es-module-lexer";
 
+import type { AgentIR } from "./agent-info";
+import { discoverAgentInfo } from "./agent-info";
 import type { ContainerIR } from "./container-info";
 import { discoverContainerInfo } from "./container-info";
+import { discoverFlagsInfo } from "./flags-info";
 import join from "./path";
 import type { QueueIR } from "./queue-info";
 import { discoverQueueInfo } from "./queue-info";
@@ -84,6 +87,92 @@ const CTX_PIPELINES_PATTERN = /\bctx\s*\.\s*pipelines\b/;
 const TYPE_ONLY_IMPORT_PATTERN = /^\s*import\s+type\b/;
 
 /**
+ * The specifiers the batteries-included `browserTool` sandbox detector treats
+ * as `@lunora/agent` — mirrors `discover-sandbox.ts`'s identical constant
+ * exactly (both the main entry and the `/sandbox` subpath re-export the tool).
+ */
+const SANDBOX_MODULE_SPECIFIERS = new Set(["@lunora/agent", "@lunora/agent/sandbox"]);
+
+/**
+ * Extracts the specifier list between the FIRST `{` and its matching `}` in
+ * an import declaration's sliced text via plain index scans (not a regex),
+ * so the two capability checks below each scan that single bounded slice
+ * once instead of two overlapping `[^}]*` quantifiers around a shared
+ * anchor — the super-linear-backtracking shape `sonarjs/slow-regex` flags.
+ */
+const extractImportSpecifierList = (statementText: string): string => {
+    const openBraceIndex = statementText.indexOf("{");
+
+    if (openBraceIndex === -1) {
+        return "";
+    }
+
+    const closeBraceIndex = statementText.indexOf("}", openBraceIndex + 1);
+
+    return closeBraceIndex === -1 ? statementText.slice(openBraceIndex + 1) : statementText.slice(openBraceIndex + 1, closeBraceIndex);
+};
+
+/**
+ * A specifier-level `{ type browserTool }` inside an otherwise-value import —
+ * compiles away even though the import declaration itself is a value import
+ * (e.g. alongside `containerTool`). Mirrors `discover-sandbox.ts`'s
+ * `named.isTypeOnly()` guard. Tested against the extracted specifier list, not
+ * the whole statement.
+ */
+const TYPE_BROWSER_TOOL_SPECIFIER_PATTERN = /\btype\s+browserTool\b/;
+
+/** A named `browserTool` specifier appears in the extracted specifier list. */
+const BROWSER_TOOL_NAME_PATTERN = /\bbrowserTool\b/;
+
+/**
+ * Whole-file regex fallback for `hasSandboxBrowserToolImport`, used ONLY when
+ * `es-module-lexer` can't parse the file (e.g. mid-edit) — same
+ * degrade-gracefully contract as `capabilitiesFromSource`'s
+ * `lexCapabilities`/`regexCapabilities` split. Being a blind text sweep, it
+ * shares the same comment-blindness every other capability's regex fallback
+ * already has; the primary (lexer-based) path below does not.
+ */
+const SANDBOX_BROWSER_TOOL_FALLBACK_PATTERN = /import\s+\{[^}]*\bbrowserTool\b[^}]*\}\s+from\s+["']@lunora\/agent(?:\/sandbox)?["']/;
+
+/**
+ * True when the sliced text of a SINGLE import declaration is a VALUE
+ * (non-type-only) named import of `browserTool` — mirrors
+ * `discover-sandbox.ts`'s `declaration.isTypeOnly()` (whole import) and
+ * `named.isTypeOnly()` (single specifier) guards exactly.
+ */
+const isValueBrowserToolImport = (statementText: string): boolean => {
+    if (TYPE_ONLY_IMPORT_PATTERN.test(statementText)) {
+        return false; // `import type { browserTool } from …` — the whole import compiles away.
+    }
+
+    const specifierList = extractImportSpecifierList(statementText);
+
+    return BROWSER_TOOL_NAME_PATTERN.test(specifierList) && !TYPE_BROWSER_TOOL_SPECIFIER_PATTERN.test(specifierList);
+};
+
+/**
+ * Whether `code` contains a VALUE `browserTool` import from `@lunora/agent`
+ * (main entry or `/sandbox`). Unlike the old whole-file regex sweep, this
+ * walks `es-module-lexer`'s PARSED import records and tests only the sliced
+ * text of each matching declaration — a commented-out import (`// import {
+ * browserTool } from "@lunora/agent";`) is never parsed as a declaration at
+ * all, so it can never match, and a `type`-prefixed specifier is rejected by
+ * {@link isValueBrowserToolImport}. This is what makes the detector agree with
+ * `discover-sandbox.ts`'s AST-based one on the same fixture matrix.
+ */
+const hasSandboxBrowserToolImport = (code: string): boolean => {
+    try {
+        const [imports] = lexModule(code);
+
+        return imports.some(
+            (entry) => entry.n !== undefined && SANDBOX_MODULE_SPECIFIERS.has(entry.n) && isValueBrowserToolImport(code.slice(entry.ss, entry.se)),
+        );
+    } catch {
+        return SANDBOX_BROWSER_TOOL_FALLBACK_PATTERN.test(code);
+    }
+};
+
+/**
  * The single source of truth for import-driven capabilities: each capability
  * flag → the `@lunora/*` package whose import implies it, plus the regex used by
  * the {@link regexCapabilities} fallback when `es-module-lexer` can't parse a
@@ -117,6 +206,12 @@ const CAPABILITY_SOURCES = {
     usesPipelines: { pattern: CTX_PIPELINES_PATTERN, source: "@lunora/bindings/pipelines" },
     usesScheduler: { pattern: /\bfrom\s+["']@lunora\/scheduler["']/, source: "@lunora/scheduler" },
     usesStorage: { pattern: /\bfrom\s+["']@lunora\/storage["']/, source: "@lunora/storage" },
+    // x402 rails are opt-in add-on subpaths (not part of the `lunorash` umbrella),
+    // so they key off the exact `@lunora/x402/{charge,pay}` specifiers. Neither
+    // implies a `.dev.vars` secret: the charge recipient is a user-named `[vars]`
+    // entry and the pay wallet key is a Secrets Store binding — both hint-only.
+    usesX402Charge: { pattern: /\bfrom\s+["']@lunora\/x402\/charge["']/, source: "@lunora/x402/charge" },
+    usesX402Pay: { pattern: /\bfrom\s+["']@lunora\/x402\/pay["']/, source: "@lunora/x402/pay" },
 } as const satisfies Record<string, { pattern: RegExp; source: string }>;
 
 /** The import-driven capability flag names (every key of {@link CAPABILITY_SOURCES}). */
@@ -159,6 +254,18 @@ interface InferredWorkflow extends WorkflowIR {
 }
 
 /**
+ * A `defineAgent` declaration plus whether its generated agent
+ * `WorkflowEntrypoint` class (e.g. `SupportAgentWorkflow`) is exported by the
+ * worker entry. An agent compiles onto a Cloudflare Workflow, so — exactly like
+ * {@link InferredWorkflow} — only exported agents are safe to provision
+ * (wrangler rejects a `workflows[].class_name` the worker doesn't export), and
+ * an agent is NOT a Durable Object (no `durable_objects` binding or migration).
+ */
+interface InferredAgent extends AgentIR {
+    exported: boolean;
+}
+
+/**
  * A queue declared in `lunora/queues.ts`. Unlike workflows, a queue needs no
  * worker-entry class export (its `queue()` handler rides `createWorker`), so
  * there is no `exported` flag — every declared queue is reconcilable into the
@@ -167,10 +274,20 @@ interface InferredWorkflow extends WorkflowIR {
 type InferredQueue = QueueIR;
 
 interface InferredBindings {
+    /** Agents declared in `lunora/agents.ts` (exported or not — see {@link InferredAgent.exported}); reconciled into `workflows[]`. */
+    agents: InferredAgent[];
     /** Containers declared in `lunora/containers.ts` (exported or not — see {@link InferredContainer.exported}). */
     containers: InferredContainer[];
     /** Durable Objects the worker entry exports → safe to bind. */
     durableObjects: DurableObjectSpec[];
+
+    /**
+     * The wrangler `flagship[].binding` name implied by `lunora/flags.ts` when it
+     * uses the Flagship provider in binding mode — `undefined` for HTTP-mode
+     * Flagship, a custom OpenFeature provider, or no flags. The binding needs an
+     * un-mintable `app_id`, so it is reconciled as a hint, not auto-written.
+     */
+    flagshipBinding?: string;
     /** Schema declares a `.global()` table → needs the `DB` D1 binding. */
     needsD1: boolean;
     /** Queues declared in `lunora/queues.ts` → reconciled into `queues.producers[]` / `queues.consumers[]`. */
@@ -185,6 +302,8 @@ interface InferredBindings {
     usesAuth: boolean;
     /** `@lunora/browser` is imported → self-describing `browser` binding (auto-writeable). */
     usesBrowser: boolean;
+    /** `lunora/flags.ts` declares a feature-flag provider (any OpenFeature provider — Flagship or custom). */
+    usesFlags: boolean;
     /** `@lunora/hyperdrive` is imported (binding needs an un-mintable remote `id`; hint-only). */
     usesHyperdrive: boolean;
     /** `@lunora/bindings/images` is imported → self-describing `images` binding (auto-writeable). */
@@ -201,6 +320,10 @@ interface InferredBindings {
     usesScheduler: boolean;
     /** `@lunora/storage` is imported (R2 bucket binding name is user-defined). */
     usesStorage: boolean;
+    /** `@lunora/x402/charge` is imported — the charge rail settles USDC to a recipient address (a public `[vars]` entry, user-named; hint-only). */
+    usesX402Charge: boolean;
+    /** `@lunora/x402/pay` is imported — the agent-wallet pay rail signs from a Secrets Store binding paired with a spend policy (ActionCtx-only; hint-only). */
+    usesX402Pay: boolean;
     /** Workflows declared in `lunora/workflows.ts` (exported or not — see {@link InferredWorkflow.exported}). */
     workflows: InferredWorkflow[];
 }
@@ -294,6 +417,11 @@ const capabilitiesFromSource = (code: string): Capabilities => {
         capabilities = regexCapabilities(code);
     }
 
+    // NOTE: `usesBrowser`'s sandbox-`browserTool` half is intentionally NOT
+    // folded in here — see `scanSandboxBrowserToolUsage` below. Unlike every
+    // other probe, it must be scoped to EXACTLY the `lunora/` file set
+    // `discover-sandbox.ts` scans (never `src/`), so it runs as a separate,
+    // lunora-only pass in `inferLunoraBindings` instead.
     return mergeCapabilities(capabilities, {
         ...NO_CAPABILITIES,
         needsD1: ENV_DB_PATTERN.test(code),
@@ -396,36 +524,60 @@ const detectExportedDurableObjects = (entryPath: string): DurableObjectSpec[] =>
     });
 };
 
-/**
- * Matches an `export * from "…/_generated/containers"` (with or without the
- * `.js` extension) — the conventional way a worker entry re-exports every
- * generated container class at once. `es-module-lexer` lists the module
- * request but not the names a star re-export forwards, so the path itself is
- * the signal that all generated container classes are exported.
- */
-const CONTAINERS_STAR_REEXPORT_PATTERN = /\bexport\s*\*\s*from\s*["'][^"']*_generated\/containers(?:\.js)?["']/;
+/** A discovered definition whose generated class may or may not be exported by the worker entry. */
+interface ClassExportable {
+    className: string;
+}
 
 /**
- * Whether the worker entry exports each generated container class: a named
+ * Matches a *type-only* export of `className` — `export type Foo` or the
+ * inline `export { type Foo }` form. Generalizes {@link TYPE_ONLY_EXPORT_PATTERNS}
+ * (built for the fixed DO class set) to an arbitrary generated class name:
+ * `es-module-lexer` still lists the name as an export in both cases even
+ * though it compiles away, so `detectClassExports` must reject it before
+ * flagging `exported: true` — otherwise a binding could reference a class
+ * wrangler can't find at deploy.
+ */
+const isTypeOnlyClassExport = (code: string, className: string): boolean =>
+    // `export type Foo` / `export type { … Foo … }` / `export { type Foo }` — all
+    // three type-only forms list the name via the lexer but compile away.
+    new RegExp(String.raw`\bexport\s+type\s+${className}\b`).test(code) ||
+    new RegExp(String.raw`\bexport\s+type\s*\{[^}]*\b${className}\b`).test(code) ||
+    new RegExp(String.raw`\bexport\s+\{[^}]*\btype\s+${className}\b`).test(code);
+
+/**
+ * Whether the worker entry exports each definition's generated class: a named
  * export of the class (covered by `es-module-lexer`'s export list) or the
- * conventional `export * from "./lunora/_generated/containers"` star
- * re-export. Mirrors `detectExportedDurableObjects` — exports are the only
- * safe provisioning signal, since wrangler validates `class_name` against the
- * worker's exports at deploy.
+ * conventional `export * from "./lunora/_generated/&lt;generatedModule>"` star
+ * re-export — the way a worker entry re-exports every generated class of one
+ * kind at once. `es-module-lexer` lists the module request but not the names a
+ * star re-export forwards, so the path itself is the signal that every class
+ * from that module is exported.
+ *
+ * One generic replaces what were three near-identical copies
+ * (`detectContainerExports`/`detectWorkflowExports`/`detectAgentExports`,
+ * differing only in the star-reexport module name and the IR type) — exports
+ * are the only safe provisioning signal for all three kinds, since wrangler
+ * validates `class_name` against the worker's exports at deploy. Mirrors the
+ * same lexer-then-regex-fallback shape as `detectExportedDurableObjects`.
  */
-const detectContainerExports = (entryPath: string | undefined, containers: ReadonlyArray<ContainerIR>): InferredContainer[] => {
-    if (containers.length === 0) {
+const detectClassExports = <Definition extends ClassExportable>(
+    entryPath: string | undefined,
+    definitions: ReadonlyArray<Definition>,
+    generatedModule: string,
+): (Definition & { exported: boolean })[] => {
+    if (definitions.length === 0) {
         return [];
     }
 
     if (entryPath === undefined) {
-        return containers.map((container) => {
-            return { ...container, exported: false };
+        return definitions.map((definition) => {
+            return { ...definition, exported: false };
         });
     }
 
     const code = readFileSync(entryPath, "utf8");
-    const starReexport = CONTAINERS_STAR_REEXPORT_PATTERN.test(code);
+    const starReexport = new RegExp(String.raw`\bexport\s*\*\s*from\s*["'][^"']*_generated\/${generatedModule}(?:\.js)?["']`).test(code);
 
     let exportedNames: Set<string>;
 
@@ -435,61 +587,36 @@ const detectContainerExports = (entryPath: string | undefined, containers: Reado
         exportedNames = new Set(exports.map((entry) => entry.n));
     } catch {
         exportedNames = new Set(
-            containers.map((container) => container.className).filter((className) => new RegExp(String.raw`\bexport\b[^\n;]*\b${className}\b`).test(code)),
+            definitions.map((definition) => definition.className).filter((className) => new RegExp(String.raw`\bexport\b[^\n;]*\b${className}\b`).test(code)),
         );
     }
 
-    return containers.map((container) => {
-        return { ...container, exported: starReexport || exportedNames.has(container.className) };
+    return definitions.map((definition) => {
+        // A candidate counts only when it is exported as a runtime value — an
+        // inline `export { type Foo }` (or `export type Foo`) lists the name but
+        // compiles away, and binding it would make `wrangler deploy` fail on the
+        // missing class. Mirrors the same guard as `detectExportedDurableObjects`.
+        const exported = starReexport || (exportedNames.has(definition.className) && !isTypeOnlyClassExport(code, definition.className));
+
+        return { ...definition, exported };
     });
 };
 
-/**
- * Matches an `export * from "…/_generated/workflows"` (with or without the
- * `.js` extension) — the conventional way a worker entry re-exports every
- * generated `WorkflowEntrypoint` class at once. `es-module-lexer` lists the
- * module request but not the names a star re-export forwards, so the path
- * itself is the signal that all generated workflow classes are exported.
- */
-const WORKFLOWS_STAR_REEXPORT_PATTERN = /\bexport\s*\*\s*from\s*["'][^"']*_generated\/workflows(?:\.js)?["']/;
+/** Whether the worker entry exports each declared container's generated DO class. */
+const detectContainerExports = (entryPath: string | undefined, containers: ReadonlyArray<ContainerIR>): InferredContainer[] =>
+    detectClassExports(entryPath, containers, "containers");
+
+/** Whether the worker entry exports each declared workflow's generated `WorkflowEntrypoint` class. */
+const detectWorkflowExports = (entryPath: string | undefined, workflows: ReadonlyArray<WorkflowIR>): InferredWorkflow[] =>
+    detectClassExports(entryPath, workflows, "workflows");
 
 /**
- * Whether the worker entry exports each generated `WorkflowEntrypoint` class: a
- * named export of the class or the conventional
- * `export * from "./lunora/_generated/workflows"` star re-export. Mirrors
- * {@link detectContainerExports} — exports are the only safe provisioning
- * signal, since wrangler validates `class_name` against the worker's exports.
+ * Whether the worker entry exports each declared agent's generated
+ * WorkflowEntrypoint class. An agent compiles onto a Cloudflare Workflow, so —
+ * exactly like {@link detectWorkflowExports} — only an exported class is safe
+ * to reconcile into `workflows[]`.
  */
-const detectWorkflowExports = (entryPath: string | undefined, workflows: ReadonlyArray<WorkflowIR>): InferredWorkflow[] => {
-    if (workflows.length === 0) {
-        return [];
-    }
-
-    if (entryPath === undefined) {
-        return workflows.map((workflow) => {
-            return { ...workflow, exported: false };
-        });
-    }
-
-    const code = readFileSync(entryPath, "utf8");
-    const starReexport = WORKFLOWS_STAR_REEXPORT_PATTERN.test(code);
-
-    let exportedNames: Set<string>;
-
-    try {
-        const [, exports] = lexModule(code);
-
-        exportedNames = new Set(exports.map((entry) => entry.n));
-    } catch {
-        exportedNames = new Set(
-            workflows.map((workflow) => workflow.className).filter((className) => new RegExp(String.raw`\bexport\b[^\n;]*\b${className}\b`).test(code)),
-        );
-    }
-
-    return workflows.map((workflow) => {
-        return { ...workflow, exported: starReexport || exportedNames.has(workflow.className) };
-    });
-};
+const detectAgentExports = (entryPath: string | undefined, agents: ReadonlyArray<AgentIR>): InferredAgent[] => detectClassExports(entryPath, agents, "agents");
 
 /**
  * The schema-derived signal: a `.global()` table needs the `DB` D1 binding.
@@ -522,8 +649,35 @@ const scanCapabilities = (projectRoot: string, scanDirectories: ReadonlyArray<st
     return merged;
 };
 
-/** Provenance lines for declared DO containers / workflows. */
-const describeDeclaredExports = (containers: ReadonlyArray<InferredContainer>, workflows: ReadonlyArray<InferredWorkflow>): string[] => [
+/**
+ * Scan ONLY the `lunora/` tree (never `src/`) for a value `browserTool`
+ * import — mirrors `discover-sandbox.ts`'s `listLunoraSourceFiles` file set
+ * exactly. Kept as a separate pass from {@link scanCapabilities} (which also
+ * walks `src/`) so config never auto-writes a `BROWSER` binding codegen will
+ * never wire — a `src/`-only `browserTool` import never registers the
+ * `sandbox:invoke` dispatcher, since `discoverSandboxUsage` only reads
+ * `lunora/`.
+ */
+const scanSandboxBrowserToolUsage = (projectRoot: string, lunoraDirectory: string): boolean => {
+    const absolute = join(projectRoot, lunoraDirectory);
+
+    if (!existsSync(absolute) || !statSync(absolute).isDirectory()) {
+        return false;
+    }
+
+    const files: string[] = [];
+
+    collectSourceFiles(absolute, files);
+
+    return files.some((file) => hasSandboxBrowserToolImport(readFileSync(file, "utf8")));
+};
+
+/** Provenance lines for declared DO containers / workflows / agents. */
+const describeDeclaredExports = (
+    containers: ReadonlyArray<InferredContainer>,
+    workflows: ReadonlyArray<InferredWorkflow>,
+    agents: ReadonlyArray<InferredAgent>,
+): string[] => [
     ...containers.map((container) =>
         container.exported
             ? `${container.bindingName}/${container.className} (container "${container.exportName}" declared and exported)`
@@ -533,6 +687,11 @@ const describeDeclaredExports = (containers: ReadonlyArray<InferredContainer>, w
         workflow.exported
             ? `${workflow.bindingName}/${workflow.className} (workflow "${workflow.exportName}" declared and exported)`
             : `hint: workflow "${workflow.exportName}" is declared but ${workflow.className} is not exported by the worker entry — add \`export * from "./lunora/_generated/workflows"\``,
+    ),
+    ...agents.map((agent) =>
+        agent.exported
+            ? `${agent.bindingName}/${agent.className} (agent "${agent.exportName}" declared and exported)`
+            : `hint: agent "${agent.exportName}" is declared but ${agent.className} is not exported by the worker entry — add \`export * from "./lunora/_generated/agents"\``,
     ),
 ];
 
@@ -571,6 +730,14 @@ const describeCapabilitySignals = (capabilities: Capabilities, exported: Readonl
             capabilities.usesPipelines,
             "hint: ctx.pipelines is used; run 'wrangler pipelines create <name>' and add a 'pipelines' binding ({ binding, pipeline }) — the pipeline resource can't be auto-provisioned",
         ],
+        [
+            capabilities.usesX402Charge,
+            "hint: @lunora/x402/charge is imported; set the recipient wallet address as a [vars] entry (the var name is yours to choose) and pass it to the charge config — the x402 facilitator settles USDC to that address",
+        ],
+        [
+            capabilities.usesX402Pay,
+            "hint: @lunora/x402/pay is imported (ActionCtx-only, spends real funds); add a secrets_store_secrets[] binding for the agent wallet key (name it to match signer.secretName) and pair the pay rail with a spend policy — ctx.secrets reads a Secrets Store binding, not .dev.vars, so the key can't be auto-provisioned",
+        ],
     ];
 
     return rules.filter(([active]) => active).map(([, signal]) => signal);
@@ -583,6 +750,7 @@ const describeSignals = (
     capabilities: Capabilities,
     containers: ReadonlyArray<InferredContainer> = [],
     workflows: ReadonlyArray<InferredWorkflow> = [],
+    agents: ReadonlyArray<InferredAgent> = [],
 ): string[] => {
     const exported = new Set(durableObjects.map((object) => object.className));
     const signals = durableObjects.map((object) => `${object.binding}/${object.className} (exported by worker entry)`);
@@ -591,7 +759,7 @@ const describeSignals = (
         signals.push("DB (.global() table declared)");
     }
 
-    signals.push(...describeDeclaredExports(containers, workflows), ...describeCapabilitySignals(capabilities, exported));
+    signals.push(...describeDeclaredExports(containers, workflows, agents), ...describeCapabilitySignals(capabilities, exported));
 
     return signals;
 };
@@ -608,15 +776,34 @@ const inferLunoraBindings = async (options: InferOptions): Promise<InferredBindi
     const schemaDirectory = options.schemaDir ?? "lunora";
     const scanDirectories = options.scanDirs ?? DEFAULT_SCAN_DIRECTORIES;
 
-    const capabilities = scanCapabilities(options.projectRoot, scanDirectories);
+    const scannedCapabilities = scanCapabilities(options.projectRoot, scanDirectories);
+    // A sandbox `browserTool` import provisions BROWSER even without a direct
+    // `@lunora/browser` import (the browser op runs on the dispatcher's ctx) —
+    // but ONLY when the import lives in `lunora/`, the exact file set
+    // `discover-sandbox.ts` scans; a `src/`-only import never registers the
+    // sandbox dispatcher, so it must not provision the binding either. Folded
+    // into `capabilities` here (not `scanCapabilities`) so both the returned
+    // `usesBrowser` flag AND the provenance signal line agree.
+    const capabilities: Capabilities = {
+        ...scannedCapabilities,
+        usesBrowser: scannedCapabilities.usesBrowser || scanSandboxBrowserToolUsage(options.projectRoot, schemaDirectory),
+    };
     const entryPath = resolveWorkerEntry(options.projectRoot);
     const durableObjects = entryPath ? detectExportedDurableObjects(entryPath) : [];
     const needsD1 = capabilities.needsD1 || schemaNeedsD1(options.projectRoot, schemaDirectory);
     const containers = detectContainerExports(entryPath, discoverContainerInfo(options.projectRoot, schemaDirectory).containers);
     const workflows = detectWorkflowExports(entryPath, discoverWorkflowInfo(options.projectRoot, schemaDirectory).workflows);
+    // Agents compile onto Cloudflare Workflows, so — like workflows — only an
+    // exported agent WorkflowEntrypoint class is safe to reconcile into `workflows[]`.
+    const agents = detectAgentExports(entryPath, discoverAgentInfo(options.projectRoot, schemaDirectory).agents);
     // Queues need no worker-entry export (their `queue()` handler rides
     // `createWorker`), so the discovered list is reconcilable as-is.
     const queues = [...discoverQueueInfo(options.projectRoot, schemaDirectory).queues];
+    // Feature flags are declared in `lunora/flags.ts` (any OpenFeature provider).
+    // Only a Flagship binding-mode provider implies a wrangler `flagship` binding
+    // (its `app_id` is un-mintable → reconciled as a hint, never auto-written).
+    const { flags } = discoverFlagsInfo(options.projectRoot, schemaDirectory);
+    const flagshipBinding = flags?.provider === "flagship" && flags.mode === "binding" ? flags.bindingName : undefined;
 
     // The import-driven `uses*` flags are projected straight off the scanned
     // capabilities (keyed by CAPABILITY_SOURCES); `needsD1` is overridden with
@@ -627,12 +814,23 @@ const inferLunoraBindings = async (options: InferOptions): Promise<InferredBindi
         capabilityFlags[flag] = capabilities[flag];
     }
 
+    const signals = describeSignals(durableObjects, needsD1, capabilities, containers, workflows, agents);
+
+    if (flagshipBinding !== undefined) {
+        signals.push(
+            `hint: lunora/flags.ts uses Flagship in binding mode; add a flagship binding ({ binding: "${flagshipBinding}", app_id }) — the app_id can't be auto-provisioned`,
+        );
+    }
+
     return {
+        agents,
         containers,
         durableObjects,
+        flagshipBinding,
         needsD1,
         queues,
-        signals: describeSignals(durableObjects, needsD1, capabilities, containers, workflows),
+        signals,
+        usesFlags: flags !== undefined,
         workflows,
         ...capabilityFlags,
     };
@@ -660,5 +858,5 @@ const packageNamesFromBindings = (bindings: InferredBindings): string[] => {
     return names;
 };
 
-export type { DurableObjectClass, DurableObjectSpec, InferOptions, InferredBindings, InferredContainer, InferredQueue, InferredWorkflow };
+export type { DurableObjectClass, DurableObjectSpec, InferOptions, InferredAgent, InferredBindings, InferredContainer, InferredQueue, InferredWorkflow };
 export { inferLunoraBindings, packageNamesFromBindings };

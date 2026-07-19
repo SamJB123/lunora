@@ -2,6 +2,8 @@ import type { StudioFeaturesResult } from "@lunora/do";
 import type { Project, SourceFile } from "ts-morph";
 import { Node, SyntaxKind } from "ts-morph";
 
+import type { CapabilityKey } from "./capabilities";
+import { CAPABILITIES } from "./capabilities";
 import { listLunoraSourceFiles } from "./discover-functions";
 
 /**
@@ -12,72 +14,17 @@ import { listLunoraSourceFiles } from "./discover-functions";
  * `discoverAiUsage` / `discoverPaymentUsage` probes (which were line-for-line
  * copies of this same import-or-`ctx.X` check).
  *
- * `ai` and `payments` gate whether codegen wires the SDK into the generated
- * worker (so a non-AI app never imports `@lunora/ai`); the rest additionally
- * feed the studio's nav gating via {@link buildStudioFeatures}. `mail` is
- * import-only — it has no `ctx.mail` helper (mail is reached through its own
- * client), so only a `@lunora/mail` import flips it here; a worker-entry wiring
- * outside `lunora/` is caught instead by the package-dependency signal in
- * {@link buildStudioFeatures}.
+ * The key set is derived from the {@link CAPABILITIES} table (its
+ * {@link CapabilityKey} union), so a capability added there is automatically
+ * probed here — the two can't drift. `ai` and `payments` gate whether codegen
+ * wires the SDK into the generated worker (so a non-AI app never imports
+ * `@lunora/ai`); the rest additionally feed the studio's nav gating via
+ * {@link buildStudioFeatures}. `mail` is import-only — it has no `ctx.mail`
+ * helper (mail is reached through its own client), so only a `@lunora/mail`
+ * import flips it here; a worker-entry wiring outside `lunora/` is caught
+ * instead by the package-dependency signal in {@link buildStudioFeatures}.
  */
-interface FeatureUsage {
-    /** A `lunora/` source imports `@lunora/ai` or reads `ctx.ai`. */
-    ai: boolean;
-    /** A `lunora/` source imports `@lunora/bindings/analytics` or reads `ctx.analytics`. */
-    analytics: boolean;
-    /** A `lunora/` source imports `@lunora/browser` or reads `ctx.browser`. */
-    browser: boolean;
-    /** A `lunora/` source imports `@lunora/hyperdrive` or reads `ctx.sql`. */
-    hyperdrive: boolean;
-    /** A `lunora/` source imports `@lunora/bindings/images` or reads `ctx.images`. */
-    images: boolean;
-    /** A `lunora/` source imports `@lunora/bindings/kv` or reads `ctx.kv`. */
-    kv: boolean;
-    /** A `lunora/` source imports `@lunora/mail`. */
-    mail: boolean;
-    /** A `lunora/` source imports `@lunora/payment` or reads `ctx.payments`. */
-    payments: boolean;
-    /** A `lunora/` source imports `@lunora/bindings/pipelines` or reads `ctx.pipelines`. */
-    pipelines: boolean;
-    /** A `lunora/` source imports `@lunora/bindings/r2sql` or reads `ctx.r2sql`. */
-    r2sql: boolean;
-    /** A source imports `@lunora/scheduler` or reads `ctx.scheduler`. */
-    scheduler: boolean;
-    /** A source imports `@lunora/storage` or reads `ctx.storage`. */
-    storage: boolean;
-    /** A source imports `@lunora/bindings/vectors` or reads `ctx.vectors`. */
-    vectors: boolean;
-    /** A source imports `@lunora/workflow` or reads `ctx.workflows`. */
-    workflows: boolean;
-}
-
-/** One feature's code-usage probe: its `@lunora/*` package and optional `ctx.*` helper name. */
-interface FeatureProbe {
-    /** Generated context helper read (e.g. `ctx.scheduler`); absent when the feature has no context surface (mail). */
-    contextProperty?: string;
-    /** The `@lunora/*` package whose import flips the flag. */
-    moduleSpecifier: string;
-}
-
-const PROBES: Record<keyof FeatureUsage, FeatureProbe> = {
-    ai: { contextProperty: "ai", moduleSpecifier: "@lunora/ai" },
-    analytics: { contextProperty: "analytics", moduleSpecifier: "@lunora/bindings/analytics" },
-    browser: { contextProperty: "browser", moduleSpecifier: "@lunora/browser" },
-    hyperdrive: { contextProperty: "sql", moduleSpecifier: "@lunora/hyperdrive" },
-    images: { contextProperty: "images", moduleSpecifier: "@lunora/bindings/images" },
-    kv: { contextProperty: "kv", moduleSpecifier: "@lunora/bindings/kv" },
-    mail: { moduleSpecifier: "@lunora/mail" },
-    payments: { contextProperty: "payments", moduleSpecifier: "@lunora/payment" },
-    // Pipelines is its own `@lunora/bindings/pipelines` subpath (distinct from
-    // `/analytics`), so a real import is a clean signal that won't be flipped by a
-    // plain analytics import; `ctx.pipelines` reads flip it too.
-    pipelines: { contextProperty: "pipelines", moduleSpecifier: "@lunora/bindings/pipelines" },
-    r2sql: { contextProperty: "r2sql", moduleSpecifier: "@lunora/bindings/r2sql" },
-    scheduler: { contextProperty: "scheduler", moduleSpecifier: "@lunora/scheduler" },
-    storage: { contextProperty: "storage", moduleSpecifier: "@lunora/storage" },
-    vectors: { contextProperty: "vectors", moduleSpecifier: "@lunora/bindings/vectors" },
-    workflows: { contextProperty: "workflows", moduleSpecifier: "@lunora/workflow" },
-};
+type FeatureUsage = Record<CapabilityKey, boolean>;
 
 /**
  * The extra schema-/project-level signals OR'd onto the code-usage flags to
@@ -88,6 +35,8 @@ const PROBES: Record<keyof FeatureUsage, FeatureProbe> = {
  * (`src/server`), detected via the project's declared dependencies.
  */
 interface StudioFeatureSignals {
+    /** Number of declared containers — any `defineContainer` means the containers page is relevant. */
+    containerCount: number;
     /** Number of declared cron jobs — any cron means the scheduler page is relevant. */
     cronCount: number;
     /** The `@lunora/*` packages this app depends on (from its `package.json`). */
@@ -105,35 +54,47 @@ interface StudioFeatureSignals {
 }
 
 /**
- * True when the source reaches the given `ctx` helper — either a direct
+ * The set of `ctx` helper names the source reaches — either a direct
  * `ctx.PROPERTY` access, or a destructuring of the property off the `ctx`
  * identifier (a `const ... = ctx` binding pattern). Parameter-position
  * destructuring (a destructured handler parameter) is still not matched (there is
  * no `ctx` identifier to anchor on, and matching a bare destructured param would
  * false-positive on unrelated functions) — but the import probe and, for studio
  * nav, the package-dependency signal cover that case.
+ *
+ * Collected in a single per-file pass (two descendant walks total) instead of the
+ * former per-feature double-walk: each context-bearing {@link CAPABILITIES} entry
+ * then just tests membership in this set, so detection is O(files × nodes) rather
+ * than O(files × features × nodes).
  */
-const readsContextProperty = (sourceFile: SourceFile, property: string): boolean => {
+const contextPropertiesRead = (sourceFile: SourceFile): Set<string> => {
     const reachesContext = (receiver: Node): boolean => Node.isIdentifier(receiver) && receiver.getText() === "ctx";
+    const names = new Set<string>();
 
-    const directAccess = sourceFile
-        .getDescendantsOfKind(SyntaxKind.PropertyAccessExpression)
-        .some((access) => access.getName() === property && reachesContext(access.getExpression()));
-
-    if (directAccess) {
-        return true;
+    for (const access of sourceFile.getDescendantsOfKind(SyntaxKind.PropertyAccessExpression)) {
+        if (reachesContext(access.getExpression())) {
+            names.add(access.getName());
+        }
     }
 
-    return sourceFile.getDescendantsOfKind(SyntaxKind.VariableDeclaration).some((declaration) => {
+    for (const declaration of sourceFile.getDescendantsOfKind(SyntaxKind.VariableDeclaration)) {
         const initializer = declaration.getInitializer();
         const nameNode = declaration.getNameNode();
 
         if (initializer === undefined || !reachesContext(initializer) || !Node.isObjectBindingPattern(nameNode)) {
-            return false;
+            continue;
         }
 
-        return nameNode.getElements().some((element) => element.getPropertyNameNode()?.getText() === property || element.getName() === property);
-    });
+        for (const element of nameNode.getElements()) {
+            const name = element.getPropertyNameNode()?.getText() ?? element.getName();
+
+            if (name) {
+                names.add(name);
+            }
+        }
+    }
+
+    return names;
 };
 
 /**
@@ -142,47 +103,35 @@ const readsContextProperty = (sourceFile: SourceFile, property: string): boolean
  * `payments`) and — via {@link buildStudioFeatures} — the studio nav.
  */
 const discoverFeatureUsage = (project: Project, lunoraDirectory: string): FeatureUsage => {
-    const usage: FeatureUsage = {
-        ai: false,
-        analytics: false,
-        browser: false,
-        hyperdrive: false,
-        images: false,
-        kv: false,
-        mail: false,
-        payments: false,
-        pipelines: false,
-        r2sql: false,
-        scheduler: false,
-        storage: false,
-        vectors: false,
-        workflows: false,
-    };
-    const keys = Object.keys(PROBES) as (keyof FeatureUsage)[];
+    // Typed as `FeatureUsage` (`Record<CapabilityKey, boolean>`) up front, so every
+    // `usage[capability.key]` read/write below is key-checked and the function
+    // returns with no boundary cast. The single assertion is the unavoidable
+    // `Object.fromEntries` widening (it always yields `{ [k: string]: T }`); the
+    // keys provably come from `CAPABILITIES`, whose `key` is a `CapabilityKey`.
+    const usage = Object.fromEntries(CAPABILITIES.map((capability) => [capability.key, false] as const)) as FeatureUsage;
 
     for (const filePath of listLunoraSourceFiles(lunoraDirectory)) {
         const sourceFile = project.getSourceFile(filePath) ?? project.addSourceFileAtPath(filePath);
         const importSpecifiers = new Set(sourceFile.getImportDeclarations().map((declaration) => declaration.getModuleSpecifierValue()));
+        const contextProperties = contextPropertiesRead(sourceFile);
 
-        for (const key of keys) {
-            if (usage[key]) {
+        for (const capability of CAPABILITIES) {
+            if (usage[capability.key]) {
                 continue;
             }
 
-            const probe = PROBES[key];
-
-            if (importSpecifiers.has(probe.moduleSpecifier)) {
-                usage[key] = true;
+            if (importSpecifiers.has(capability.moduleSpecifier)) {
+                usage[capability.key] = true;
 
                 continue;
             }
 
-            if (probe.contextProperty !== undefined && readsContextProperty(sourceFile, probe.contextProperty)) {
-                usage[key] = true;
+            if (capability.contextProperty !== undefined && contextProperties.has(capability.contextProperty)) {
+                usage[capability.key] = true;
             }
         }
 
-        if (keys.every((key) => usage[key])) {
+        if (CAPABILITIES.every((capability) => usage[capability.key])) {
             break;
         }
     }
@@ -201,6 +150,11 @@ const discoverFeatureUsage = (project: Project, lunoraDirectory: string): Featur
  */
 const buildStudioFeatures = (usage: FeatureUsage, signals: StudioFeatureSignals): StudioFeaturesResult => {
     return {
+        analytics: usage.analytics || signals.dependencies.has("@lunora/bindings/analytics"),
+        auth: signals.dependencies.has("@lunora/auth"),
+        containers: usage.container || signals.containerCount > 0 || signals.dependencies.has("@lunora/container"),
+        flags: usage.flags || signals.dependencies.has("@lunora/flags"),
+        kv: usage.kv || signals.dependencies.has("@lunora/bindings/kv"),
         mail: usage.mail || signals.dependencies.has("@lunora/mail"),
         payments: usage.payments || signals.dependencies.has("@lunora/payment"),
         queues: signals.queueCount > 0 || signals.dependencies.has("@lunora/queue"),

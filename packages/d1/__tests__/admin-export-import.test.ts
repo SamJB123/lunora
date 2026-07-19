@@ -106,6 +106,58 @@ describe("d1 admin export/import globals", () => {
             expect(rows).toHaveLength(2);
             expect(rows[0]).toMatchObject({ table: "settings" });
         });
+
+        // Keyset paging (Finding 1): a small batch size forces several pages;
+        // every row must surface exactly once, in ascending `id` order, with no
+        // skip/duplicate — the property offset paging couldn't guarantee.
+        it("keyset-paginates across multiple pages without skipping or duplicating rows", async () => {
+            expect.assertions(3);
+
+            for (let index = 0; index < 5; index += 1) {
+                // eslint-disable-next-line no-await-in-loop -- sequential inserts to build a deterministic fixture
+                await writer.insert("settings", { _id: `s${String(index)}`, name: `n${String(index)}`, value: `v${String(index)}` }, { allowExplicitId: true });
+            }
+
+            const ids: unknown[] = [];
+
+            for await (const row of exportGlobalRows(harness.exec, schema, { batchSize: 2 })) {
+                ids.push(row.doc["_id"]);
+            }
+
+            expect(ids).toHaveLength(5);
+            expect(new Set(ids).size).toBe(5);
+            expect(ids).toEqual(["s0", "s1", "s2", "s3", "s4"]);
+        });
+
+        // Finding 4: a `.global()` table that was never written is provisioned by
+        // the export (idempotent CREATE … IF NOT EXISTS) and yields zero rows,
+        // rather than aborting the stream with a raw `no such table`.
+        it("exports a never-written global table as empty instead of throwing `no such table`", async () => {
+            expect.assertions(1);
+
+            const freshSchema: SchemaLike = {
+                tables: {
+                    widgets: {
+                        indexes: [],
+                        shape: { label: col("string") },
+                        shardMode: { kind: "global" } as never,
+                    },
+                },
+            };
+
+            const fresh = createD1Exec();
+            // Intentionally do NOT create the `widgets` table — exportGlobalRows
+            // must provision it before selecting.
+            const rows: unknown[] = [];
+
+            for await (const row of exportGlobalRows(fresh.exec, freshSchema, {})) {
+                rows.push(row);
+            }
+
+            expect(rows).toEqual([]);
+
+            fresh.close();
+        });
     });
 
     describe("importGlobalRows", () => {
@@ -210,6 +262,27 @@ describe("d1 admin export/import globals", () => {
             expect(reload).toMatchObject({ name: "theme", value: "dark" });
 
             fresh.close();
+        });
+
+        // Plan 118: the insert-failure catch now routes through `toErrorBody`
+        // instead of embedding a caught error's raw `.code`/`.message` directly —
+        // pin that an unrecognized throw (no D1 driver error here carries a
+        // `LunoraError`-shaped code/status) is redacted rather than leaking raw
+        // error text into the admin import response.
+        it("an unrecognized insert failure is redacted instead of leaking the raw error message", async () => {
+            expect.assertions(2);
+
+            const failingWriter: DatabaseWriterLike = {
+                ...writer,
+                insert: () => Promise.reject(new Error("driver error: connection reset")),
+            };
+
+            const result = await importGlobalRows(failingWriter, schema, {
+                rows: [{ doc: { _id: "s1", name: "theme", value: "dark" }, table: "settings" }],
+            });
+
+            expect(result.errors).toHaveLength(1);
+            expect(result.errors[0]).toMatchObject({ code: "INSERT_FAILED", message: "Internal error" });
         });
     });
 });

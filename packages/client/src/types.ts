@@ -24,6 +24,55 @@ export type ArgsOf<F> = F extends FunctionReference<infer _K, infer A, infer _R>
 /** Extract the return type from a {@link FunctionReference}. */
 export type ReturnOf<F> = F extends FunctionReference<infer _K, infer _A, infer R> ? R : never;
 
+/**
+ * Typed reference to an HTTP-SSE stream route (`httpRoute.&lt;verb>(path).stream()`)
+ * emitted by `@lunora/codegen` as `httpStreams.&lt;namespace>.&lt;name>`.
+ *
+ * Distinct from {@link FunctionReference}: this is the **HTTP-SSE route stream**
+ * (opened with `fetch` + `ReadableStream` against the route's own URL), not the
+ * WS procedure stream (`kind: "stream"`). At runtime it carries the HTTP verb
+ * and the route path; the phantom marker carries the chunk / searchParams /
+ * params types so `httpStream` (and the framework hooks over it) infer the
+ * chunk type end-to-end.
+ * @experimental Reconnect/POST-body/wire-fidelity design questions are still open, so the shape may change.
+ */
+export interface HttpStreamRef<Chunk = unknown, SearchParams = unknown, Params = unknown> {
+    /**
+     * Phantom marker carrying the `Chunk`/`SearchParams`/`Params` type
+     * parameters for inference. Never present at runtime; declared in a
+     * covariant (output) position so a concrete reference stays assignable to
+     * a widened one.
+     */
+    readonly __lunoraHttpStream?: { chunk: Chunk; params: Params; searchParams: SearchParams };
+    /** HTTP verb the route binds to (uppercased), e.g. `"GET"`. */
+    readonly method: string;
+    /** The route path as declared, e.g. `/api/tokens/:id` — `:name` segments are filled from `params`. */
+    readonly path: string;
+}
+
+/**
+ * The call-side args of an HTTP-SSE stream route: `:name` path params plus URL query params.
+ * @experimental Part of the HTTP-SSE stream surface.
+ */
+export interface HttpStreamCallArgs<SearchParams = unknown, Params = unknown> {
+    /** Values for the route path's `:name` segments. */
+    params?: Params;
+    /** URL query params, appended to the request URL (undefined entries are skipped). */
+    searchParams?: SearchParams;
+}
+
+/**
+ * Extract the chunk type from a {@link HttpStreamRef}.
+ * @experimental Part of the HTTP-SSE stream surface.
+ */
+export type HttpStreamChunkOf<R> = R extends HttpStreamRef<infer Chunk, infer _S, infer _P> ? Chunk : never;
+
+/**
+ * Extract the call-side args type from a {@link HttpStreamRef}.
+ * @experimental Part of the HTTP-SSE stream surface.
+ */
+export type HttpStreamArgsOf<R> = R extends HttpStreamRef<infer _C, infer S, infer P> ? HttpStreamCallArgs<S, P> : never;
+
 export type Unsubscribe = () => void;
 
 /**
@@ -107,6 +156,15 @@ export interface PersistedMutation {
      */
     identity?: string | null;
     shardKey?: string;
+
+    /**
+     * App/schema version stamped at enqueue (from `LunoraClientOptions.persistenceVersion`).
+     * On hydrate, a record whose `version` doesn't match the current one is dropped
+     * and purged rather than replayed — so a write persisted by an older deploy
+     * (with a now-changed function signature) can't replay against the new schema.
+     * Absent when no `persistenceVersion` is configured (no version gating).
+     */
+    version?: string;
 }
 
 /**
@@ -128,6 +186,42 @@ export interface PersistenceAdapter {
     load: () => Promise<PersistedMutation[]>;
     /** Remove a mutation by id once it has been replayed (resolved or rejected). */
     remove: (id: string) => Promise<void>;
+}
+
+/**
+ * One write handed to an {@link OutboxSink}. Mirrors {@link PersistedMutation}
+ * plus the custom-mutator identity (`clientId`/`mutationId`/`idempotencyKey`)
+ * the durable outbox needs to dedupe and watermark replays.
+ */
+export interface OutboxMutation {
+    args: Record<string, unknown>;
+    /** Stable per-client id; pairs with {@link OutboxMutation.mutationId} as `idempotencyKey`. */
+    clientId: string;
+    functionPath: string;
+    /** `${clientId}:${mutationId}` — sent as `x-lunora-mutation-id` so a replay is server-idempotent. */
+    idempotencyKey: string;
+    /** Issuing identity fingerprint (`null` = signed out); drives the sink's identity guard. */
+    identity: string | null;
+    /** Monotonic per-client mutation id, backing the server `__client_watermark`. */
+    mutationId: number;
+    shardKey?: string;
+}
+
+/**
+ * Pluggable durable outbox seam. When set on {@link LunoraClientOptions.outbox},
+ * the client delegates offline write durability + at-least-once replay to this
+ * sink instead of its built-in {@link PersistenceAdapter}-backed `OfflineQueue`.
+ * `@lunora/db` supplies the blessed implementation (`createExecutorOutboxSink`,
+ * backed by the TanStack `OfflineExecutor`); the interface itself is
+ * dependency-free so `@lunora/client` stays TanStack-free.
+ */
+export interface OutboxSink {
+    /**
+     * Persist and schedule a write for replay. Rejects with an
+     * `OFFLINE_QUEUE_OVERFLOW`-coded error when the sink's cap is exceeded, so
+     * the caller can surface back-pressure to the issuing mutation.
+     */
+    enqueue: (mutation: OutboxMutation) => Promise<void>;
 }
 
 /**
@@ -163,6 +257,14 @@ export interface CachedQuery {
 
     /** The full query result last seen from the server. */
     value: unknown;
+
+    /**
+     * App/schema version stamped when persisted (from `LunoraClientOptions.persistenceVersion`).
+     * A cached value whose `version` doesn't match the current one is not hydrated —
+     * so a result of a now-changed shape from an older deploy can't render. Absent
+     * when no `persistenceVersion` is configured (no version gating).
+     */
+    version?: string;
 }
 
 /**
@@ -183,6 +285,16 @@ export interface QueryCacheAdapter {
     remove: (key: string) => Promise<void>;
 }
 
+/**
+ * Resolves the WS `?token=` credential fresh at every (re)connect — the channel
+ * for short-lived tokens (e.g. the ephemeral admin sub-token the worker mints
+ * at `POST /_lunora/admin/ws-token`) instead of a static secret in the URL.
+ * May return the token synchronously or as a Promise; returning `undefined`
+ * connects without a token. A thrown error / rejected Promise fails that
+ * connect attempt, and the client retries with its normal reconnect backoff.
+ */
+export type WsTokenProvider = () => Promise<string | undefined> | string | undefined;
+
 export interface LunoraClientOptions {
     /**
      * Base path the worker mounts better-auth at, used by the client's
@@ -193,6 +305,17 @@ export interface LunoraClientOptions {
     bookmarkStorage?: BookmarkStorage;
 
     /**
+     * Stable per-client id backing the custom-mutator watermark. Sent on the
+     * `connect` envelope (so the server can scope this client's
+     * `__client_watermark`) and stamped onto every {@link OutboxMutation} the
+     * {@link LunoraClientOptions.outbox} sink persists, where it pairs with the
+     * monotonic mutation id to form the idempotency key. The `@lunora/db` path
+     * persists a stable id alongside the outbox and passes it here; omit for the
+     * standalone client, which generates an ephemeral per-session id.
+     */
+    clientId?: string;
+
+    /**
      * Default app context sent in the `connect` envelope right after each socket
      * opens, forwarded to the server's `onConnect`/`onDisconnect` lifecycle hooks
      * as `event.context`. A per-shard context registered via
@@ -200,6 +323,28 @@ export interface LunoraClientOptions {
      * hook needs connection context.
      */
     connectionContext?: Record<string, unknown>;
+
+    /**
+     * Fail-fast timeout (ms) for opening a subscription WebSocket. If the
+     * handshake doesn't complete within this window — a hung dev proxy or a cold
+     * worker that never upgrades — the client force-closes the socket and routes
+     * through its normal reconnect/backoff (surfacing `offline` status) instead
+     * of leaving the live channel silently stuck on the browser's much longer
+     * default. Does not affect HTTP queries/mutations (those never ride the WS).
+     * Defaults to 10000 (10s); set to `0` (or negative) to disable.
+     */
+    connectTimeoutMs?: number;
+
+    /**
+     * When `true`, tabs sharing the same origin coordinate via BroadcastChannel
+     * so only one tab (the "leader") opens WebSocket connections to the server.
+     * Follower tabs receive subscription data through the channel instead.
+     *
+     * Reduces simultaneous WS connections, bandwidth, and cross-tab state drift.
+     * Requires `BroadcastChannel` (browser-only); silently ignored otherwise.
+     * Defaults to `false`.
+     */
+    crossTabSync?: boolean;
     fetch?: typeof fetch;
 
     /**
@@ -210,16 +355,63 @@ export interface LunoraClientOptions {
      * `0` (or a negative value) to disable the heartbeat entirely.
      */
     heartbeatIntervalMs?: number;
-    offlineQueue?: OfflineQueueOptions;
-    /** Durable store for the offline mutation queue; omit to keep it in memory. */
-    persistence?: PersistenceAdapter;
 
     /**
-     * Durable store for the read cache (Pillar 2). When supplied, query results
+     * When `true` and a `queryCache` is active, framework hooks (React, Vue, …)
+     * wait for the durable cache to finish hydrating before their first render
+     * with an enabled subscription, so users see cached data instead of an
+     * undefined flash before the socket round-trip. Defaults to `false`.
+     *
+     * Requires `queryCache` to be set (not `false`); silently ignored otherwise.
+     */
+    hydrateOnStart?: boolean;
+
+    offlineQueue?: OfflineQueueOptions;
+
+    /**
+     * Durable outbox seam for offline writes. When supplied (the `@lunora/db`
+     * path wires `createExecutorOutboxSink`), offline mutations are delegated to
+     * the sink and the built-in {@link PersistenceAdapter}-backed `OfflineQueue`
+     * is bypassed, so a db app has exactly one durable write path. Omit for the
+     * standalone client, which keeps using {@link LunoraClientOptions.persistence}.
+     */
+    outbox?: OutboxSink;
+
+    /**
+     * Durable store for the offline mutation queue. Tri-state — an explicit
+     * {@link PersistenceAdapter} is used as-is; `false` opts out (the queue stays
+     * in memory, lost on reload); omitted (the default) auto-probes a durable
+     * IndexedDB store when the `indexedDB` global is present (browsers), otherwise
+     * in-memory, so SSR/Node/React-Native keep the in-memory behaviour and only
+     * environments that can persist do. Pass `createAsyncStoragePersistence()` on
+     * React Native.
+     */
+    persistence?: false | PersistenceAdapter;
+
+    /**
+     * App/schema version stamped onto every persisted queued write and cached
+     * read. Bump it on a breaking change to a function signature or query shape:
+     * on the next boot, persisted writes / cached reads stamped with a different
+     * version are dropped (and purged) rather than replayed / hydrated against the
+     * new schema. Omit to disable version gating (records are never invalidated by
+     * version).
+     *
+     * **Adoption is itself an invalidation event:** records written before you set
+     * `persistenceVersion` carry no version, so the first boot after enabling it
+     * purges all currently-queued offline writes (and cached reads) as stale. Adopt
+     * it on a build where that clean slate is acceptable — typically the same
+     * breaking deploy you're protecting against — not purely speculatively.
+     */
+    persistenceVersion?: string;
+
+    /**
+     * Durable store for the read cache (Pillar 2). When active, query results
      * are persisted as their subscriptions advance and hydrated on construction
      * so a reload renders cached data before the socket reconnects, then resumes
-     * the live subscription from the persisted cursor. Omit (or pass `false`) to
-     * keep reads in memory only — the default, unchanged behaviour.
+     * the live subscription from the persisted cursor. Tri-state — an explicit
+     * {@link QueryCacheAdapter} is used as-is; `false` opts out (reads stay in
+     * memory only); omitted (the default) auto-probes IndexedDB exactly like
+     * {@link LunoraClientOptions.persistence}.
      */
     queryCache?: QueryCacheAdapter | false;
     reconnect?: ReconnectOptions;
@@ -227,27 +419,64 @@ export interface LunoraClientOptions {
     WebSocket?: typeof WebSocket;
 
     /**
-     * Token appended to the WebSocket URL as `?token=…`. The server matches it
-     * against `LUNORA_WS_BEARER` (to clear the upgrade gate) and/or
+     * Credential appended to the WebSocket URL as `?token=…`. The server matches
+     * it against `LUNORA_WS_BEARER` (to clear the upgrade gate) and/or
      * `LUNORA_ADMIN_TOKEN` (to authorize `__lunora_admin__:*` subscriptions —
-     * what the studio sets it to). Browsers can't set headers on the
-     * `WebSocket` constructor, so the query parameter is the only channel; it
-     * ends up in server logs and history, so prefer a short-lived rotating
-     * token in production.
+     * what the studio supplies). Browsers can't set headers on the `WebSocket`
+     * constructor, so the query parameter is the only channel; it ends up in
+     * server logs and history, so prefer a short-lived rotating token in
+     * production over a static secret.
+     *
+     * Pass a {@link WsTokenProvider} function to resolve the token fresh at
+     * every (re)connect — the channel for short-lived credentials such as the
+     * ephemeral admin sub-token minted by `POST /_lunora/admin/ws-token`: the
+     * provider re-mints on each reconnect, including the one following a `4001`
+     * token-expired drop, so a static master token never has to ride the URL.
      */
-    wsToken?: string;
+    wsToken?: string | WsTokenProvider;
     wsUrl?: string;
 }
 
 /** Wire envelope sent on `POST /_lunora/rpc`. */
 export interface RpcEnvelope {
     args?: Record<string, unknown>;
+
+    /**
+     * Stable per-client identifier (custom-mutator push path). Pairs with
+     * {@link RpcEnvelope.mutationId} to form `idempotencyKey` and scope the
+     * server `__client_watermark`. Absent on plain `client.mutation` calls.
+     */
+    clientId?: string;
     functionPath: string;
+
+    /**
+     * Idempotency key (`${clientId}:${mutationId}`) for the custom-mutator push
+     * path, mirrored into the `x-lunora-mutation-id` header. Absent on plain
+     * `client.mutation` calls.
+     */
+    idempotencyKey?: string;
+
+    /**
+     * Monotonic per-client mutation id (custom-mutator push path), backing the
+     * server-side per-client watermark: `id &lt;= watermark` is a replay (skipped),
+     * `id == watermark + 1` runs authoritatively, `id > watermark + 1` halts the
+     * batch so the client resends from `watermark + 1`. Absent on plain
+     * `client.mutation` calls.
+     */
+    mutationId?: number;
     shardKey?: string;
 }
 
-/** Wire response from the shard's `/rpc` endpoint (forwarded by the runtime). */
-export type RpcResponseBody = { result: unknown } | { error: { code: string; message: string } };
+/**
+ * Wire response from the shard's `/rpc` endpoint (forwarded by the runtime). A
+ * watermarked custom-mutator push additionally carries `lastMutationId` — the
+ * highest per-client sequence the DO has applied — which the client uses to keep
+ * its `clientSeq` generator monotonic across reloads (see `LunoraClient.callMutator`).
+ * A plain mutation on a CDC shard carries `commitCursor` — the cursor the write
+ * committed at — which gates the drop of a per-call optimistic layer.
+ */
+export type RpcResponseBody =
+    { error: { code: string; data?: unknown; message: string } } | { commitCursor?: number; lastMutationId?: number; result: unknown };
 
 /** Subscription protocol — client → server. */
 export interface ClientSubscribeMessage {
@@ -277,9 +506,51 @@ export interface ClientUnsubscribeMessage {
  * `onDisconnect` when the socket drops.
  */
 export interface ClientConnectMessage {
+    /**
+     * Stable per-client id (persisted alongside the outbox). Lets the server
+     * scope this connection's `__client_watermark` so custom-mutator pokes can
+     * echo the right per-client `lastMutationId`. Omitted by clients that don't
+     * use custom mutators.
+     */
+    clientId?: string;
     context?: Record<string, unknown>;
     id: string;
     type: "connect";
+}
+
+/**
+ * Subscribe to a declarative **shape** — server-side partial replication scoped
+ * by `shardBy` + the shape's predicate + RLS. The client sends the shape *name*
+ * + validated `args`; the server resolves the trusted `where` (identity/RLS
+ * `baseWhere` the client can't forge) and streams the matching rowset, then live
+ * {@link ServerPokePartMessage} diffs. `id` namespaces the subscription and is
+ * echoed as `shapeId` on every poke part.
+ */
+export interface ClientShapeSubscribeMessage {
+    id: string;
+    shape: { args?: Record<string, unknown>; name: string };
+
+    /**
+     * Resume from this checkpoint (the `__cdc_log` cursor the client last
+     * applied for this shape). When absent or below the server's retained floor
+     * (`minCdcSeq`), the server re-seeds with a full insert-poke instead of a
+     * delta.
+     */
+    sinceCheckpoint?: number;
+
+    /**
+     * The CDC epoch {@link ClientShapeSubscribeMessage.sinceCheckpoint} belongs
+     * to. A mismatch (forked changelog timeline) forces a full re-seed even when
+     * the cursor is numerically in range.
+     */
+    sinceEpoch?: string;
+    type: "shape_subscribe";
+}
+
+/** Cancel a shape subscription started with the same `id`. */
+export interface ClientShapeUnsubscribeMessage {
+    id: string;
+    type: "shape_unsubscribe";
 }
 
 export interface ClientAckMessage {
@@ -325,6 +596,8 @@ export interface ClientWhisperMessage {
 export type ClientMessage =
     | ClientAckMessage
     | ClientConnectMessage
+    | ClientShapeSubscribeMessage
+    | ClientShapeUnsubscribeMessage
     | ClientStreamMessage
     | ClientSubscribeMessage
     | ClientUnsubscribeMessage
@@ -344,6 +617,14 @@ export interface ServerDataMessage {
     /** The CDC epoch this frame's cursor belongs to (see {@link CachedQuery.serverEpoch}). */
     epoch?: string;
     id: string;
+
+    /**
+     * The highest custom-mutator `mutationId` from this client the server has
+     * now applied (the per-client `__client_watermark`). Echoed so the client's
+     * outbox can drop confirmed pending mutations and let TanStack DB collapse
+     * the matching optimistic overlay. Absent on shards without custom mutators.
+     */
+    lastMutationId?: number;
     type: "data" | "delta";
 }
 
@@ -358,7 +639,34 @@ export interface ServerResumeMessage {
     /** The CDC epoch this resume's cursor belongs to (see {@link CachedQuery.serverEpoch}). */
     epoch?: string;
     id: string;
+    /** Per-client custom-mutator watermark (see {@link ServerDataMessage.lastMutationId}). */
+    lastMutationId?: number;
     type: "resume";
+}
+
+/**
+ * Settled acknowledgement for a **list** subscription: a write touched one of
+ * the subscription's read tables but produced a byte-identical result, so the
+ * server suppressed the data frame. Sent ONLY to a `@lunora/db` custom-mutator
+ * client (one that announced a `clientId`, hence has a server-side
+ * `__client_watermark`) so its optimistic list overlay drops even when no data
+ * frame arrives. Plain `useQuery` subscribers never receive it, and an older
+ * client safely ignores the unknown frame.
+ */
+export interface ServerSettledMessage {
+    cursor?: number;
+    /** The CDC epoch this settled frame's cursor belongs to (see {@link CachedQuery.serverEpoch}). */
+    epoch?: string;
+    id: string;
+
+    /**
+     * The highest custom-mutator `mutationId` from this client the server has
+     * now applied (the per-client `__client_watermark`). Forwarded to a
+     * collection's `onCheckpoint` so it can drop the overlay for the confirmed
+     * write whose result didn't change this list.
+     */
+    lastMutationId?: number;
+    type: "settled";
 }
 
 export interface ServerErrorMessage {
@@ -398,13 +706,79 @@ export interface ServerWhisperMessage {
     type: "whisper";
 }
 
+/**
+ * One row-level change in a shape's replication stream — the wire form of the
+ * DO's `__cdc_log` `CdcChange`. `insert`/`update` carry the post-image in
+ * `value` (projected to the shape's `columns`); `delete` omits it, identifying
+ * the removed row by `key` alone. The client applies these to its local
+ * collection; an unknown `key` on a `delete` is a safe no-op (a row the client
+ * never had in this shape).
+ */
+export interface RowOp {
+    /** Row primary key (`_id`). */
+    key: string;
+    op: "delete" | "insert" | "update";
+    /** Logical table the row belongs to. */
+    table: string;
+    /** Post-image document for insert/update; absent on delete. */
+    value?: Record<string, unknown>;
+}
+
+/**
+ * Opens a **poke** — an atomically-applied batch of shape diffs (Zero's poke
+ * protocol). A `pokeStart` is followed by zero or more {@link ServerPokePartMessage}
+ * frames and closed by exactly one {@link ServerPokeEndMessage}; the client
+ * buffers every part and applies them in a single transaction at `pokeEnd`, so a
+ * socket that drops mid-poke simply re-seeds on reconnect (no torn view).
+ */
+export interface ServerPokeStartMessage {
+    /** The checkpoint the client's view is expected to be at before this poke applies (for ordering/gap detection). */
+    baseCheckpoint?: number;
+    /** CDC epoch this poke belongs to; a mismatch forces the client to re-seed rather than apply. */
+    epoch?: string;
+    /** Correlates this poke's `pokeStart`/`pokePart`/`pokeEnd` frames. */
+    pokeId: string;
+    type: "pokeStart";
+}
+
+/** One shape's slice of an in-flight poke: the row-ops to apply for `shapeId`. */
+export interface ServerPokePartMessage {
+    /** Per-client custom-mutator watermark carried with this slice (see {@link ServerSettledMessage.lastMutationId}). */
+    lastMutationId?: number;
+    pokeId: string;
+    /** Ordered row-level changes for this shape, applied in sequence at `pokeEnd`. */
+    rowsPatch: RowOp[];
+    /** The {@link ClientShapeSubscribeMessage.id} these row-ops belong to. */
+    shapeId: string;
+    type: "pokePart";
+}
+
+/**
+ * Closes a poke: the client commits the buffered parts atomically and advances
+ * its checkpoint to {@link ServerPokeEndMessage.checkpoint} (the `__cdc_log`
+ * cursor high-watermark the view now reflects), replayed as `sinceCheckpoint` on
+ * the next reconnect.
+ */
+export interface ServerPokeEndMessage {
+    /** The `__cdc_log` cursor the view is at after applying this poke. */
+    checkpoint?: number;
+    /** CDC epoch the {@link ServerPokeEndMessage.checkpoint} belongs to. */
+    epoch?: string;
+    pokeId: string;
+    type: "pokeEnd";
+}
+
 export type ServerMessage =
     | ServerAckMessage
     | ServerChunkMessage
     | ServerCompleteMessage
     | ServerDataMessage
     | ServerErrorMessage
+    | ServerPokeEndMessage
+    | ServerPokePartMessage
+    | ServerPokeStartMessage
     | ServerResumeMessage
+    | ServerSettledMessage
     | ServerWhisperMessage;
 
 /**
@@ -568,11 +942,11 @@ export interface FunctionDescriptor {
  * cron introspection), so the studio renders these read-only.
  */
 // The admin wire-shape types `CronJobInfo` (cron-triggers tab), `VectorIndexSummary`
-// + `VectorQueryMatch` (vector browser) are owned by the runtime contract
-// (`@lunora/runtime`, which defines the `/_lunora/admin/*` endpoints) and
-// re-exported here for SDK consumers — a single source of truth, no hand-kept
+// + `VectorQueryMatch` (vector browser), and the KV browser types are owned by the
+// runtime contract (`@lunora/runtime`, which defines the `/_lunora/admin/*` endpoints)
+// and re-exported here for SDK consumers — a single source of truth, no hand-kept
 // copies to drift. Type-only re-export, so no worker code reaches the browser SDK.
-export type { CronJobInfo, VectorIndexSummary, VectorQueryMatch } from "@lunora/runtime";
+export type { CronJobInfo, KvKeyEntry, KvKeyListResult, KvNamespaceSummary, KvValueResult, VectorIndexSummary, VectorQueryMatch } from "@lunora/runtime";
 
 /** A `.global()` (D1-backed) table plus its row count, from `/_lunora/admin/global/tables`. */
 export interface GlobalTableInfo {
@@ -658,6 +1032,13 @@ export interface WorkflowInstanceDetail extends WorkflowInstanceSummary {
 
 /** A page of workflow instances. */
 export interface WorkflowInstancePage {
+    /**
+     * Whether workflow inspection is configured on the worker (a Cloudflare
+     * account id + API token). `false` when the admin proxy reports it can't
+     * inspect instances; omitted (treated as configured) otherwise. Lets a
+     * caller render a "set credentials" state without a failed request.
+     */
+    configured?: boolean;
     instances: WorkflowInstanceSummary[];
     page: number;
     perPage: number;
@@ -669,4 +1050,4 @@ export interface WorkflowInstancePage {
 // package that defines the `/_lunora/admin/auth/*` endpoints) and re-exported here
 // for SDK consumers — a single source of truth, no hand-kept copies. This is a
 // type-only re-export, so no runtime/worker code is pulled into the browser SDK.
-export type { AuthCapabilities, AuthImpersonation, AuthPage, AuthSession, AuthUser } from "@lunora/runtime";
+export type { AuthCapabilities, AuthConfigInfo, AuthImpersonation, AuthPage, AuthSession, AuthUser, AuthUserFieldSpec } from "@lunora/runtime";

@@ -4,6 +4,7 @@ import { applyLoadMore, derivePaginationStatus, initialPages, rebalance } from "
 import type { Accessor } from "solid-js";
 import { createEffect, createMemo, createSignal, on, onCleanup } from "solid-js";
 
+import { stableWireKey } from "../../../shared/wire-key";
 import { useLunora } from "./context";
 
 /** The args a paginated query exposes minus the framework-supplied page cursor. */
@@ -55,7 +56,12 @@ const buildPageArgs = (page: Page, baseArgs: Record<string, unknown>): Record<st
     };
 };
 
-const buildPageKey = (functionPath: string, pageArgs: Record<string, unknown>): string => `${functionPath}::${JSON.stringify(pageArgs)}`;
+// Key pages with the repo's canonical `stableWireKey` (keys sorted at every
+// depth, wire-typed args tokenized) rather than raw `JSON.stringify`, so two
+// structurally-equal arg records built with a different key order collapse to
+// one key instead of opening a duplicate subscription — matching the client's
+// own `SubscriptionRegistry.key`.
+const buildPageKey = (functionPath: string, pageArgs: Record<string, unknown>): string => `${functionPath}::${stableWireKey(pageArgs)}`;
 
 /**
  * SolidJS-native pagination engine shared by `createPaginatedQuery` and
@@ -103,19 +109,55 @@ const createPaginatedCore = <T>(
         setPageResults(updated);
     };
 
-    const syncSubscriptions = (currentPages: Page[], baseArgs: Record<string, unknown>): void => {
+    /**
+     * When rebalance splits or joins pages, the result keys change. Carry the
+     * existing results to the new keys so visible data is preserved while the
+     * server acknowledges the new boundary; each new page seeds its result from
+     * the old page whose `lower` bound matches (the page covering the start of
+     * the new range). Best-effort — the server sends a fresh result on the new
+     * subscription once attached. Mirrors Vue's `migrateResultsForRebalance`.
+     */
+    const migrateResultsForRebalance = (oldPages: Page[], newPages: Page[], baseArgs: Record<string, unknown>): void => {
+        const keyOf = (page: Page): string => buildPageKey(function_["__lunoraRef"], buildPageArgs(page, baseArgs));
+
+        for (const newPage of newPages) {
+            const newKey = keyOf(newPage);
+
+            if (resultsByKey.has(newKey)) {
+                continue; // already have a fresh result under this key
+            }
+
+            const donor = oldPages.find((oldPage) => oldPage.lower === newPage.lower);
+
+            if (donor) {
+                const carried = resultsByKey.get(keyOf(donor));
+
+                if (carried) {
+                    resultsByKey.set(newKey, carried);
+                }
+            }
+        }
+    };
+
+    const syncPass = (currentPages: Page[], baseArgs: Record<string, unknown>): void => {
         const wantedKeys = new Set<string>();
 
         for (const page of currentPages) {
             wantedKeys.add(buildPageKey(function_["__lunoraRef"], buildPageArgs(page, baseArgs)));
         }
 
-        // Close stale subscriptions.
+        // Close stale subscriptions and reclaim their stored results. Any key not
+        // in `wantedKeys` no longer maps to a current page, so its `resultsByKey`
+        // entry (a full page array) would otherwise be stranded forever — one leak
+        // per `loadMore`/rebalance over a long-lived feed. `loadMore`'s tail carry
+        // and `migrateResultsForRebalance` copy the result to the new key before
+        // the pages change, so the entry is safe to drop here.
         for (const [key, unsub] of activeSubs) {
             if (!wantedKeys.has(key)) {
                 unsub();
                 activeSubs.delete(key);
                 pendingPageKeys.delete(key);
+                resultsByKey.delete(key);
             }
         }
 
@@ -153,9 +195,15 @@ const createPaginatedCore = <T>(
                     // `loadMore`) stays in `pendingPageKeys` until it resolves;
                     // joining before that would discard visible content.
                     if (pendingPageKeys.size === 0) {
-                        const next = rebalance(pages(), pageResults());
+                        const latestPages = pages();
+                        const next = rebalance(latestPages, pageResults());
 
                         if (next) {
+                            // Seed the new page keys from the old results before
+                            // swapping `pages`, so already-rendered items don't
+                            // vanish (and the status regress to LoadingFirstPage)
+                            // until the new subscriptions' first frames arrive.
+                            migrateResultsForRebalance(latestPages, next, currentArgs);
                             setPages(next);
                         }
                     }
@@ -164,6 +212,55 @@ const createPaginatedCore = <T>(
             );
 
             activeSubs.set(key, unsub);
+        }
+    };
+
+    // `client.subscribe` replays a cached value to the new subscriber
+    // SYNCHRONOUSLY — the callback fires before `subscribe` returns, i.e. before
+    // this page's `activeSubs.set(key, unsub)` above is recorded. If that replay
+    // empties `pendingPageKeys` and `rebalance` returns a new layout, `setPages`
+    // updates the `pages` signal, and the `pages` effect below can re-enter
+    // `syncSubscriptions` against half-populated bookkeeping (depending on whether
+    // Solid schedules that effect synchronously in this construction). Re-entering
+    // the open loop there would duplicate still-wanted subs and orphan handles (the
+    // outer frame's `activeSubs.set` overwrites the reentrant entry) — a leaked,
+    // unsubscribable WS subscription. So guard: while a pass is running, a nested
+    // call only flags a re-sync, which the drain below runs once the outer pass has
+    // finished recording every handle — that follow-up pass closes any now-stale
+    // sub and opens the genuinely new pages against complete bookkeeping. Safe even
+    // if Solid already defers the effect (then this is a no-op hardening).
+    let syncing = false;
+    let resyncRequested = false;
+
+    const syncSubscriptions = (currentPages: Page[], baseArgs: Record<string, unknown>): void => {
+        if (syncing) {
+            resyncRequested = true;
+
+            return;
+        }
+
+        syncing = true;
+
+        try {
+            let pagesToSync = currentPages;
+            let argsToSync = baseArgs;
+
+            do {
+                resyncRequested = false;
+                syncPass(pagesToSync, argsToSync);
+
+                const latestArgs = resolveArgs();
+
+                if (latestArgs === "skip") {
+                    break;
+                }
+
+                pagesToSync = pages();
+                argsToSync = latestArgs;
+                // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- resyncRequested is set by syncPass through a nested call the flow analyzer cannot track
+            } while (resyncRequested);
+        } finally {
+            syncing = false;
         }
     };
 
@@ -233,8 +330,11 @@ const createPaginatedCore = <T>(
         // `applyLoadMore` pins the open-ended tail: its args key changes from
         // `endCursor: null` to `endCursor: cursor`. Carry the existing result to
         // the new key so `rebuildPageResults` after the pages update does not
-        // lose the data. The subscription closure key is also updated in
-        // `activeSubs` so the callback writes to the right slot.
+        // lose the data. Unlike Vue (which re-keys the live subscription entry in
+        // place), the Solid engine keys `activeSubs` by page key: the pages effect
+        // runs `syncSubscriptions`, which closes the old tail's subscription and
+        // opens a fresh one for the pinned page — and prunes the old key from
+        // `resultsByKey` after this carry has copied it.
         const oldTail = pages().at(-1);
         const newPinnedPage = next.at(-2); // `applyLoadMore` inserts the new tail last
 

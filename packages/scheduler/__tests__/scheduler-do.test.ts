@@ -159,6 +159,26 @@ describe("schedulerDO", () => {
         expect(state.alarm).toBe(now + 60_000);
     });
 
+    it("/schedule accepts a workflow target (no functionPath) and alarm() dispatches it", async () => {
+        expect.assertions(4);
+
+        const state = createFakeState();
+        const scheduler = new TestScheduler(state, { LUNORA_ORIGIN_URL: "https://app.test" });
+        const now = Date.now();
+
+        // A workflow/agent schedule carries a `workflow` binding instead of a functionPath.
+        const response = await scheduler.fetch(post("/schedule", { args: { prompt: "digest" }, scheduledFor: now - 1000, workflow: "AGENT_SUPPORT" }));
+
+        expect(response.status).toBe(200);
+
+        await scheduler.alarm();
+
+        expect(scheduler.dispatched).toHaveLength(1);
+        expect(scheduler.dispatched[0]?.workflow).toBe("AGENT_SUPPORT");
+        // The stored record carries no functionPath — the two targets are exclusive.
+        expect(scheduler.dispatched[0]?.functionPath).toBeUndefined();
+    });
+
     it("/get returns a single record by id (direct O(1) read), or {} when absent", async () => {
         expect.assertions(4);
 
@@ -380,6 +400,40 @@ describe("schedulerDO — retry / dead-letter pipeline", () => {
         expect(dead.attempts).toBeGreaterThan(5);
     });
 
+    it("logs a warning when a job is parked in the dead-letter store", async () => {
+        expect.assertions(2);
+
+        const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+        try {
+            const state = createFakeState();
+            const scheduler = new FailingScheduler(state, { LUNORA_ORIGIN_URL: "https://app.test" }, Number.POSITIVE_INFINITY);
+
+            const id = await scheduledId(await scheduler.fetch(post("/schedule", { args: {}, functionPath: "f", scheduledFor: Date.now() - 1000 })));
+
+            // Fire the alarm enough times to exhaust MAX_RETRY_ATTEMPTS (5). Each
+            // fire we force the re-armed entry due again.
+            for (let index = 0; index < 7; index += 1) {
+                const indexKey = [...state.storageMap.keys()].find((key) => key.startsWith("t:"));
+
+                if (indexKey) {
+                    const recordId = state.storageMap.get(indexKey);
+
+                    state.storageMap.delete(indexKey);
+                    state.storageMap.set(`t:${"0".padStart(15, "0")}:${String(recordId)}`, recordId);
+                }
+
+                // eslint-disable-next-line no-await-in-loop -- sequential alarm fires
+                await scheduler.alarm();
+            }
+
+            expect(warnSpy).toHaveBeenCalledTimes(1);
+            expect(warnSpy.mock.calls[0]?.[0]).toContain(id);
+        } finally {
+            warnSpy.mockRestore();
+        }
+    });
+
     it("does not leave a dangling dispatched: marker (claim is index-only)", async () => {
         expect.assertions(2);
 
@@ -394,6 +448,32 @@ describe("schedulerDO — retry / dead-letter pipeline", () => {
         // appear, and a successful fire leaves nothing behind.
         expect([...state.storageMap.keys()].filter((key) => key.startsWith("dispatched:"))).toHaveLength(0);
         expect(state.storageMap.size).toBe(0);
+    });
+
+    it("deletes a dangling time-index entry whose id: header is missing instead of busy-looping", async () => {
+        expect.assertions(3);
+
+        const state = createFakeState();
+        const scheduler = new TestScheduler(state, { LUNORA_ORIGIN_URL: "https://app.test" });
+        const now = Date.now();
+
+        // A stale index entry (past time) pointing at an id: header that no
+        // longer exists — the orphan a partial-failure path can leave behind.
+        const danglingKey = `t:${String(now - 5000).padStart(15, "0")}:ghost`;
+
+        state.storageMap.set(danglingKey, "ghost");
+
+        // A real future job so rescheduleAlarm() has a legitimate next time.
+        await scheduler.fetch(post("/schedule", { args: {}, functionPath: "real", scheduledFor: now + 60_000 }));
+
+        await scheduler.alarm();
+
+        // The orphan is cleaned up, nothing was dispatched for it, and the alarm
+        // is armed to the real future job — NOT stuck re-arming the past dangling
+        // time (which would fire, find no record, and busy-loop forever).
+        expect(state.storageMap.has(danglingKey)).toBe(false);
+        expect(scheduler.dispatched).toHaveLength(0);
+        expect(state.alarm).toBe(now + 60_000);
     });
 
     it("preserves the job for retry when LUNORA_ORIGIN_URL is unset at fire time", async () => {
@@ -832,17 +912,34 @@ describe("schedulerDO — scheduledFor validation", () => {
         expect(nonFiniteResponse.status).toBe(400);
     });
 
-    it("accepts the maximum valid Date millisecond value", async () => {
+    it("accepts the largest scheduledFor that still pads to a uniform width", async () => {
         expect.assertions(1);
 
         const state = createFakeState();
         const scheduler = new TestScheduler(state, { LUNORA_ORIGIN_URL: "https://app.test" });
 
-        // 8.64e15 is the largest valid Date; String() stays in plain digits so
-        // the index padding holds.
-        const response = await scheduler.fetch(post("/schedule", { args: {}, functionPath: "f", scheduledFor: 8_640_000_000_000_000 }));
+        // 999_999_999_999_999 (1e15 - 1) is the largest accepted value: it fits
+        // in exactly TIME_PAD (15) digits, so its time-index key keeps the
+        // lexical-order == numeric-order invariant.
+        const response = await scheduler.fetch(post("/schedule", { args: {}, functionPath: "f", scheduledFor: 999_999_999_999_999 }));
 
         expect(response.status).toBe(200);
+    });
+
+    it("rejects a scheduledFor one digit wider than the pad width (would break the index sort)", async () => {
+        expect.assertions(2);
+
+        const state = createFakeState();
+        const scheduler = new TestScheduler(state, { LUNORA_ORIGIN_URL: "https://app.test" });
+
+        // 1e15 is 16 digits — one wider than TIME_PAD (15) — so it would zero-pad
+        // to a 16-char key that sorts BEFORE shorter 15-char keys (e.g.
+        // "1000000000000000" < "200000000000000"), mis-ordering the alarm. It
+        // must be rejected up front and nothing persisted.
+        const response = await scheduler.fetch(post("/schedule", { args: {}, functionPath: "f", scheduledFor: 1_000_000_000_000_000 }));
+
+        expect(response.status).toBe(400);
+        expect([...state.storageMap.keys()].filter((key) => key.startsWith("id:"))).toHaveLength(0);
     });
 });
 
@@ -865,7 +962,7 @@ describe("schedulerDO — per-record drain isolation (storage throw)", () => {
         }
 
         protected override async dispatch(record: ScheduleRecord): Promise<boolean> {
-            if (this.poison.has(record.functionPath)) {
+            if (this.poison.has(record.functionPath ?? "")) {
                 return false;
             }
 
@@ -917,7 +1014,7 @@ describe("schedulerDO — per-record drain isolation (storage throw)", () => {
         await expect(scheduler.alarm()).resolves.toBeUndefined();
 
         // The two healthy due records still dispatched despite the poison throw.
-        expect(scheduler.dispatched.map((record) => record.functionPath).toSorted((left, right) => left.localeCompare(right))).toEqual(["ok-a", "ok-b"]);
+        expect(scheduler.dispatched.map((record) => record.functionPath ?? "").toSorted((left, right) => left.localeCompare(right))).toEqual(["ok-a", "ok-b"]);
 
         // rescheduleAlarm() still ran (finally) and armed the next pending time.
         // The poison record was re-claimed (re-fireable) at its original time

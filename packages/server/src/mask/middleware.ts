@@ -64,6 +64,7 @@ interface QueryArgs {
     baseWhere?: unknown;
     cursor?: null | string;
     limit?: number;
+    orderBy?: ReadonlyArray<Record<string, unknown>>;
     where?: unknown;
     with?: Record<string, unknown>;
 }
@@ -71,11 +72,13 @@ interface QueryArgs {
 interface AggregateArgs {
     field?: string;
     op: string;
+    where?: unknown;
 }
 
 interface GroupByArgs {
     agg?: { field?: string; op: string };
     by: ReadonlyArray<string>;
+    where?: unknown;
 }
 
 interface TableReaderLike {
@@ -101,16 +104,26 @@ interface MaskDatabase {
     count: (tableName: string, whereOrArgs?: unknown) => Promise<number>;
     delete: (id: string, expectedTable?: string) => Promise<void>;
     deleteMany: (ids: ReadonlyArray<string>, options?: { limit?: number }) => Promise<{ deleted: number }>;
+    deleteWhere?: (tableName: string, where: Record<string, unknown>, options?: { limit?: number }) => Promise<{ deleted: number }>;
     findFirst: (tableName: string, args?: QueryArgs) => Promise<Record<string, unknown> | null>;
     findFirstOrThrow: (tableName: string, args?: QueryArgs) => Promise<Record<string, unknown>>;
     findMany: (tableName: string, args?: QueryArgs) => Promise<QueryPage>;
     get: (id: string, expectedTable?: string) => Promise<Record<string, unknown> | null>;
     groupBy: (tableName: string, options: GroupByArgs) => Promise<ReadonlyArray<{ key: Record<string, unknown>; value: null | number }>>;
     insert: (tableName: string, document: Record<string, unknown>) => Promise<string>;
-    insertMany: (tableName: string, documents: ReadonlyArray<Record<string, unknown>>, options?: { limit?: number }) => Promise<string[]>;
+    insertMany: (
+        tableName: string,
+        documents: ReadonlyArray<Record<string, unknown>>,
+        options?: { limit?: number; skipDuplicates?: boolean },
+    ) => Promise<(string | null)[]>;
     lookupById?: (id: string, expectedTable?: string) => Promise<null | { row: Record<string, unknown>; tableName: string }>;
     patch: (id: string, patch: Record<string, unknown>, expectedTable?: string) => Promise<void>;
-    patchMany: (patches: ReadonlyArray<{ id: string; patch: Record<string, unknown> }>, options?: { limit?: number }) => Promise<void>;
+    patchMany: (patches: ReadonlyArray<{ id: string; patch: Record<string, unknown> }>, options?: { limit?: number }) => Promise<{ patched: number }>;
+    patchWhere?: (
+        tableName: string,
+        args: { patch: Record<string, unknown>; where: Record<string, unknown> },
+        options?: { limit?: number },
+    ) => Promise<{ patched: number }>;
     query: (tableName: string) => TableReaderLike;
     rank: (tableName: string, indexName: string, options: unknown) => Promise<null | { position: number; total: number }>;
     rankBefore?: (tableName: string, indexName: string, options: unknown) => Promise<{ before: number; total: number }>;
@@ -221,6 +234,73 @@ const maskPage = <Context>(page: QueryPage, columns: MaskColumns<Context>, base:
 };
 
 /**
+ * SECURITY (value oracle on the index path): `withIndex` / `withSearchIndex`
+ * constrain WHICH rows are fetched by a caller-supplied range/search over a
+ * column. If that column is masked, a caller can
+ * `query(table).withIndex("by_ssn", q => q.eq("ssn", guess)).first()` — or the
+ * search-index twin `q => q.search("email", term)` — and confirm / binary-search
+ * the exact value the mask is meant to hide. It is the same oracle
+ * `assertWhereAllowed` (below) closes on the `where` path, reached instead
+ * through the index builder.
+ *
+ * Unlike `where` (a plain object walked by `collectWhereFields`), the
+ * range/search is a builder CALLBACK (`q => q.eq("ssn", x)`), so the referenced
+ * fields aren't statically inspectable. Run the callback once against a
+ * recording proxy: its blanket `get` trap turns EVERY property access into a
+ * method that captures its first positional argument — the field name is ALWAYS
+ * the first argument of every builder method (`eq`/`gt`/`gte`/`lt`/`lte` on the
+ * index range, `eq`/`search` on the search filter) — and returns a fresh
+ * recorder so the chain (`q.eq(...).gt(...)`) keeps recording. Recording through
+ * a blanket trap rather than a fixed method allow-list FAILS CLOSED: a
+ * field-naming method added to the builder later still records its field with no
+ * change here. Then reject if any recorded field is masked, mirroring
+ * `assertWhereAllowed`'s message.
+ *
+ * The callback runs twice — here on the recorder, then on the real builder in
+ * `reader.withIndex`/`withSearchIndex`. The builder callbacks are pure (they
+ * only push into a fresh per-call stage; see `@lunora/do`'s `createRangeBuilder`
+ * / `createSearchBuilder`), so the dry pass is side-effect free. `withIndex`'s
+ * `range` is optional (a bare index scan) — with no callback there is no field
+ * to record and nothing to reject.
+ */
+const assertIndexFieldsAllowed = <Context>(
+    builderCallback: ((q: unknown) => unknown) | undefined,
+    columns: MaskColumns<Context>,
+    tableName: string,
+    method: string,
+): void => {
+    if (typeof builderCallback !== "function") {
+        return;
+    }
+
+    const referenced = new Set<string>();
+
+    const makeRecorder = (): unknown =>
+        new Proxy(
+            {},
+            {
+                get:
+                    () =>
+                    (field: unknown): unknown => {
+                        if (typeof field === "string") {
+                            referenced.add(field);
+                        }
+
+                        return makeRecorder();
+                    },
+            },
+        );
+
+    builderCallback(makeRecorder());
+
+    for (const field of referenced) {
+        if (field in columns) {
+            throw new LunoraError("MASK_UNSUPPORTED", `${method}() filtering "${tableName}" by masked column "${field}" is not supported`);
+        }
+    }
+};
+
+/**
  * A value glued onto `ctx.db` is a per-table facade entry when it carries the
  * `findMany` + `withSearchIndex` accessor pair (mirrors RLS's check). Used to
  * find the entries that need re-binding through the masked writer.
@@ -246,17 +326,23 @@ const wrapDatabase = <Context>(base: MaskDatabase, perTable: Map<string, MaskCol
      * refinement (`filter` / `order` / `withIndex` / `withSearchIndex`) returns a
      * reader that is still masked.
      */
-    const wrapReader = (reader: TableReaderLike, columns: MaskColumns<Context>): TableReaderLike => {
+    const wrapReader = (reader: TableReaderLike, columns: MaskColumns<Context>, tableName: string): TableReaderLike => {
         return {
             collect: async () => {
                 const rows = await reader.collect();
 
                 return rows.map((row) => maskRow(row, columns, context));
             },
+            // SECURITY (value oracle): the predicate must see the MASKED row, not
+            // the raw stored row — otherwise a caller can `.filter(d => d.ssn ===
+            // guess)` to read the value the mask hides. Masking before the
+            // predicate keeps filtering on non-masked columns working while
+            // redacting masked cells the predicate can observe.
             filter: (predicate) =>
                 wrapReader(
-                    reader.filter((document) => predicate(document)),
+                    reader.filter((document) => predicate(maskRow(document, columns, context))),
                     columns,
+                    tableName,
                 ),
             first: async () => {
                 const row = await reader.first();
@@ -264,7 +350,7 @@ const wrapDatabase = <Context>(base: MaskDatabase, perTable: Map<string, MaskCol
                 // eslint-disable-next-line unicorn/no-null -- mirrors the reader's `null` empty sentinel
                 return row ? maskRow(row, columns, context) : null;
             },
-            order: (direction) => wrapReader(reader.order(direction), columns),
+            order: (direction) => wrapReader(reader.order(direction), columns, tableName),
             paginate: async (options) => maskPage(await reader.paginate(options), columns, context),
             take: async (limit) => {
                 const rows = await reader.take(limit);
@@ -277,8 +363,21 @@ const wrapDatabase = <Context>(base: MaskDatabase, perTable: Map<string, MaskCol
                 // eslint-disable-next-line unicorn/no-null -- mirrors the reader's `null` empty sentinel
                 return row ? maskRow(row, columns, context) : null;
             },
-            withIndex: (indexName, range) => wrapReader(reader.withIndex(indexName, range), columns),
-            withSearchIndex: (indexName, search) => wrapReader(reader.withSearchIndex(indexName, search), columns),
+            // SECURITY (value oracle): reject before delegating when the range /
+            // search references a masked column — an index range or search term
+            // over a masked column is the same value oracle as a masked-column
+            // `where`, so it must fail closed (see `assertIndexFieldsAllowed`).
+            // Reads over NON-masked columns pass through and still mask output.
+            withIndex: (indexName, range) => {
+                assertIndexFieldsAllowed(range, columns, tableName, "withIndex");
+
+                return wrapReader(reader.withIndex(indexName, range), columns, tableName);
+            },
+            withSearchIndex: (indexName, search) => {
+                assertIndexFieldsAllowed(search, columns, tableName, "withSearchIndex");
+
+                return wrapReader(reader.withSearchIndex(indexName, search), columns, tableName);
+            },
         };
     };
 
@@ -347,16 +446,143 @@ const wrapDatabase = <Context>(base: MaskDatabase, perTable: Map<string, MaskCol
         }
     };
 
+    /**
+     * Collect the field names a client `where` clause references, walking the
+     * `AND`/`OR` (arrays) and `NOT` (object) logical connectors. `__`-prefixed
+     * structural markers (e.g. the relation-EXISTS key) are not columns of this
+     * table, so they're skipped.
+     */
+    const collectWhereFields = (where: unknown, into: Set<string>): void => {
+        if (!where || typeof where !== "object" || Array.isArray(where)) {
+            return;
+        }
+
+        for (const [key, value] of Object.entries(where as Record<string, unknown>)) {
+            if (key === "AND" || key === "OR") {
+                if (Array.isArray(value)) {
+                    for (const clause of value) {
+                        collectWhereFields(clause, into);
+                    }
+                }
+            } else if (key === "NOT") {
+                collectWhereFields(value, into);
+            } else if (!key.startsWith("__")) {
+                into.add(key);
+            }
+        }
+    };
+
+    /**
+     * SECURITY (value oracle): masking only redacts OUTPUT values — it does not
+     * stop a caller filtering by a masked column. `findMany({ where: { ssn: { eq:
+     * X } } })` (row present ⇒ value confirmed) or a range predicate lets a caller
+     * binary-search the exact value the mask is meant to hide. Fail closed — like
+     * `assertReductionAllowed` does for aggregate/groupBy — when a client `where`
+     * references a masked column. `baseWhere` is a CALLER-reachable field on the
+     * public `count`/query args (it reaches the SQL predicate via `mergeWhere`),
+     * so it is routed through this same guard too — it is not a server-only field.
+     */
+    const assertWhereAllowed = (tableName: string, where: unknown, method: string): void => {
+        const columns = perTable.get(tableName);
+
+        if (!columns || where === undefined) {
+            return;
+        }
+
+        const referenced = new Set<string>();
+
+        collectWhereFields(where, referenced);
+
+        for (const field of referenced) {
+            if (field in columns) {
+                throw new LunoraError("MASK_UNSUPPORTED", `${method}() filtering "${tableName}" by masked column "${field}" is not supported`);
+            }
+        }
+    };
+
+    /**
+     * SECURITY (value oracle via sort order): masking rewrites OUTPUT cells but
+     * preserves ROW ORDER, so `findMany({ orderBy: [{ ssn: "asc" }] })` returns
+     * masked cells sorted by the true hidden value — a sort/binary-search/relative-
+     * rank oracle across pages. Fail closed when an `orderBy` entry references a
+     * masked column, mirroring `assertWhereAllowed` and the index-reader guard
+     * (`order()` over a masked `withIndex` already throws). `orderBy` is a
+     * `Partial&lt;Record&lt;column, "asc" | "desc">>[]`, so each entry's keys are the
+     * ordered columns.
+     */
+    const assertOrderByAllowed = (tableName: string, orderBy: unknown, method: string): void => {
+        const columns = perTable.get(tableName);
+
+        if (!columns || !Array.isArray(orderBy)) {
+            return;
+        }
+
+        for (const entry of orderBy) {
+            if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+                for (const field of Object.keys(entry as Record<string, unknown>)) {
+                    if (field in columns) {
+                        throw new LunoraError("MASK_UNSUPPORTED", `${method}() ordering "${tableName}" by masked column "${field}" is not supported`);
+                    }
+                }
+            }
+        }
+    };
+
     const wrapped: MaskDatabase = {
         ...base,
 
+        async deleteWhere(tableName, where, options) {
+            assertWhereAllowed(tableName, where, "deleteMany({ where })");
+
+            if (base.deleteWhere === undefined) {
+                throw new LunoraError("INTERNAL", `ctx.db.${tableName}.deleteMany({ where }) is unavailable: this writer has no where-based delete`);
+            }
+
+            return base.deleteWhere(tableName, where, options);
+        },
+
+        async patchWhere(tableName, args, options) {
+            assertWhereAllowed(tableName, args.where, "patchMany({ where })");
+
+            if (base.patchWhere === undefined) {
+                throw new LunoraError("INTERNAL", `ctx.db.${tableName}.patchMany({ where }) is unavailable: this writer has no where-based patch`);
+            }
+
+            return base.patchWhere(tableName, args, options);
+        },
+
         aggregate(tableName, options) {
             assertReductionAllowed(tableName, [options.field], "aggregate");
+            assertWhereAllowed(tableName, options.where, "aggregate");
 
             return base.aggregate(tableName, options);
         },
 
+        count(tableName, whereOrArgs) {
+            // A masked-column `where` is an existence/value oracle even through a
+            // row-count (no value returned but presence leaks). `count(where)` may
+            // pass a bare `where` or an args wrapper — unwrap the client `where`.
+            const wrapper =
+                whereOrArgs && typeof whereOrArgs === "object" && !Array.isArray(whereOrArgs) ? (whereOrArgs as Record<string, unknown>) : undefined;
+            const where = wrapper && ("where" in wrapper || "baseWhere" in wrapper || "restrictsCounts" in wrapper) ? wrapper.where : whereOrArgs;
+
+            assertWhereAllowed(tableName, where, "count");
+
+            // `baseWhere` is in the public `count` args and reaches the SQL
+            // predicate (`mergeWhere(baseWhere, where, scope)`), so a masked
+            // column smuggled through it is the same oracle — guard it too.
+            if (wrapper) {
+                assertWhereAllowed(tableName, wrapper.baseWhere, "count");
+            }
+
+            return base.count(tableName, whereOrArgs);
+        },
+
         async findFirst(tableName, args) {
+            assertWhereAllowed(tableName, args?.where, "findFirst");
+            assertWhereAllowed(tableName, args?.baseWhere, "findFirst");
+            assertOrderByAllowed(tableName, args?.orderBy, "findFirst");
+
             const row = await base.findFirst(tableName, args);
             const columns = perTable.get(tableName);
 
@@ -364,6 +590,10 @@ const wrapDatabase = <Context>(base: MaskDatabase, perTable: Map<string, MaskCol
         },
 
         async findFirstOrThrow(tableName, args) {
+            assertWhereAllowed(tableName, args?.where, "findFirstOrThrow");
+            assertWhereAllowed(tableName, args?.baseWhere, "findFirstOrThrow");
+            assertOrderByAllowed(tableName, args?.orderBy, "findFirstOrThrow");
+
             const row = await base.findFirstOrThrow(tableName, args);
             const columns = perTable.get(tableName);
 
@@ -371,6 +601,10 @@ const wrapDatabase = <Context>(base: MaskDatabase, perTable: Map<string, MaskCol
         },
 
         async findMany(tableName, args) {
+            assertWhereAllowed(tableName, args?.where, "findMany");
+            assertWhereAllowed(tableName, args?.baseWhere, "findMany");
+            assertOrderByAllowed(tableName, args?.orderBy, "findMany");
+
             const page = await base.findMany(tableName, args);
             const columns = perTable.get(tableName);
 
@@ -390,6 +624,7 @@ const wrapDatabase = <Context>(base: MaskDatabase, perTable: Map<string, MaskCol
 
         groupBy(tableName, options) {
             assertReductionAllowed(tableName, [...options.by, options.agg?.field], "groupBy");
+            assertWhereAllowed(tableName, options.where, "groupBy");
 
             return base.groupBy(tableName, options);
         },
@@ -398,7 +633,7 @@ const wrapDatabase = <Context>(base: MaskDatabase, perTable: Map<string, MaskCol
             const reader = base.query(tableName);
             const columns = perTable.get(tableName);
 
-            return columns ? wrapReader(reader, columns) : reader;
+            return columns ? wrapReader(reader, columns, tableName) : reader;
         },
 
         async rankPage(tableName, indexName, options) {

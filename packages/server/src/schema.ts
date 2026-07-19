@@ -1,3 +1,4 @@
+import { LunoraError } from "@lunora/errors";
 import type { Validator } from "@lunora/values";
 import { isOrWrapsFromValidator, v } from "@lunora/values";
 
@@ -7,6 +8,7 @@ import type {
     AggregateIndexDefinition,
     AggregateOp,
     DurableObjectJurisdiction,
+    ExternalSourceDefinition,
     GlobalBackend,
     IndexDefinition,
     OnDeleteAction,
@@ -149,6 +151,20 @@ interface TableBuilder<Shape extends Record<string, Validator> = Record<string, 
      * physically persists).
      */
     softDelete: (options?: { field?: string }) => TableBuilder<Shape>;
+
+    /**
+     * Materialize this table from an external Postgres/MySQL behind Cloudflare
+     * Hyperdrive (plan 077). A system-driven poll loop reads the tenant slice
+     * (`query`, with params bound from `tenantBy`) and lands it in the DO's SQLite,
+     * after which `defineShape` carries it to clients unchanged. Implies
+     * `.externallyManaged()` (rows come from the ingest loop, not user mutations).
+     *
+     * Orthogonal to `.shardBy()` — combine them for per-tenant DOs. **Under
+     * `.shardBy()` `tenantBy` is mandatory** (the tenant-isolation boundary); the
+     * `external_source_unscoped` advisor lint fails the build when it is absent, and
+     * `external_source_on_global` rejects combining `.source()` with `.global()`.
+     */
+    source: (definition: ExternalSourceDefinition) => TableBuilder<Shape>;
     /** Declare named lifecycle triggers fired inline within the write path. */
     triggers: (build: (t: TriggerBuilder<Shape>) => Record<string, TriggerDefinition>) => TableBuilder<Shape>;
     /** Declare a vector index over a single text field on this table. */
@@ -212,7 +228,7 @@ const defineTable = <Shape extends Record<string, Validator>>(inputShape: Shape)
     // anywhere in a column, including nested under v.optional/array/object/etc.
     for (const [columnName, validator] of Object.entries(shape)) {
         if (isOrWrapsFromValidator(validator)) {
-            throw new Error(`defineTable: column "${columnName}" uses v.from() which is args-only — table columns need a concrete v.* type`);
+            throw new LunoraError("INTERNAL", `defineTable: column "${columnName}" uses v.from() which is args-only — table columns need a concrete v.* type`);
         }
     }
 
@@ -228,13 +244,14 @@ const defineTable = <Shape extends Record<string, Validator>>(inputShape: Shape)
     let isExternallyManaged = false;
     let isPublic = false;
     let softDelete: { field: string } | undefined;
+    let externalSource: ExternalSourceDefinition | undefined;
 
     const builder: TableBuilder<Shape> = {
         aggregateIndex(name, options) {
             const op: AggregateOp = options?.op ?? "count";
 
             if (op !== "count" && !options?.field) {
-                throw new Error(`aggregateIndex "${name}": op "${op}" requires a "field"`);
+                throw new LunoraError("INTERNAL", `aggregateIndex "${name}": op "${op}" requires a "field"`);
             }
 
             aggregateIndexes.push({
@@ -253,6 +270,9 @@ const defineTable = <Shape extends Record<string, Validator>>(inputShape: Shape)
         },
         get aggregateIndexes() {
             return aggregateIndexes;
+        },
+        get externalSource() {
+            return externalSource;
         },
         externallyManaged() {
             isExternallyManaged = true;
@@ -286,7 +306,7 @@ const defineTable = <Shape extends Record<string, Validator>>(inputShape: Shape)
         rankIndex(name, options) {
             // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- defensive: `sortBy` is typed required but untyped JS callers can omit it
             if (!options.sortBy || options.sortBy.length === 0) {
-                throw new Error(`rankIndex "${name}": "sortBy" is required and must list at least one key`);
+                throw new LunoraError("INTERNAL", `rankIndex "${name}": "sortBy" is required and must list at least one key`);
             }
 
             const sortBy: RankSortKey[] = options.sortBy.map((key) => {
@@ -338,6 +358,28 @@ const defineTable = <Shape extends Record<string, Validator>>(inputShape: Shape)
         },
         get softDeleteMode() {
             return softDelete;
+        },
+        source(definition) {
+            // Order-independent guards only — `binding`/`query` are always required.
+            // The tenant-scope (`tenantBy` under `.shardBy()`) and the
+            // sourced-vs-`.global()` contradiction depend on the FINAL table state
+            // (the chain order is arbitrary), so they are enforced by the
+            // `external_source_unscoped` / `external_source_on_global` advisor lints
+            // over the discovered IR rather than here.
+            if (!definition.binding) {
+                throw new LunoraError("INTERNAL", "source: `binding` is required (the wrangler Hyperdrive binding name)");
+            }
+
+            if (!definition.query) {
+                throw new LunoraError("INTERNAL", "source: `query` is required (the tenant-membership SQL)");
+            }
+
+            externalSource = definition;
+            // A sourced table is written by the ingest loop, never a user mutation —
+            // exactly what `.externallyManaged()` marks, so imply it.
+            isExternallyManaged = true;
+
+            return builder;
         },
         softDelete(options) {
             const field = options?.field ?? "deletedAt";
@@ -424,7 +466,7 @@ const defineAggregateIndex = (name: string, options: AggregateIndexOptions): Agg
     const op: AggregateOp = options.op ?? "count";
 
     if (op !== "count" && !options.field) {
-        throw new Error(`aggregateIndex "${name}": op "${op}" requires a "field"`);
+        throw new LunoraError("INTERNAL", `aggregateIndex "${name}": op "${op}" requires a "field"`);
     }
 
     return { by: options.by, field: options.field, name, on: options.on, op, where: options.where };
@@ -450,7 +492,7 @@ interface RankIndexOptions {
 const defineRankIndex = (name: string, options: RankIndexOptions): RankIndexDefinition => {
     // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- defensive: `sortBy` is typed required but untyped JS callers can omit it
     if (!options.sortBy || options.sortBy.length === 0) {
-        throw new Error(`rankIndex "${name}": "sortBy" is required and must list at least one key`);
+        throw new LunoraError("INTERNAL", `rankIndex "${name}": "sortBy" is required and must list at least one key`);
     }
 
     const sortBy: RankSortKey[] = options.sortBy.map((key) => {
@@ -578,7 +620,7 @@ const attachStandaloneIndexes = (
         const table = tables[index.on];
 
         if (!table) {
-            throw new Error(`defineAggregateIndex "${index.name}": unknown table "${index.on}"`);
+            throw new LunoraError("INTERNAL", `defineAggregateIndex "${index.name}": unknown table "${index.on}"`);
         }
 
         (table.aggregateIndexes as AggregateIndexDefinition[]).push(index);
@@ -588,10 +630,116 @@ const attachStandaloneIndexes = (
         const table = tables[index.on];
 
         if (!table) {
-            throw new Error(`defineRankIndex "${index.name}": unknown table "${index.on}"`);
+            throw new LunoraError("INTERNAL", `defineRankIndex "${index.name}": unknown table "${index.on}"`);
         }
 
         (table.rankIndexes as RankIndexDefinition[]).push(index);
+    }
+};
+
+/** The first incremental-only knob set on a `.source()` config, or `undefined` when none are (used to reject them on a full-pull source). */
+const strayIncrementalKnob = (source: ExternalSourceDefinition): string | undefined => {
+    if (source.cursor) {
+        return "cursor";
+    }
+
+    if (source.reconcileEveryMs !== undefined) {
+        return "reconcileEveryMs";
+    }
+
+    if (source.softDeleteColumn !== undefined) {
+        return "softDeleteColumn";
+    }
+
+    return undefined;
+};
+
+/**
+ * Validate the `mode` + incremental knobs of one `.source()` (plan 077 / 136):
+ * reject an unknown mode; require `cursor` + a delete-visibility path
+ * (`reconcileEveryMs`/`softDeleteColumn`) for incremental; reject those knobs on a
+ * full-pull source. Throws so a misconfigured source never loads.
+ */
+const validateExternalSourceMode = (name: string, source: ExternalSourceDefinition): void => {
+    const isIncremental = source.mode === "incremental";
+
+    // Reject an unknown mode from untyped JS callers (the typed union is
+    // `"full-pull" | "incremental" | undefined`, a compile-time error otherwise).
+    if (source.mode !== undefined && source.mode !== "full-pull" && !isIncremental) {
+        throw new LunoraError(
+            "INTERNAL",
+            `defineSchema: table "${name}" uses \`mode: ${JSON.stringify(source.mode)}\` — supported modes are "full-pull" (default) and "incremental".`,
+        );
+    }
+
+    if (!isIncremental) {
+        // The incremental-only knobs are meaningless (and misleading) on a full-pull
+        // source — reject them so a mislaid `mode` fails loudly rather than silently
+        // ignoring a cursor/reconcile/soft-delete config.
+        const strayKnob = strayIncrementalKnob(source);
+
+        if (strayKnob) {
+            throw new LunoraError(
+                "INTERNAL",
+                `defineSchema: table "${name}" sets \`${strayKnob}\` but is not \`mode: "incremental"\` — that knob only applies to incremental ingest. Set \`mode: "incremental"\` or remove \`${strayKnob}\`.`,
+            );
+        }
+
+        return;
+    }
+
+    // Incremental needs a durable watermark: the cursor column + the
+    // watermark-parameterized pull query. Without it there is nothing to page from
+    // (plan 136 §"No cursor declaration").
+    if (!source.cursor?.column || !source.cursor.query) {
+        throw new LunoraError(
+            "INTERNAL",
+            `defineSchema: table "${name}" is \`mode: "incremental"\` but has no \`cursor\` — add \`cursor: { column: "updated_at", query: "… WHERE … > $N" }\` binding the watermark as the trailing parameter.`,
+        );
+    }
+
+    // Delete visibility: an incremental slice can't observe upstream deletes (absent
+    // ≠ deleted), so it MUST declare either a reconcile sweep or a soft-delete
+    // tombstone column, else it silently accumulates phantom rows (the
+    // `external_source_incremental_no_delete_path` STOP lint mirrors this).
+    if (source.reconcileEveryMs === undefined && source.softDeleteColumn === undefined) {
+        throw new LunoraError(
+            "INTERNAL",
+            `defineSchema: table "${name}" is \`mode: "incremental"\` with no delete-visibility path — an incremental pull never sees upstream deletes, so it would accumulate phantom rows. Add \`reconcileEveryMs\` (a periodic full-pull sweep) or \`softDeleteColumn\` (an upstream tombstone column).`,
+        );
+    }
+};
+
+/**
+ * Hard-enforce the `.source(...)` invariants at schema-definition time (plan 077).
+ * Chain order is arbitrary, so the builder can't see the final `shardMode` when
+ * `.source()` runs — the checks live here, where every table is fully assembled.
+ * These **throw** (the schema won't load), so the tenant-isolation boundary is a
+ * runtime guarantee, not merely the advisor lint's build-time warning.
+ */
+const validateExternalSources = (tables: Record<string, TableDefinition>): void => {
+    for (const [name, table] of Object.entries(tables)) {
+        const source = table.externalSource;
+
+        if (!source) {
+            continue;
+        }
+
+        if (table.shardMode.kind === "global") {
+            throw new LunoraError(
+                "INTERNAL",
+                `defineSchema: table "${name}" cannot be both .source() and .global() — a sourced table materializes into a shard DO's SQLite, a global table lives in the external tier`,
+            );
+        }
+
+        if (table.shardMode.kind === "shardBy" && !source.tenantBy) {
+            throw new LunoraError(
+                "INTERNAL",
+                `defineSchema: sourced + .shardBy() table "${name}" needs a \`tenantBy\` mapper — without it every tenant's DO would run the same unscoped query and replicate the whole multitenant table (a cross-tenant leak). Add \`tenantBy: (shardKey) => [shardKey]\` binding the shard key into the query's parameters.`,
+            );
+        }
+
+        validateExternalSourceMode(name, source);
     }
 };
 
@@ -603,6 +751,7 @@ const defineSchema = <T extends Record<string, TableDefinition>>(
 ): ExtendableSchema<T> => {
     fillIndexTableNames(tables);
     attachStandaloneIndexes(tables, aggregateIndexes, rankIndexes);
+    validateExternalSources(tables);
 
     return withExtend({ tables, vectorIndexes });
 };

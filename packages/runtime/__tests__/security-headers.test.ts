@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { decorateResponse, enforceOrigin, handleCorsPreflight, resolveSecurity } from "../src/security-headers";
 
@@ -20,6 +20,25 @@ describe("resolveSecurity", () => {
         expect.hasAssertions();
 
         expect(() => resolveSecurity({ cors: { allowedOrigins: ["*"], allowCredentials: true } })).toThrow(/wildcard/i);
+    });
+
+    it("warns for a custom allowedOrigins predicate, with or without credentials", () => {
+        expect.assertions(3);
+
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+        // The predicate feeds the CSRF/WS origin trust even without credentials.
+        resolveSecurity({ cors: { allowedOrigins: () => true } });
+
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining("predicate"));
+
+        warn.mockClear();
+        resolveSecurity({ cors: { allowCredentials: true, allowedOrigins: () => true } });
+
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining("allowCredentials"));
+        expect(warn).toHaveBeenCalledTimes(1);
+
+        warn.mockRestore();
     });
 
     it("allows a wildcard origin without credentials", () => {
@@ -136,14 +155,44 @@ describe("decorateResponse", () => {
         expect(out.headers.get("content-security-policy")).toBe("default-src 'self'");
     });
 
-    it("skips the default CSP for HTML responses but keeps the other headers", () => {
+    it("applies the conservative default CSP for HTML responses (no default-src) and keeps the other headers", () => {
         expect.hasAssertions();
 
         const html = new Response("<html></html>", { headers: { "content-type": "text/html; charset=utf-8" } });
         const out = decorateResponse(html, httpsRequest(), resolved);
 
-        expect(out.headers.get("content-security-policy")).toBeNull();
+        const csp = out.headers.get("content-security-policy");
+
+        // Conservative HTML hardening; frame-ancestors mirrors the default SAMEORIGIN frameOptions.
+        expect(csp).toContain("base-uri 'none'");
+        expect(csp).toContain("object-src 'none'");
+        expect(csp).toContain("frame-ancestors 'self'");
+        expect(csp).not.toContain("default-src");
         expect(out.headers.get("x-content-type-options")).toBe("nosniff");
+    });
+
+    it("derives the HTML CSP frame-ancestors from frameOptions (DENY → 'none', disabled → omitted)", () => {
+        expect.hasAssertions();
+
+        const deny = resolveSecurity({ headers: { frameOptions: "DENY" } });
+        const denyCsp = decorateResponse(new Response("<html></html>", { headers: { "content-type": "text/html" } }), httpsRequest(), deny).headers.get(
+            "content-security-policy",
+        );
+
+        // Must NOT weaken X-Frame-Options: DENY with a looser 'self'.
+        expect(denyCsp).toContain("frame-ancestors 'none'");
+        expect(denyCsp).not.toContain("frame-ancestors 'self'");
+
+        const noFraming = resolveSecurity({ headers: { frameOptions: false } });
+        const noFramingCsp = decorateResponse(
+            new Response("<html></html>", { headers: { "content-type": "text/html" } }),
+            httpsRequest(),
+            noFraming,
+        ).headers.get("content-security-policy");
+
+        // Framing disabled → no frame-ancestors directive (framing left unrestricted), base hardening stays.
+        expect(noFramingCsp).not.toContain("frame-ancestors");
+        expect(noFramingCsp).toContain("base-uri 'none'");
     });
 
     it("applies an explicit CSP string to HTML too", () => {
@@ -216,6 +265,29 @@ describe("handleCorsPreflight", () => {
         );
 
         expect(response).toBeUndefined();
+    });
+
+    it("enforces the configured allowedHeaders instead of echoing the requested list", () => {
+        expect.hasAssertions();
+
+        const restricted = resolveSecurity({ cors: { allowedOrigins: ["https://app.example.com"], allowedHeaders: ["Content-Type"] } });
+
+        const response = handleCorsPreflight(
+            httpsRequest({
+                method: "OPTIONS",
+                headers: {
+                    origin: "https://app.example.com",
+                    "access-control-request-method": "POST",
+                    "access-control-request-headers": "content-type, x-evil",
+                },
+            }),
+            restricted,
+        );
+
+        const allowHeaders = response?.headers.get("access-control-allow-headers") ?? "";
+
+        expect(allowHeaders.toLowerCase()).toContain("content-type");
+        expect(allowHeaders.toLowerCase()).not.toContain("x-evil");
     });
 
     it("ignores non-preflight OPTIONS and disabled CORS", () => {

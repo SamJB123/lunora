@@ -19,6 +19,15 @@
 /** Escape a string as a single-quoted SQL literal (doubling embedded single quotes). */
 const quoteString = (value: string): string => `'${value.replaceAll("'", "''")}'`;
 
+/** A dotted identifier: one or more `\w` segments joined by `.` (e.g. `namespace.table`, `db.schema.table`). */
+const IDENTIFIER_RE = /^\w+(?:\.\w+)*$/;
+
+/** A table reference: a dotted identifier with an optional `[AS] alias` (e.g. `s.zones z`, `users AS u`). */
+const TABLE_REF_RE = /^\w+(?:\.\w+)*(?:\s+(?:as\s+)?\w+)?$/i;
+
+/** R2 SQL's documented `LIMIT` ceiling. */
+const MAX_LIMIT = 10_000;
+
 /**
  * A composed SQL fragment. Carries the finished `text`; `toString()` returns it
  * so a fragment can be dropped straight into a template or `String(...)`.
@@ -47,6 +56,36 @@ export const raw = (text: string): Sql => new Sql(text);
 
 /** Resolve a `string | Sql` to its raw text. A bare string is taken as trusted SQL (callers pass identifiers/fragments here). */
 export const toText = (value: Sql | string): string => (isSql(value) ? value.text : value);
+
+/**
+ * Validate a table/namespace/database identifier that will be spliced into R2 SQL
+ * text (which has no parameter binding and no identifier quoting we can rely on).
+ * Accepts only dotted `\w` segments and throws otherwise, so a client-supplied
+ * `describe`/`showTables` argument can't inject SQL. For a genuinely dynamic
+ * identifier you built yourself, wrap it with {@link raw}.
+ */
+export const ident = (name: string): string => {
+    if (typeof name !== "string" || !IDENTIFIER_RE.test(name)) {
+        throw new TypeError(`r2sql: invalid identifier ${JSON.stringify(name)} — expected dotted [A-Za-z0-9_] segments (e.g. "namespace.table").`);
+    }
+
+    return name;
+};
+
+/**
+ * Validate a table REFERENCE for a `FROM`/`JOIN` position: a dotted identifier
+ * plus an optional `[AS] alias`. Broader than {@link ident} (which forbids the
+ * alias) but still an allowlist — no whitespace beyond the single alias, no
+ * punctuation — so a caller-supplied table string can't inject SQL. Use
+ * {@link raw} for anything more dynamic that you built yourself.
+ */
+export const tableRef = (ref: string): string => {
+    if (typeof ref !== "string" || !TABLE_REF_RE.test(ref)) {
+        throw new TypeError(`r2sql: invalid table reference ${JSON.stringify(ref)} — expected "namespace.table" with an optional "[AS] alias".`);
+    }
+
+    return ref;
+};
 
 /**
  * Render a JS value as an R2 SQL literal:
@@ -121,3 +160,15 @@ export const sql = (strings: TemplateStringsArray, ...values: unknown[]): Sql =>
 
 /** Join SQL fragments/strings with `separator` into one {@link Sql} (e.g. `AND`-ed conditions). */
 export const joinSql = (parts: ReadonlyArray<Sql | string>, separator: string): Sql => new Sql(parts.map((part) => toText(part)).join(separator));
+
+/**
+ * Validate a `LIMIT` value against R2 SQL's 1–10,000 integer range, eagerly and
+ * with a clear error, rather than rendering `LIMIT 3.5` / `LIMIT 0` / `LIMIT
+ * 50000` that R2 SQL rejects as an opaque remote error. Matches the package's
+ * eager-validation posture (kv `list` / vectors `query` throw on bad limits).
+ */
+export const assertLimit = (n: number): void => {
+    if (!Number.isInteger(n) || n < 1 || n > MAX_LIMIT) {
+        throw new RangeError(`r2sql: limit must be an integer between 1 and ${String(MAX_LIMIT)} (got ${String(n)}).`);
+    }
+};

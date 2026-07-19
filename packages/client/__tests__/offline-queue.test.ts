@@ -53,11 +53,30 @@ describe("offlineQueue", () => {
         expect(drained.map((d) => d.functionPath)).toEqual(["mid", "new"]);
     });
 
+    it("invokes onEvict with the dropped entry and code on overflow", () => {
+        expect.assertions(4);
+
+        const onEvict = vi.fn<(entry: { functionPath: string; liveAwaiter?: boolean }, error: Error & { code?: string }) => void>();
+        const queue = new OfflineQueue({ maxItems: 1 }, { onEvict });
+
+        // A hydrated-style entry (no live awaiter) is evicted by a newer write.
+        queue.enqueue({ args: {}, functionPath: "old", liveAwaiter: false, reject: () => undefined, resolve: () => undefined });
+        queue.enqueue({ args: {}, functionPath: "new", liveAwaiter: true, reject: () => undefined, resolve: () => undefined });
+
+        expect(onEvict).toHaveBeenCalledTimes(1);
+
+        const [entry, error] = onEvict.mock.calls[0]!;
+
+        expect(entry.functionPath).toBe("old");
+        expect(entry.liveAwaiter).toBe(false);
+        expect(error.code).toBe("OFFLINE_QUEUE_OVERFLOW");
+    });
+
     it("requeue restores drained items to the front in FIFO order without re-persisting", async () => {
         expect.assertions(3);
 
         const persistence = createInMemoryPersistence();
-        const queue = new OfflineQueue({}, persistence);
+        const queue = new OfflineQueue({}, { persistence });
 
         queue.enqueue({ args: {}, functionPath: "a", reject: () => undefined, resolve: () => undefined });
         queue.enqueue({ args: {}, functionPath: "b", reject: () => undefined, resolve: () => undefined });
@@ -101,7 +120,7 @@ describe("offlineQueue — persistence", () => {
         expect.assertions(4);
 
         const persistence = createInMemoryPersistence();
-        const queue = new OfflineQueue({}, persistence);
+        const queue = new OfflineQueue({}, { persistence });
 
         queue.enqueue({ args: { title: "hi" }, functionPath: "posts:create", reject: () => undefined, resolve: () => undefined, shardKey: "room-1" });
 
@@ -122,7 +141,7 @@ describe("offlineQueue — persistence", () => {
 
         const persistence = createInMemoryPersistence();
         const append = vi.spyOn(persistence, "append");
-        const queue = new OfflineQueue({}, persistence);
+        const queue = new OfflineQueue({}, { persistence });
 
         queue.enqueue({ args: {}, functionPath: "posts:create", identity: "1:abc", reject: () => undefined, resolve: () => undefined });
 
@@ -137,7 +156,7 @@ describe("offlineQueue — persistence", () => {
 
         await persistence.append({ args: {}, functionPath: "a", identity: "1:abc", id: "1" });
 
-        const queue = new OfflineQueue({}, persistence);
+        const queue = new OfflineQueue({}, { persistence });
 
         await queue.hydrate();
 
@@ -153,7 +172,7 @@ describe("offlineQueue — persistence", () => {
 
         await persistence.append({ args: {}, functionPath: "a", id: "1" });
 
-        const queue = new OfflineQueue({}, persistence);
+        const queue = new OfflineQueue({}, { persistence });
 
         await queue.hydrate();
 
@@ -166,7 +185,7 @@ describe("offlineQueue — persistence", () => {
         expect.assertions(1);
 
         const persistence = createInMemoryPersistence();
-        const queue = new OfflineQueue({ maxItems: 1 }, persistence);
+        const queue = new OfflineQueue({ maxItems: 1 }, { persistence });
 
         queue.enqueue({ args: {}, functionPath: "old", reject: () => undefined, resolve: () => undefined });
         queue.enqueue({ args: {}, functionPath: "new", reject: () => undefined, resolve: () => undefined });
@@ -185,7 +204,7 @@ describe("offlineQueue — persistence", () => {
         await persistence.append({ args: {}, functionPath: "b", id: "2", shardKey: "room-2" });
         await persistence.append({ args: {}, functionPath: "c", id: "3", shardKey: "room-1" });
 
-        const queue = new OfflineQueue({}, persistence);
+        const queue = new OfflineQueue({}, { persistence });
         const shardKeys = await queue.hydrate();
 
         expect(queue.size).toBe(3);
@@ -196,6 +215,35 @@ describe("offlineQueue — persistence", () => {
         expect(drained.map((d) => d.functionPath)).toEqual(["a", "b", "c"]);
     });
 
+    it("hydrate splices restored prior-session writes ahead of a mutation enqueued during boot-time hydration (CLIENT-03)", async () => {
+        expect.assertions(1);
+
+        const persistence = createInMemoryPersistence();
+
+        await persistence.append({ args: {}, functionPath: "old-session-write", id: "1" });
+
+        const queue = new OfflineQueue({}, { persistence });
+
+        // `hydrate()` starts its async durable-store load here; the following
+        // `enqueue` runs synchronously in the same tick, before that load's
+        // `await` resolves — simulating a mutation issued while offline during
+        // boot, which the client enqueues before hydration (an async
+        // microtask-deferred persistence load) finishes restoring the prior
+        // session's older writes.
+        const hydratePromise = queue.hydrate();
+
+        queue.enqueue({ args: {}, functionPath: "boot-time-write", reject: () => undefined, resolve: () => undefined });
+
+        await hydratePromise;
+
+        // The restored older write must replay BEFORE the boot-time write, or
+        // last-writer-wins on the server would let this session's write
+        // silently get clobbered by the (out-of-order-replayed) older one.
+        const drained = queue.drain();
+
+        expect(drained.map((d) => d.functionPath)).toEqual(["old-session-write", "boot-time-write"]);
+    });
+
     it("hydrate re-appends nothing and skips ids already queued", async () => {
         expect.assertions(1);
 
@@ -203,7 +251,7 @@ describe("offlineQueue — persistence", () => {
 
         await persistence.append({ args: {}, functionPath: "a", id: "1" });
 
-        const queue = new OfflineQueue({}, persistence);
+        const queue = new OfflineQueue({}, { persistence });
 
         await queue.hydrate();
         // A second hydrate (or one after the live enqueue assigned the same id)
@@ -220,7 +268,7 @@ describe("offlineQueue — persistence", () => {
 
         await persistence.append({ args: {}, functionPath: "a", id: "1" });
 
-        const queue = new OfflineQueue({}, persistence);
+        const queue = new OfflineQueue({}, { persistence });
 
         await queue.hydrate();
 
@@ -236,7 +284,7 @@ describe("offlineQueue — persistence", () => {
         expect.assertions(2);
 
         const persistence = createInMemoryPersistence();
-        const queue = new OfflineQueue({}, persistence);
+        const queue = new OfflineQueue({}, { persistence });
 
         queue.enqueue({ args: {}, functionPath: "a", reject: () => undefined, resolve: () => undefined });
         queue.clear();
@@ -256,7 +304,7 @@ describe("offlineQueue — persistence error reporting", () => {
             append: () => Promise.reject(appendError),
         };
         const handler = vi.fn<(context: PersistenceErrorContext) => void>();
-        const queue = new OfflineQueue({ onPersistenceError: handler }, faultyPersistence);
+        const queue = new OfflineQueue({ onPersistenceError: handler }, { persistence: faultyPersistence });
 
         queue.enqueue({ args: {}, functionPath: "posts:create", reject: () => undefined, resolve: () => undefined });
 
@@ -276,7 +324,7 @@ describe("offlineQueue — persistence error reporting", () => {
             append: () => Promise.reject(new Error("quota")),
         };
         const handler = vi.fn<(context: PersistenceErrorContext) => void>();
-        const queue = new OfflineQueue({ onPersistenceError: handler }, faultyPersistence);
+        const queue = new OfflineQueue({ onPersistenceError: handler }, { persistence: faultyPersistence });
 
         queue.enqueue({ args: {}, functionPath: "posts:create", reject: () => undefined, resolve: () => undefined });
 
@@ -297,7 +345,7 @@ describe("offlineQueue — persistence error reporting", () => {
         const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
         try {
-            const queue = new OfflineQueue({}, faultyPersistence);
+            const queue = new OfflineQueue({}, { persistence: faultyPersistence });
 
             queue.enqueue({ args: {}, functionPath: "posts:create", reject: () => undefined, resolve: () => undefined });
 
@@ -315,7 +363,7 @@ describe("offlineQueue — persistence error reporting", () => {
 
         const persistence = createInMemoryPersistence();
         const handler = vi.fn<(context: PersistenceErrorContext) => void>();
-        const queue = new OfflineQueue({ onPersistenceError: handler }, persistence);
+        const queue = new OfflineQueue({ onPersistenceError: handler }, { persistence });
 
         queue.enqueue({ args: {}, functionPath: "posts:create", reject: () => undefined, resolve: () => undefined });
 
@@ -333,7 +381,7 @@ describe("offlineQueue — persistence error reporting", () => {
             remove: () => Promise.reject(removeError),
         };
         const handler = vi.fn<(context: PersistenceErrorContext) => void>();
-        const queue = new OfflineQueue({ maxItems: 1, onPersistenceError: handler }, faultyPersistence);
+        const queue = new OfflineQueue({ maxItems: 1, onPersistenceError: handler }, { persistence: faultyPersistence });
 
         queue.enqueue({ args: {}, functionPath: "old", reject: () => undefined, resolve: () => undefined });
         queue.enqueue({ args: {}, functionPath: "new", reject: () => undefined, resolve: () => undefined });
@@ -346,5 +394,23 @@ describe("offlineQueue — persistence error reporting", () => {
 
         expect(removeCalls).toHaveLength(1);
         expect(removeCalls[0]?.[0]?.error).toBe(removeError);
+    });
+
+    it("hydrate load failure invokes handler with operation 'load' and rejects", async () => {
+        expect.assertions(4);
+
+        const loadError = new Error("indexeddb unavailable");
+        const faultyPersistence = {
+            ...createInMemoryPersistence(),
+            load: () => Promise.reject(loadError),
+        };
+        const handler = vi.fn<(context: PersistenceErrorContext) => void>();
+        const queue = new OfflineQueue({ onPersistenceError: handler }, { persistence: faultyPersistence });
+
+        await expect(queue.hydrate()).rejects.toBe(loadError);
+
+        expect(handler).toHaveBeenCalledTimes(1);
+        expect(handler.mock.calls[0]?.[0]?.operation).toBe("load");
+        expect(handler.mock.calls[0]?.[0]?.error).toBe(loadError);
     });
 });

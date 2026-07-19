@@ -120,9 +120,15 @@ type ScheduledDispatch = (kind: "action" | "mutation", reference: unknown, conte
 const createFakeScheduler = (
     getDispatch: () => ScheduledDispatch,
     getMutationContext: () => unknown,
+    getActionContext: () => unknown,
     getFunctionRegistry: () => Map<string, { handler: unknown; kind: string }>,
+    now: number,
 ): { controls: FakeSchedulerControls; scheduler: Scheduler } => {
-    let nowMs = Date.now();
+    // Seed the virtual clock from the harness's `now` (which honours
+    // `options.now`) so `ctx.scheduler.runAt(ctx.now + delay, …)` schedules
+    // relative to the same instant `ctx.now` reports. Seeding from `Date.now()`
+    // here would desync the two and fire (or strand) delayed jobs.
+    let nowMs = now;
     let nextId = 1;
 
     /** All pending (not yet executed or cancelled) jobs, in enqueue order. */
@@ -147,6 +153,12 @@ const createFakeScheduler = (
         return id;
     };
 
+    // A schedule target is a function-path string or a generated workflow/agent
+    // ref (`workflows.<name>` / `agents.<name>`); reduce it to the string key the
+    // fake registry dispatches on. A string passes through unchanged, so existing
+    // function-scheduling tests are untouched.
+    const targetPath = (target: Parameters<Scheduler["runAfter"]>[1]): string => (typeof target === "string" ? target : (target.name ?? target.binding ?? ""));
+
     const scheduler: Scheduler = {
         cancel: (id: string) => {
             const existed = pending.has(id);
@@ -161,14 +173,14 @@ const createFakeScheduler = (
 
         list: () => Promise.resolve([...pending.values()]),
 
-        runAfter: (delayMs: number, functionPath: string, args?: Record<string, unknown>) => {
-            const id = enqueue(nowMs + delayMs, functionPath, args);
+        runAfter: (delayMs: number, target: Parameters<Scheduler["runAfter"]>[1], args?: Record<string, unknown>) => {
+            const id = enqueue(nowMs + delayMs, targetPath(target), args);
 
             return Promise.resolve(id);
         },
 
-        runAt: (timestampMs: number, functionPath: string, args?: Record<string, unknown>) => {
-            const id = enqueue(timestampMs, functionPath, args);
+        runAt: (timestampMs: number, target: Parameters<Scheduler["runAt"]>[1], args?: Record<string, unknown>) => {
+            const id = enqueue(timestampMs, targetPath(target), args);
 
             return Promise.resolve(id);
         },
@@ -195,9 +207,9 @@ const createFakeScheduler = (
 
         if (entry.kind === "mutation" || entry.kind === "action") {
             const dispatch = getDispatch();
-            const mutationContext = getMutationContext();
+            const context = entry.kind === "action" ? getActionContext() : getMutationContext();
 
-            await dispatch(entry.kind, entry, mutationContext, job.args);
+            await dispatch(entry.kind, entry, context, job.args);
         } else {
             // eslint-disable-next-line no-console -- deliberate test-time warning
             console.warn(
@@ -225,9 +237,20 @@ const createFakeScheduler = (
         const due = [...pending.values()].filter((j) => j.scheduledFor <= cutoff).toSorted((a, b) => a.scheduledFor - b.scheduledFor);
 
         const failed: ScheduledJobFailure[] = [];
+        let executed = 0;
 
         // Sequential dispatch: jobs must run in order as each may mutate shared state.
         for (const job of due) {
+            // A job earlier in this same sweep may have cancelled this one
+            // (`ctx.scheduler.cancel(id)`). Honour that: `cancel` reported
+            // `{ cancelled: true }`, so the handler must not still run — and a
+            // skipped job is not counted as executed.
+            if (!pending.has(job.id)) {
+                continue;
+            }
+
+            executed += 1;
+
             try {
                 // eslint-disable-next-line no-await-in-loop -- intentional sequential dispatch; jobs must run in order and may mutate shared state
                 await dispatchJob(job);
@@ -241,7 +264,7 @@ const createFakeScheduler = (
             }
         }
 
-        return { executed: due.length, failed };
+        return { executed, failed };
     };
 
     /**

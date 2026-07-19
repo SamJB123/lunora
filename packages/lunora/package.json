@@ -1,6 +1,6 @@
 {
     "name": "lunorash",
-    "version": "1.0.0-alpha.32",
+    "version": "1.0.0-alpha.90",
     "description": "The Lunora umbrella package: one install for the server authoring API, worker runtime, Durable Objects, and the lunora CLI",
     "keywords": [
         "backend",
@@ -66,6 +66,10 @@
             "types": "./dist/values.d.ts",
             "import": "./dist/values.mjs"
         },
+        "./errors": {
+            "types": "./dist/errors.d.ts",
+            "import": "./dist/errors.mjs"
+        },
         "./runtime": {
             "types": "./dist/runtime.d.ts",
             "import": "./dist/runtime.mjs"
@@ -94,6 +98,30 @@
             "types": "./dist/client/ssr.d.ts",
             "import": "./dist/client/ssr.mjs"
         },
+        "./flags": {
+            "types": "./dist/flags.d.ts",
+            "import": "./dist/flags.mjs"
+        },
+        "./flags/env": {
+            "types": "./dist/flags/env.d.ts",
+            "import": "./dist/flags/env.mjs"
+        },
+        "./flags/flagship": {
+            "types": "./dist/flags/flagship.d.ts",
+            "import": "./dist/flags/flagship.mjs"
+        },
+        "./flags/memory": {
+            "types": "./dist/flags/memory.d.ts",
+            "import": "./dist/flags/memory.mjs"
+        },
+        "./flags/web": {
+            "types": "./dist/flags/web.d.ts",
+            "import": "./dist/flags/web.mjs"
+        },
+        "./ratelimit": {
+            "types": "./dist/ratelimit.d.ts",
+            "import": "./dist/ratelimit.mjs"
+        },
         "./package.json": "./package.json"
     },
     "publishConfig": {
@@ -104,8 +132,8 @@
         "build:prod": "pnpm exec packem build --production",
         "lint:eslint": "eslint .",
         "lint:eslint:fix": "eslint . --fix",
-        "lint:prettier": "prettier --check .",
-        "lint:prettier:fix": "prettier --write .",
+        "lint:prettier": "prettier --check . --ignore-path ../../.prettierignore",
+        "lint:prettier:fix": "prettier --write . --ignore-path ../../.prettierignore",
         "lint:types": "tsc --noEmit",
         "test": "vitest run",
         "test:coverage": "vitest run --coverage",
@@ -114,12 +142,15 @@
         "fallow:health": "fallow health --score"
     },
     "dependencies": {
-        "@lunora/cli": "1.0.0-alpha.32",
-        "@lunora/client": "1.0.0-alpha.3",
-        "@lunora/do": "1.0.0-alpha.7",
-        "@lunora/runtime": "1.0.0-alpha.5",
-        "@lunora/server": "1.0.0-alpha.5",
-        "@lunora/values": "1.0.0-alpha.3"
+        "@lunora/cli": "1.0.0-alpha.89",
+        "@lunora/client": "1.0.0-alpha.24",
+        "@lunora/do": "1.0.0-alpha.33",
+        "@lunora/errors": "1.0.0-alpha.5",
+        "@lunora/flags": "1.0.0-alpha.13",
+        "@lunora/ratelimit": "1.0.0-alpha.8",
+        "@lunora/runtime": "1.0.0-alpha.28",
+        "@lunora/server": "1.0.0-alpha.27",
+        "@lunora/values": "1.0.0-alpha.8"
     },
     "devDependencies": {
         "@codspeed/vitest-plugin": "catalog:test",

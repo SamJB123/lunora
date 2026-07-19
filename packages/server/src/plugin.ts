@@ -58,6 +58,8 @@
  *     builder — each consumer decides which plugin middlewares to attach.
  */
 
+import { LunoraError } from "@lunora/errors";
+
 import runMiddlewareChain from "./builder/run-middleware";
 import type { Middleware, MiddlewareNext } from "./builder/types";
 import type {
@@ -189,7 +191,7 @@ export const defineSchemaExtension = <T extends Record<string, TableDefinition>>
     options: { tables: T; vectorIndexes?: Record<string, VectorIndexDefinition> },
 ): SchemaExtension<T> => {
     if (!key) {
-        throw new Error("defineSchemaExtension: `key` is required and must be a non-empty string");
+        throw new LunoraError("INTERNAL", "defineSchemaExtension: `key` is required and must be a non-empty string");
     }
 
     return {
@@ -235,19 +237,38 @@ export interface DefinePluginOptions<TExtension extends Record<string, TableDefi
 }
 
 /**
+ * Call signatures for {@link definePlugin}. When `extension` is supplied the
+ * returned plugin's `extension` is typed as PRESENT (not `?`), so the
+ * canonical install pattern `defineSchema(...).extend(plugin.extension)`
+ * typechecks without a non-null assertion — the shape every scaffold template
+ * ships. The bare-options signature keeps `extension` optional for plugins
+ * that carry only middleware.
+ */
+export interface DefinePluginFunction {
+    <TExtension extends Record<string, TableDefinition>, TContextIn = unknown, TContextOut = TContextIn>(
+        key: string,
+        options: DefinePluginOptions<TExtension, TContextIn, TContextOut> & { extension: SchemaExtension<TExtension> },
+    ): Plugin<TExtension, TContextIn, TContextOut> & { readonly extension: SchemaExtension<TExtension> };
+    <TExtension extends Record<string, TableDefinition>, TContextIn = unknown, TContextOut = TContextIn>(
+        key: string,
+        options: DefinePluginOptions<TExtension, TContextIn, TContextOut>,
+    ): Plugin<TExtension, TContextIn, TContextOut>;
+}
+
+/**
  * Package a schema extension + middleware as a reusable plugin. Either
  * field is optional — `definePlugin("foo", {})` is valid but degenerate.
  */
-export const definePlugin = <TExtension extends Record<string, TableDefinition>, TContextIn = unknown, TContextOut = TContextIn>(
+export const definePlugin = (<TExtension extends Record<string, TableDefinition>, TContextIn = unknown, TContextOut = TContextIn>(
     key: string,
     options: DefinePluginOptions<TExtension, TContextIn, TContextOut>,
 ): Plugin<TExtension, TContextIn, TContextOut> => {
     if (!key) {
-        throw new Error("definePlugin: `key` is required and must be a non-empty string");
+        throw new LunoraError("INTERNAL", "definePlugin: `key` is required and must be a non-empty string");
     }
 
     if (options.extension && options.extension.key !== key) {
-        throw new Error(`definePlugin("${key}"): extension key "${options.extension.key}" does not match plugin key`);
+        throw new LunoraError("INTERNAL", `definePlugin("${key}"): extension key "${options.extension.key}" does not match plugin key`);
     }
 
     return {
@@ -255,7 +276,7 @@ export const definePlugin = <TExtension extends Record<string, TableDefinition>,
         ...(options.extension ? { extension: options.extension } : {}),
         ...(options.middleware ? { middleware: options.middleware } : {}),
     };
-};
+}) as DefinePluginFunction;
 
 /**
  * Bundle of registered functions a {@link Component} ships. Keys are the
@@ -382,7 +403,8 @@ export const mergeSchemaExtension = <T extends Record<string, TableDefinition>, 
         const prefixed = prefixTableName(key, bareName);
 
         if (Object.hasOwn(merged, prefixed)) {
-            throw new Error(
+            throw new LunoraError(
+                "INTERNAL",
                 `defineSchema(...).extend("${key}"): table "${prefixed}" already exists in the base schema — another extension with the same key already contributed it`,
             );
         }
@@ -397,7 +419,8 @@ export const mergeSchemaExtension = <T extends Record<string, TableDefinition>, 
             const prefixed = prefixTableName(key, bareIndexName);
 
             if (Object.hasOwn(mergedVectorIndexes, prefixed)) {
-                throw new Error(
+                throw new LunoraError(
+                    "INTERNAL",
                     `defineSchema(...).extend("${key}"): vector index "${prefixed}" already exists in the base schema — another extension with the same key already contributed it`,
                 );
             }

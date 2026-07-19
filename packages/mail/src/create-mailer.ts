@@ -1,3 +1,5 @@
+import { LunoraError } from "@lunora/errors";
+
 import { assertSafeAddresses, assertSafeHeaderValue } from "./address";
 import { isCaptureTransport } from "./capture-transport";
 import { createCloudflareTransport } from "./cloudflare-transport";
@@ -23,12 +25,32 @@ const buildDefaultTransport = (options: LunoraMailOptions): MailTransport => {
         return createResendTransport(options.apiKey, options.from);
     }
 
-    throw new Error("@lunora/mail: a transport is required — pass `transport`, `cloudflareSend` (Cloudflare Email Workers, the default), or `apiKey` (Resend)");
+    throw new LunoraError(
+        "INTERNAL",
+        "@lunora/mail: a transport is required — pass `transport`, `cloudflareSend` (Cloudflare Email Workers, the default), or `apiKey` (Resend)",
+    );
 };
 
+/**
+ * Create a mailer bound to a transport.
+ *
+ * SECURITY — recipient policy and HTML content are the caller's responsibility.
+ * The mailer fully blocks header/CRLF/comma injection in addresses
+ * (`assertSafeAddresses` / `assertSafeHeaderValue`), but it does NOT decide WHO
+ * you may send to or WHAT HTML you render.
+ *
+ * Open relay: derive `to`/`cc`/`bcc` from server-trusted state, never from raw
+ * request input, and prefer a fixed/allowlisted `from` — sending to an arbitrary
+ * user-supplied address turns your deployment into a spam relay.
+ *
+ * Template XSS / content injection: treat template HTML like any other HTML sink
+ * — never interpolate untrusted data into raw markup (or a
+ * `dangerouslySetInnerHTML`-style template) without escaping. The mailer sends
+ * whatever HTML you hand it verbatim.
+ */
 const createMailer = (options: LunoraMailOptions): Mailer => {
     if (!options.from) {
-        throw new Error("@lunora/mail: `from` is required");
+        throw new LunoraError("INTERNAL", "@lunora/mail: `from` is required");
     }
 
     const transport = options.transport ?? buildDefaultTransport(options);
@@ -105,7 +127,7 @@ const createMailer = (options: LunoraMailOptions): Mailer => {
                 return { queued: true };
             }
 
-            throw new Error("@lunora/mail: `queue` binding is required for mailer.queue()");
+            throw new LunoraError("INTERNAL", "@lunora/mail: `queue` binding is required for mailer.queue()");
         }
 
         // React elements are NOT structured-cloneable, so the queue body

@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { mintWsAdminToken } from "../../../shared/ws-admin-token";
 import { ADMIN_FUNCTIONS } from "../src/introspect";
 import type { ShardDOState } from "../src/shard-do";
 import { ShardDO } from "../src/shard-do";
@@ -147,6 +148,40 @@ describe("shardDO admin subscriptions", () => {
         expect(dataEnvelopes(ws).at(-1)?.data).toMatchObject({ requests: 0, shard: "shard-a" });
     });
 
+    it("seeds getFanoutMetrics with per-topic subscriber counts folded from every socket", async () => {
+        expect.assertions(4);
+
+        const shard = new AdminSubShard(state, { LUNORA_ADMIN_TOKEN: ADMIN_TOKEN });
+        const admin = createFakeWebSocket();
+        const member1 = createFakeWebSocket();
+        const member2 = createFakeWebSocket();
+
+        // Two members share a shape and a whisper topic; the admin socket watches
+        // neither, so it contributes to the connection count but no topic.
+        shard.registerSocket(admin, { admin: true, subs: {} });
+        shard.registerSocket(member1, { shapes: { s1: { name: "roomMessages" } }, subs: {}, whispers: ["cursor:room"] });
+        shard.registerSocket(member2, { shapes: { s2: { name: "roomMessages" } }, subs: {}, whispers: ["cursor:room"] });
+
+        await shard.driveMessage(admin, adminSub("sub-1", ADMIN_FUNCTIONS.getFanoutMetrics));
+
+        const seeded = dataEnvelopes(admin).at(-1)?.data as {
+            peakSubscribers: number;
+            shapePoke: { passes: number };
+            topics: { kind: string; subscribers: number; topic: string }[];
+            totalConnections: number;
+        };
+
+        expect(seeded.totalConnections).toBe(3);
+        expect(seeded.peakSubscribers).toBe(2);
+        // Both topics have 2 subscribers; ties break by topic name (cursor:room < roomMessages).
+        expect(seeded.topics).toEqual([
+            { kind: "whisper", subscribers: 2, topic: "cursor:room" },
+            { kind: "shape", subscribers: 2, topic: "roomMessages" },
+        ]);
+        // No poke/broadcast has run in this test, so the running counters are zero.
+        expect(seeded.shapePoke.passes).toBe(0);
+    });
+
     it("re-runs a readTablePage subscription only when its own table is written", async () => {
         expect.assertions(3);
 
@@ -279,5 +314,111 @@ describe("shardDO admin-socket upgrade flagging", () => {
         });
 
         expect(attachment).toEqual({ admin: true, connectionId: expect.any(String), subs: {} });
+    });
+
+    it("stamps admin:true when the upgrade presents a minted ephemeral token via ?token", async () => {
+        expect.assertions(1);
+
+        const minted = await mintWsAdminToken(ADMIN_TOKEN);
+        const attachment = await upgradeAndCaptureAttachment(
+            { LUNORA_ADMIN_TOKEN: ADMIN_TOKEN },
+            `https://shard.internal/?token=${encodeURIComponent(minted.token)}`,
+        );
+
+        expect(attachment).toEqual({ admin: true, connectionId: expect.any(String), subs: {} });
+    });
+
+    it("accepts a minted ephemeral token as an alternate credential when LUNORA_WS_BEARER gates the socket", async () => {
+        expect.assertions(1);
+
+        const minted = await mintWsAdminToken(ADMIN_TOKEN);
+        const attachment = await upgradeAndCaptureAttachment(
+            { LUNORA_ADMIN_TOKEN: ADMIN_TOKEN, LUNORA_WS_BEARER: "user-bearer" },
+            `https://shard.internal/?token=${encodeURIComponent(minted.token)}`,
+        );
+
+        expect(attachment).toEqual({ admin: true, connectionId: expect.any(String), subs: {} });
+    });
+
+    it("stamps admin:false when the minted ephemeral token has expired", async () => {
+        expect.assertions(1);
+
+        const minted = await mintWsAdminToken(ADMIN_TOKEN, { now: Date.now() - 120_000, ttlMs: 60_000 });
+        const attachment = await upgradeAndCaptureAttachment(
+            { LUNORA_ADMIN_TOKEN: ADMIN_TOKEN },
+            `https://shard.internal/?token=${encodeURIComponent(minted.token)}`,
+        );
+
+        expect(attachment).toEqual({ admin: false, connectionId: expect.any(String), subs: {} });
+    });
+
+    it("stamps admin:false when the minted ephemeral token was tampered with", async () => {
+        expect.assertions(1);
+
+        const minted = await mintWsAdminToken(ADMIN_TOKEN);
+        const [version, exp, signature] = minted.token.split(".") as [string, string, string];
+        const flipped = signature.startsWith("A") ? `B${signature.slice(1)}` : `A${signature.slice(1)}`;
+        const attachment = await upgradeAndCaptureAttachment(
+            { LUNORA_ADMIN_TOKEN: ADMIN_TOKEN },
+            `https://shard.internal/?token=${encodeURIComponent(`${version}.${exp}.${flipped}`)}`,
+        );
+
+        expect(attachment).toEqual({ admin: false, connectionId: expect.any(String), subs: {} });
+    });
+
+    it("rejects the upgrade (403) when LUNORA_WS_BEARER is set and the ephemeral token is expired", async () => {
+        expect.assertions(1);
+
+        const minted = await mintWsAdminToken(ADMIN_TOKEN, { now: Date.now() - 120_000, ttlMs: 60_000 });
+
+        // No attachment is ever stamped: the gate rejects before the pair is built.
+        const attachment = await upgradeAndCaptureAttachment(
+            { LUNORA_ADMIN_TOKEN: ADMIN_TOKEN, LUNORA_WS_BEARER: "user-bearer" },
+            `https://shard.internal/?token=${encodeURIComponent(minted.token)}`,
+        );
+
+        expect(attachment).toBeUndefined();
+    });
+
+    describe("enforcement via LUNORA_REQUIRE_EPHEMERAL_WS_TOKEN", () => {
+        const ENFORCED = { LUNORA_ADMIN_TOKEN: ADMIN_TOKEN, LUNORA_REQUIRE_EPHEMERAL_WS_TOKEN: "1" };
+
+        it("stamps admin:false for the raw master token in ?token=", async () => {
+            expect.assertions(1);
+
+            const attachment = await upgradeAndCaptureAttachment(ENFORCED, `https://shard.internal/?token=${ADMIN_TOKEN}`);
+
+            expect(attachment).toEqual({ admin: false, connectionId: expect.any(String), subs: {} });
+        });
+
+        it("still stamps admin:true for a minted ephemeral token in ?token=", async () => {
+            expect.assertions(1);
+
+            const minted = await mintWsAdminToken(ADMIN_TOKEN);
+            const attachment = await upgradeAndCaptureAttachment(ENFORCED, `https://shard.internal/?token=${encodeURIComponent(minted.token)}`);
+
+            expect(attachment).toEqual({ admin: true, connectionId: expect.any(String), subs: {} });
+        });
+
+        it("still stamps admin:true for the master token in the Authorization HEADER (no URL leak)", async () => {
+            expect.assertions(1);
+
+            const attachment = await upgradeAndCaptureAttachment(ENFORCED, "https://shard.internal/", {
+                Authorization: `Bearer ${ADMIN_TOKEN}`,
+            });
+
+            expect(attachment).toEqual({ admin: true, connectionId: expect.any(String), subs: {} });
+        });
+
+        it("leaves the master token in ?token= working when the env value reads as off", async () => {
+            expect.assertions(1);
+
+            const attachment = await upgradeAndCaptureAttachment(
+                { LUNORA_ADMIN_TOKEN: ADMIN_TOKEN, LUNORA_REQUIRE_EPHEMERAL_WS_TOKEN: "off" },
+                `https://shard.internal/?token=${ADMIN_TOKEN}`,
+            );
+
+            expect(attachment).toEqual({ admin: true, connectionId: expect.any(String), subs: {} });
+        });
     });
 });

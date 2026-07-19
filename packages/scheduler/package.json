@@ -1,6 +1,6 @@
 {
     "name": "@lunora/scheduler",
-    "version": "1.0.0-alpha.3",
+    "version": "1.0.0-alpha.10",
     "description": "Scheduling for Lunora: runAfter / runAt and Cron Triggers via SchedulerDO",
     "keywords": [
         "cloudflare",
@@ -50,8 +50,8 @@
         "build:prod": "pnpm exec packem build --production",
         "lint:eslint": "eslint .",
         "lint:eslint:fix": "eslint . --fix",
-        "lint:prettier": "prettier --check .",
-        "lint:prettier:fix": "prettier --write .",
+        "lint:prettier": "prettier --check . --ignore-path ../../.prettierignore",
+        "lint:prettier:fix": "prettier --write . --ignore-path ../../.prettierignore",
         "lint:types": "tsc --noEmit",
         "test": "vitest run",
         "test:coverage": "vitest run --coverage",
@@ -61,7 +61,8 @@
         "fallow:health": "fallow health --score"
     },
     "dependencies": {
-        "cron-parser": "5.5.0"
+        "@lunora/errors": "1.0.0-alpha.5",
+        "cron-parser": "5.6.1"
     },
     "devDependencies": {
         "@cloudflare/vitest-pool-workers": "catalog:cloudflare",

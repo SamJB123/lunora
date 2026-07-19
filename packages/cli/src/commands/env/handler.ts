@@ -16,6 +16,7 @@ import {
 
 import type { CommandHandler } from "../../util/command";
 import { defineHandler } from "../../util/command";
+import { detectPackageManager, execArgsFor } from "../../util/detect-package-manager";
 import type { Logger } from "../../util/logger";
 import type { SpawnDescriptor, Spawner } from "../../util/spawn";
 import { defaultSpawner } from "../../util/spawn";
@@ -82,19 +83,85 @@ const parseDevVariables = (content: string): Map<string, ParsedLine> => {
     return map;
 };
 
-const serializeDevVariables = (map: Map<string, ParsedLine>): string => {
-    const lines: string[] = [];
+/**
+ * Match the `.dev.vars` line that *defines* `key` (matching the shared grammar's
+ * `splitDevVariableLine`: optional leading whitespace, the key, optional
+ * whitespace, then `=`). Comment (`#…`) and blank lines never match. Keys are
+ * always validated against `DEV_VARS_KEY_PATTERN` before we build this, so they
+ * hold only `[A-Za-z_]\w*` — no regex metacharacters to escape in practice —
+ * but `key` is escaped anyway as defense-in-depth against a future caller that
+ * skips validation.
+ *
+ * The trailing `(\r?\n|$)` capture consumes the line's own line terminator (or
+ * matches the zero-width end-of-string when the line is the file's last, with
+ * no trailing newline) — `upsertDevVariableLine` needs this to drop a whole
+ * duplicate line, not just its content, leaving no blank line behind.
+ *
+ * `global` selects the all-matches form (`g`) `upsertDevVariableLine` needs to
+ * collapse every duplicate `KEY=` line down to one, vs. a plain single-match
+ * form for the `.test()` existence check. Callers must not reuse ONE instance
+ * for both a `.test()` and a `.replace()` — a global regex's `.test()` mutates
+ * `lastIndex`, which would make a subsequent `.replace()` on the same instance
+ * silently start scanning mid-file.
+ */
+const escapeRegExp = (value: string): string => value.replaceAll(/[.*+?^${}()|[\]\\]/gu, String.raw`\$&`);
 
-    for (const entry of map.values()) {
-        // Always quote to preserve whitespace round-trip. Newlines, double-quotes
-        // and backslashes are rejected at write time (env set) because the shared
-        // grammar's read path does not unescape them, so we can quote verbatim
-        // here — any escaping we added would not survive the round-trip.
-        lines.push(`${entry.key}="${entry.value}"`);
+const devVariableLinePattern = (key: string, global: boolean): RegExp =>
+    new RegExp(String.raw`^[ \t]*${escapeRegExp(key)}[ \t]*=.*(\r?\n|$)`, global ? "gmu" : "mu");
+
+/**
+ * Surgically upsert a single `KEY="value"` line in raw `.dev.vars` content,
+ * leaving every comment, blank line, and untouched entry verbatim. Rebuilding
+ * the whole file from the parsed entry map (the previous approach) silently
+ * dropped all `# …` comments and blank lines — including the documentation the
+ * registry installer and scaffolder write — and re-quoted lines the user never
+ * touched. If the key already has a line it is replaced in place; otherwise the
+ * new line is appended with a single trailing newline. Always quotes the value
+ * to preserve a whitespace round-trip; `env set` rejects newline/`"`/`\` up
+ * front so the verbatim quote is safe.
+ *
+ * Duplicate `KEY=` lines are collapsed down to exactly one. The shared read
+ * path (`parseDevVariableEntries`, which `env get`/`env list`/`env diff` all
+ * build on) is last-wins — it keeps overwriting a Map entry as it walks the
+ * file, so with duplicate lines the LAST one wins at read time. Replacing only
+ * the first match (as a plain, non-global `.replace()` does) left that later,
+ * untouched duplicate still winning at read time — a `set` that silently
+ * didn't take effect. The first matching line is replaced in place (preserving
+ * its position in the file); every later duplicate is dropped entirely
+ * (including its own trailing newline).
+ */
+const upsertDevVariableLine = (content: string, key: string, value: string): string => {
+    const rendered = `${key}="${value}"`;
+
+    if (!devVariableLinePattern(key, false).test(content)) {
+        if (content === "") {
+            return `${rendered}\n`;
+        }
+
+        return content.endsWith("\n") ? `${content}${rendered}\n` : `${content}\n${rendered}\n`;
     }
 
-    return `${lines.join("\n")}\n`;
+    let replacedFirst = false;
+
+    // Replace via a function so `$`-bearing values aren't treated as
+    // replacement-string special patterns.
+    return content.replace(devVariableLinePattern(key, true), (_match: string, newline: string) => {
+        if (replacedFirst) {
+            return "";
+        }
+
+        replacedFirst = true;
+
+        return `${rendered}${newline}`;
+    });
 };
+
+/**
+ * Surgically remove every `.dev.vars` line defining `key` (and its trailing
+ * newline), preserving all other lines, comments, and blanks verbatim.
+ */
+const removeDevVariableLine = (content: string, key: string): string =>
+    content.replaceAll(new RegExp(String.raw`^[ \t]*${key}[ \t]*=.*(?:\r?\n|$)`, "gmu"), "");
 
 const redact = (value: string): string => {
     if (value.length <= 4) {
@@ -198,10 +265,9 @@ const runEnvSet = (context: EnvContext): EnvCommandResult => {
         return { code: 1, descriptors: [] };
     }
 
-    const map = loadDevVariables(devVariablesPath);
+    const raw = existsSync(devVariablesPath) ? readFileSync(devVariablesPath, "utf8") : "";
 
-    map.set(options.key, { key: options.key, value: options.value });
-    writeFileSync(devVariablesPath, serializeDevVariables(map), "utf8");
+    writeFileSync(devVariablesPath, upsertDevVariableLine(raw, options.key, options.value), "utf8");
     logger.success(`env: set ${options.key} (${redact(options.value)}) in ${DEV_VARS_FILE}`);
 
     return { code: 0, descriptors: [] };
@@ -216,15 +282,15 @@ const runEnvUnset = (context: EnvContext): EnvCommandResult => {
         return { code: 1, descriptors: [] };
     }
 
-    const map = loadDevVariables(devVariablesPath);
+    const raw = existsSync(devVariablesPath) ? readFileSync(devVariablesPath, "utf8") : "";
 
-    if (!map.delete(options.key)) {
+    if (!parseDevVariables(raw).has(options.key)) {
         logger.warn(`env: ${options.key} was not set in ${DEV_VARS_FILE}`);
 
         return { code: 0, descriptors: [] };
     }
 
-    writeFileSync(devVariablesPath, serializeDevVariables(map), "utf8");
+    writeFileSync(devVariablesPath, removeDevVariableLine(raw, options.key), "utf8");
     logger.success(`env: unset ${options.key} in ${DEV_VARS_FILE}`);
 
     return { code: 0, descriptors: [] };
@@ -248,10 +314,12 @@ const runEnvPush = async (context: EnvContext): Promise<EnvCommandResult> => {
     }
 
     const spawner = options.spawner ?? defaultSpawner;
+    const cwd = options.cwd ?? process.cwd();
+    const manager = detectPackageManager(cwd);
     const descriptors: SpawnDescriptor[] = [];
 
     for (const entry of map.values()) {
-        const args: string[] = ["exec", "wrangler", "secret", "put", entry.key];
+        const args: string[] = ["secret", "put", entry.key];
 
         if (options.prod) {
             args.push("--env", "production");
@@ -261,10 +329,11 @@ const runEnvPush = async (context: EnvContext): Promise<EnvCommandResult> => {
             args.push("--temporary");
         }
 
+        const exec = execArgsFor(manager, "wrangler", args);
         const descriptor: SpawnDescriptor = {
-            args,
-            command: "pnpm",
-            cwd: options.cwd ?? process.cwd(),
+            args: exec.args,
+            command: exec.command,
+            cwd,
             // `wrangler secret put <name>` reads the value from stdin. We
             // pipe it through the spawner's `input` channel so the secret
             // never lands on the command line, in env, or in shell history.
@@ -451,13 +520,13 @@ const runEnvGenerate = async (context: EnvContext): Promise<EnvCommandResult> =>
     });
 
     if (options.set === true) {
-        const map = loadDevVariables(devVariablesPath);
+        let raw = existsSync(devVariablesPath) ? readFileSync(devVariablesPath, "utf8") : "";
 
         for (const entry of generated) {
-            map.set(entry.key, entry);
+            raw = upsertDevVariableLine(raw, entry.key, entry.value);
         }
 
-        writeFileSync(devVariablesPath, serializeDevVariables(map), "utf8");
+        writeFileSync(devVariablesPath, raw, "utf8");
         logger.success(`env: generated ${String(generated.length)} secret(s) into ${DEV_VARS_FILE}: ${generated.map((entry) => entry.key).join(", ")}`);
 
         return { code: 0, descriptors: [] };

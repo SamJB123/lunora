@@ -17,6 +17,7 @@ import { dirname } from "node:path";
 import join from "./path";
 import type { SchemaInfo } from "./schema-info";
 import { discoverSchemaInfo } from "./schema-info";
+import { isCacheEnabled, WORKERS_CACHE_MIN_DATE } from "./workers-cache";
 import { findWranglerFile, readWranglerJsonc } from "./wrangler-path";
 
 const REQUIRED_COMPATIBILITY_DATE: string = "2026-04-07";
@@ -89,6 +90,10 @@ interface WranglerConfig {
     assets?: { binding?: string; directory?: string; html_handling?: string; not_found_handling?: string };
     // Browser Rendering binding (`env.BROWSER`). Self-describing { binding }.
     browser?: { binding?: string };
+    // Workers Cache toggle (`"cache": { "enabled": true }`). Parsed from
+    // untrusted JSONC, so it may be `null` or malformed; `validateCache` guards
+    // against that at runtime.
+    cache?: { enabled?: boolean } | null;
     compatibility_date?: string;
     compatibility_flags?: ReadonlyArray<string>;
     // Parsed from untrusted JSONC, so individual entries may be `null` or
@@ -100,6 +105,15 @@ interface WranglerConfig {
     // `validateDispatchNamespaces`.
     dispatch_namespaces?: ReadonlyArray<{ binding?: string; namespace?: string; outbound?: unknown } | null | undefined>;
     durable_objects?: { bindings?: ReadonlyArray<WranglerDurableObjectBinding> };
+    // Per-entrypoint cache control for named `WorkerEntrypoint`s. Lunora apps
+    // typically use a single `export default` entrypoint, so this is passthrough.
+    // Parsed from untrusted JSONC, so the map or any entry may be `null`;
+    // `validateExports` guards against that at runtime.
+    exports?: Record<string, { cache?: { enabled?: boolean } | null; type?: string } | null> | null;
+    // Cloudflare Flagship feature-flag bindings (`@lunora/flags` binding mode).
+    // The `app_id` is a remote Flagship app Lunora can't mint — warn, don't fail.
+    // See `HINT_BINDING_RULES`.
+    flagship?: ReadonlyArray<{ app_id?: string; binding?: string } | null | undefined>;
     // Hyperdrive (bring-your-own Postgres/MySQL). The `id` is a remote resource
     // (`wrangler hyperdrive create`) Lunora can't mint — warn, don't fail. See
     // `validateHyperdriveBindings`.
@@ -284,6 +298,15 @@ const validateContainerEntry = (entry: WranglerContainerEntry | null | undefined
 };
 
 /**
+ * The object-typed entries of a possibly-malformed bindings array from untrusted
+ * JSONC. Tolerates a non-array value (e.g. a stray string) and drops `null` /
+ * non-object entries (a trailing comma in JSONC parses to `[null]`), so callers
+ * can safely `.find`/`.map` string fields without a raw `TypeError`.
+ */
+const objectBindingEntries = <T>(value: ReadonlyArray<T> | undefined): T[] =>
+    Array.isArray(value) ? value.filter((entry): entry is object & T => entry !== null && typeof entry === "object") : [];
+
+/**
  * Every `containers[]` entry must be a container-enabled Durable Object the
  * worker actually wires up (see {@link validateContainerEntry}). Also nudges
  * when observability is off — container logs are invisible without it.
@@ -307,7 +330,7 @@ const validateContainers = (wrangler: WranglerConfig, errors: string[], warnings
         return;
     }
 
-    const boundClasses = new Set((wrangler.durable_objects?.bindings ?? []).map((binding) => binding.class_name));
+    const boundClasses = new Set(objectBindingEntries(wrangler.durable_objects?.bindings).map((binding) => binding.class_name));
     const migrations = wrangler.migrations ?? [];
     const sqliteClasses = new Set(migrations.flatMap((migration) => [...(migration?.new_sqlite_classes ?? [])]));
     const nonSqliteClasses = new Set(migrations.flatMap((migration) => [...(migration?.new_classes ?? [])]));
@@ -514,6 +537,14 @@ const HINT_BINDING_RULES = [
         hintMessage: (label: string, binding: string) =>
             `${label} ("${binding}") has no "id" — run \`wrangler kv namespace create\` and set the namespace id, or the binding can't resolve`,
         key: "kv_namespaces",
+    },
+    {
+        arrayMessage: "flagship must be an array of { binding, app_id } entries",
+        bindingMessage: (label: string) => `${label} must have a non-empty "binding" naming the Flagship binding`,
+        hintField: "app_id",
+        hintMessage: (label: string, binding: string) =>
+            `${label} ("${binding}") has no "app_id" — create a Flagship app and set its id, or the binding can't resolve`,
+        key: "flagship",
     },
     {
         arrayMessage: "hyperdrive must be an array of { binding, id } entries",
@@ -787,6 +818,69 @@ const validateObservability = (wrangler: WranglerConfig, errors: string[]): void
 };
 
 /**
+ * `cache` is the Workers Cache toggle (`{ "enabled": true }`). A present block
+ * must have `enabled` be a boolean if it is set. Unknown shapes are rejected so
+ * a typo like `"cache": { "enable": true }` is caught before deploy.
+ */
+const validateCache = (wrangler: WranglerConfig, errors: string[]): void => {
+    const { cache } = wrangler;
+
+    if (cache === undefined) {
+        return;
+    }
+
+    if (typeof cache !== "object" || cache === null || Array.isArray(cache)) {
+        errors.push('cache must be an object (e.g. { "enabled": true })');
+
+        return;
+    }
+
+    if (cache.enabled !== undefined && typeof cache.enabled !== "boolean") {
+        errors.push("cache.enabled must be a boolean (true or false)");
+    }
+};
+
+/**
+ * `exports` is the per-entrypoint cache-control map for named `WorkerEntrypoint`s.
+ * Lunora apps typically use a single `export default` entrypoint, so this is
+ * passthrough/shape-check only. Each value must be an object with an optional
+ * `type` (string) and optional `cache.enabled` (boolean).
+ */
+const validateExports = (wrangler: WranglerConfig, errors: string[]): void => {
+    const { exports } = wrangler;
+
+    if (exports === undefined) {
+        return;
+    }
+
+    if (typeof exports !== "object" || exports === null || Array.isArray(exports)) {
+        errors.push("exports must be an object keyed by entrypoint name");
+
+        return;
+    }
+
+    for (const [name, entry] of Object.entries(exports)) {
+        if (typeof entry !== "object" || entry === null) {
+            errors.push(`exports["${name}"] must be an object`);
+
+            continue;
+        }
+
+        if (entry.type !== undefined && typeof entry.type !== "string") {
+            errors.push(`exports["${name}"].type must be a string`);
+        }
+
+        if (entry.cache !== undefined) {
+            if (typeof entry.cache !== "object" || entry.cache === null || Array.isArray(entry.cache)) {
+                errors.push(`exports["${name}"].cache must be an object`);
+            } else if (entry.cache.enabled !== undefined && typeof entry.cache.enabled !== "boolean") {
+                errors.push(`exports["${name}"].cache.enabled must be a boolean`);
+            }
+        }
+    }
+};
+
+/**
  * `assets` is the Workers Static Assets block — serves the client build from the
  * same worker (Cloudflare serves files for free, only invoking the worker on a
  * miss, so the Lunora SSR/API handler is unaffected). NOT Cloudflare Pages,
@@ -919,7 +1013,7 @@ const validateWranglerConfig = (wrangler: WranglerConfig | undefined, schema?: S
         return { errors, valid: false, warnings };
     }
 
-    const durableObjectBindings = wrangler.durable_objects?.bindings ?? [];
+    const durableObjectBindings = objectBindingEntries(wrangler.durable_objects?.bindings);
     const shardBinding = durableObjectBindings.find((binding) => binding.name === "SHARD" && binding.class_name === "ShardDO");
 
     if (!shardBinding) {
@@ -940,6 +1034,14 @@ const validateWranglerConfig = (wrangler: WranglerConfig | undefined, schema?: S
         errors.push(`compatibility_date must be >= "${REQUIRED_COMPATIBILITY_DATE}" (got "${compatibilityDate || "<missing>"}")`);
     }
 
+    // Workers Cache requires compatibility_date >= WORKERS_CACHE_MIN_DATE. Only
+    // enforce this when the cache block is actually enabled, so non-cache apps
+    // aren't forced to bump. Malformed dates already produced a format error
+    // above, so skip the date comparison unless the shape is valid.
+    if (isCacheEnabled(wrangler) && ISO_DATE_PATTERN.test(compatibilityDate) && compatibilityDate < WORKERS_CACHE_MIN_DATE) {
+        errors.push(`cache.enabled requires compatibility_date >= "${WORKERS_CACHE_MIN_DATE}" (got "${compatibilityDate || "<missing>"}")`);
+    }
+
     // `web_socket_auto_reply_to_close` became the default on 2026-04-07, the
     // same date REQUIRED_COMPATIBILITY_DATE enforces — so requiring it
     // explicitly is redundant and workerd now warns when it's set. Any
@@ -948,7 +1050,7 @@ const validateWranglerConfig = (wrangler: WranglerConfig | undefined, schema?: S
     // adds no signal. We therefore neither require nor reject the flag here.
 
     if (schema?.hasGlobalTable) {
-        const d1Bindings = wrangler.d1_databases ?? [];
+        const d1Bindings = objectBindingEntries(wrangler.d1_databases);
         const databaseBinding = d1Bindings.find((binding) => binding.binding === "DB");
 
         if (!databaseBinding) {
@@ -986,6 +1088,8 @@ const validateWranglerConfig = (wrangler: WranglerConfig | undefined, schema?: S
     validatePlacement(wrangler, errors);
     validateObservability(wrangler, errors);
     validateAssets(wrangler, errors);
+    validateCache(wrangler, errors);
+    validateExports(wrangler, errors);
     validateCorsVariables(wrangler, errors);
 
     return { errors, valid: errors.length === 0, warnings };

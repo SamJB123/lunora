@@ -17,7 +17,7 @@ import {
     refreshCodegenProject,
     runCodegen,
 } from "../src/index";
-import type { FunctionIR, SchemaIR } from "../src/ir";
+import type { FunctionIR, SchemaIR, ShapeIR } from "../src/ir";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const fixtureRoot = join(here, "fixtures", "simple");
@@ -61,6 +61,31 @@ describe("run-codegen", () => {
             expect(result.generated.dataModel).toContain('_id: Id<"messages">');
             expect(result.generated.dataModel).toContain('channelId: Id<"channels">;');
             expect(result.generated.dataModel).toContain("text: string;");
+        });
+
+        it("rejects a workflow and an agent that share a deployed name (CODEGEN-01 cross-kind)", () => {
+            expect.assertions(1);
+
+            // discoverWorkflows/discoverAgents each dedup WITHIN their own kind,
+            // but both land in the exact same wrangler workflows[] array — a
+            // collision across kinds must be rejected before reconcile, not left
+            // to fail late in wrangler or silently clobber a binding.
+            writeFileSync(
+                join(workdir, "lunora", "workflows.ts"),
+                `
+                import { defineWorkflow } from "@lunora/workflow";
+                export const sweep = defineWorkflow({ handler: async () => undefined, name: "shared-name" });
+            `,
+            );
+            writeFileSync(
+                join(workdir, "lunora", "agents.ts"),
+                `
+                import { defineAgent } from "@lunora/agent";
+                export const support = defineAgent({ model: "m", name: "shared-name" });
+            `,
+            );
+
+            expect(() => runCodegen({ projectRoot: workdir })).toThrow(/Duplicate deployed name "shared-name"/u);
         });
 
         it("is silent and output-unchanged when LUNORA_CODEGEN_TIMING is unset", () => {
@@ -146,6 +171,348 @@ describe("run-codegen", () => {
             expect(result.generated.api).not.toContain('from "@lunora/client"');
         });
 
+        describe("local-first sync engine (shapes, mutators, collections)", () => {
+            const writeShapes = (): void => {
+                writeFileSync(
+                    join(workdir, "lunora", "shapes.ts"),
+                    `import { defineShape, v } from "@lunora/server";
+export const channelMessages = defineShape({
+    table: "messages",
+    args: { channelId: v.id("channels") },
+    columns: ["channelId", "text"],
+    where: (_ctx, args) => ({ channelId: args.channelId }),
+});
+`,
+                    "utf8",
+                );
+            };
+
+            const writeMutators = (): void => {
+                writeFileSync(
+                    join(workdir, "lunora", "mutators.ts"),
+                    `import { defineMutator, v } from "@lunora/server";
+export const sendMessage = defineMutator({
+    args: { channelId: v.id("channels"), text: v.string() },
+    server: async (_ctx, args) => ({ channelId: args.channelId, text: args.text }),
+    client: (_tx, _args) => {},
+});
+`,
+                    "utf8",
+                );
+            };
+
+            it("registers shapes into LUNORA_SHAPES and overrides resolveShape on the DO", () => {
+                expect.assertions(10);
+
+                writeShapes();
+
+                const result = runCodegen({ lint: false, projectRoot: workdir });
+
+                // functions.ts gains the shape registry, keyed by export name.
+                expect(result.generated.functions).toContain("export const LUNORA_SHAPES");
+                expect(result.generated.functions).toContain('"channelMessages":');
+                // The generated DO resolves shape subscriptions against the registry.
+                expect(result.generated.shard).toContain("LUNORA_SHAPES");
+                expect(result.generated.shard).toContain("protected override resolveShape");
+                expect(result.generated.shard).toContain("compileWhere");
+                // The cross-shard-join guard is imported + called against the compiled predicate.
+                expect(result.generated.shard).toContain("assertShapeShardable");
+                expect(result.generated.shard).toContain("assertShapeShardable(effectiveWhere, schema as unknown as SchemaLike, shape.table)");
+                // The shape predicate is AND-merged with the table's RLS read base-where:
+                // a module-scope registry is built from the function table, the helper is
+                // imported, and the resolver composes it before the shardability guard.
+                // eslint-disable-next-line no-secrets/no-secrets -- asserting on generated TS, not a credential
+                expect(result.generated.shard).toContain("const LUNORA_RLS_READ_REGISTRY = buildRlsReadRegistry(Object.values(LUNORA_FUNCTIONS));");
+                expect(result.generated.shard).toContain("buildRlsReadRegistry, composeShapeReadWhere");
+                // eslint-disable-next-line no-secrets/no-secrets -- asserting on generated TS, not a credential
+                expect(result.generated.shard).toContain("composeShapeReadWhere(LUNORA_RLS_READ_REGISTRY,");
+            });
+
+            it("registers mutators into the dispatch table + LUNORA_MUTATOR_PATHS and overrides isCustomMutator", () => {
+                expect.assertions(5);
+
+                writeMutators();
+
+                const result = runCodegen({ lint: false, projectRoot: workdir });
+
+                // Mutators register into the function dispatch table (transaction-wrapped),
+                // keyed by their file-scoped path, never leaking into the api surface.
+                expect(result.generated.functions).toContain('"mutators:sendMessage"');
+                expect(result.generated.functions).toContain("export const LUNORA_MUTATOR_PATHS");
+                expect(result.generated.api).not.toContain("sendMessage");
+                // The generated DO routes the push/watermark protocol through the override.
+                expect(result.generated.shard).toContain("LUNORA_MUTATOR_PATHS");
+                expect(result.generated.shard).toContain("protected override isCustomMutator");
+            });
+
+            it("emits _generated/collections.ts (one factory per shape) when @lunora/db is a dependency", () => {
+                expect.assertions(4);
+
+                writeShapes();
+                writeFileSync(join(workdir, "package.json"), JSON.stringify({ dependencies: { "@lunora/db": "*" }, name: "db-app" }));
+
+                const result = runCodegen({ lint: false, projectRoot: workdir });
+
+                expect(result.generated.collections).toContain('import { lunoraCollectionOptions } from "@lunora/db/collections"');
+                expect(result.generated.collections).toContain('import type { LunoraClient } from "@lunora/client"');
+                expect(result.generated.collections).toContain("export const channelMessagesCollection");
+                expect(result.generated.collections).toContain('shape: { args, name: "channelMessages" }');
+            });
+
+            it("routes the collection client import through the umbrella but keeps @lunora/db scoped", () => {
+                expect.assertions(3);
+
+                writeShapes();
+                writeFileSync(join(workdir, "package.json"), JSON.stringify({ dependencies: { "@lunora/db": "*", lunorash: "*" }, name: "umbrella-db-app" }));
+
+                const result = runCodegen({ lint: false, projectRoot: workdir });
+
+                // @lunora/client is in the umbrella base → remapped.
+                expect(result.generated.collections).toContain('import type { LunoraClient } from "lunorash/client"');
+                // @lunora/db is an opt-in add-on → stays scoped even under the umbrella.
+                expect(result.generated.collections).toContain('from "@lunora/db/collections"');
+                expect(result.generated.collections).not.toContain('from "lunorash/db');
+            });
+
+            it("does not emit collections.ts when shapes exist but @lunora/db is absent", () => {
+                expect.assertions(2);
+
+                writeShapes();
+
+                const result = runCodegen({ lint: false, projectRoot: workdir });
+
+                expect(result.generated.collections).toBe("");
+                expect(existsSync(join(workdir, "lunora", "_generated", "collections.ts"))).toBe(false);
+            });
+
+            it("prunes a stale collections.ts when the @lunora/db feature is later removed", () => {
+                expect.assertions(3);
+
+                const collectionsPath = join(workdir, "lunora", "_generated", "collections.ts");
+
+                // Feature present: shapes + @lunora/db → collections.ts is written to disk.
+                writeShapes();
+                writeFileSync(join(workdir, "package.json"), JSON.stringify({ dependencies: { "@lunora/db": "*" }, name: "db-app" }));
+                runCodegen({ lint: false, projectRoot: workdir });
+
+                expect(existsSync(collectionsPath)).toBe(true);
+
+                // Feature removed: drop the @lunora/db dependency. The emitter now
+                // returns "" and the prior file must be deleted, not left dangling
+                // (it imports @lunora/db, which the app no longer installs).
+                writeFileSync(join(workdir, "package.json"), JSON.stringify({ dependencies: {}, name: "db-app" }));
+
+                const result = runCodegen({ lint: false, projectRoot: workdir });
+
+                expect(result.generated.collections).toBe("");
+                expect(existsSync(collectionsPath)).toBe(false);
+            });
+
+            it("leaves generated output byte-identical when neither shapes nor mutators are declared", () => {
+                expect.assertions(3);
+
+                const baseline = runCodegen({ lint: false, projectRoot: workdir }).generated;
+
+                expect(baseline.collections).toBe("");
+                expect(baseline.functions).not.toContain("LUNORA_SHAPES");
+                expect(baseline.functions).not.toContain("LUNORA_MUTATOR_PATHS");
+            });
+        });
+
+        describe("typed identity layer (defineIdentity)", () => {
+            const writeIdentity = (): void => {
+                writeFileSync(
+                    join(workdir, "lunora", "identity.ts"),
+                    `import { defineIdentity, v } from "@lunora/server";
+export const identity = defineIdentity({
+    userId: v.string(),
+    tenantId: v.optional(v.string()),
+    scopes: v.optional(v.array(v.string())),
+});
+`,
+                    "utf8",
+                );
+            };
+
+            it("leaves server.ts byte-identical when no defineIdentity is declared", () => {
+                expect.assertions(6);
+
+                const { server } = runCodegen({ lint: false, projectRoot: workdir }).generated;
+
+                // No contract ⇒ none of the narrowing fragments are emitted, so the
+                // output is the untyped-identity baseline (the guardrail the item
+                // was deferred to protect).
+                expect(server).not.toContain("InferIdentity");
+                expect(server).not.toContain("lunoraIdentityContract");
+                expect(server).not.toContain("export type Identity");
+                expect(server).not.toContain("NarrowedAuth");
+                // The RLS DSL keeps the untyped-identity default binding.
+                expect(server).toContain("export const definePolicy = createPolicyDsl<DataModel, Relations>();");
+                // ctx.auth is inherited from the base (never re-declared / omitted).
+                expect(server).not.toContain('"db" | "storage" | "auth"');
+            });
+
+            it("narrows ctx.auth.getIdentity() + the RLS policy identity to the declared contract", () => {
+                expect.assertions(9);
+
+                writeIdentity();
+
+                const { server } = runCodegen({ lint: false, projectRoot: workdir }).generated;
+
+                // The claim type is recovered from the declaration itself (reused
+                // `InferIdentity` machinery, `typeof` the imported contract) — no
+                // parallel type system, no runtime import.
+                expect(server).toContain('import type { InferIdentity } from "@lunora/server";');
+                expect(server).toContain('import type * as lunoraIdentityContract from "../identity.js";');
+                expect(server).toContain("export type Identity = InferIdentity<typeof lunoraIdentityContract.identity>;");
+                // `getIdentity()` narrows to `Identity | null` via a NarrowedAuth override.
+                expect(server).toContain('type NarrowedAuth = Omit<QueryCtxBase["auth"], "getIdentity"> & { getIdentity: () => Promise<Identity | null> };');
+                expect(server).toContain("readonly auth: NarrowedAuth;");
+                // Each ctx omits the base `auth` so the narrowed one replaces it.
+                expect(ctxInterface(server, "QueryCtx")).toContain("readonly auth: NarrowedAuth;");
+                expect(ctxInterface(server, "ActionCtx")).toContain("readonly auth: NarrowedAuth;");
+                expect(server).toContain('export interface QueryCtx extends Omit<QueryCtxBase, "db" | "storage" | "auth">');
+                // The RLS DSL is bound to the declared identity so a policy's
+                // `ctx.auth.identity` narrows to it.
+                expect(server).toContain("export const definePolicy = createPolicyDsl<DataModel, Relations, Identity>();");
+            });
+
+            it("leaves app.ts free of identity wiring when no defineIdentity is declared", () => {
+                expect.assertions(2);
+
+                const { app } = runCodegen({ lint: false, projectRoot: workdir }).generated;
+
+                // No contract ⇒ no import and no `options.identity` wiring, so the
+                // runtime trust boundary is a no-op. (An unrelated `identity:` may
+                // appear inside the D1 global-db factory, so we assert on the
+                // contract-specific fragments rather than the bare substring.)
+                expect(app).not.toContain("lunoraIdentityContract");
+                expect(app).not.toContain(`from "../identity.js"`);
+            });
+
+            it("wires options.identity into app.ts so the trust boundary validates in the generated worker", () => {
+                expect.assertions(3);
+
+                writeIdentity();
+
+                const { app } = runCodegen({ lint: false, projectRoot: workdir }).generated;
+
+                // Imported as a VALUE (not `import type`) — the contract must exist
+                // at runtime for the worker's contract gate to run.
+                expect(app).toContain('import * as lunoraIdentityContract from "../identity.js";');
+                expect(app).not.toContain("import type * as lunoraIdentityContract");
+                // Wired onto the worker options the runtime validates against.
+                expect(app).toContain("identity: lunoraIdentityContract.identity,");
+            });
+
+            it("errors when more than one defineIdentity is declared", () => {
+                expect.assertions(1);
+
+                writeFileSync(
+                    join(workdir, "lunora", "identity.ts"),
+                    `import { defineIdentity, v } from "@lunora/server";
+export const identity = defineIdentity({ userId: v.string() });
+export const other = defineIdentity({ userId: v.string() });
+`,
+                    "utf8",
+                );
+
+                expect(() => runCodegen({ lint: false, projectRoot: workdir })).toThrow(/exactly one is allowed/u);
+            });
+        });
+
+        describe("typed env layer (defineEnv)", () => {
+            const writeEnv = (specifier = "@lunora/server"): void => {
+                writeFileSync(
+                    join(workdir, "lunora", "env.ts"),
+                    `import { defineEnv, v } from "${specifier}";
+export const env = defineEnv({
+    STRIPE_KEY: v.string(),
+    PORT: v.optional(v.number()),
+});
+`,
+                    "utf8",
+                );
+            };
+
+            it("leaves server.ts + shard.ts byte-identical when no defineEnv is declared", () => {
+                expect.assertions(4);
+
+                const { server, shard } = runCodegen({ lint: false, projectRoot: workdir }).generated;
+
+                // No contract ⇒ none of the wiring fragments are emitted, so the
+                // output is the baseline (guards the golden-fixture invariant).
+                expect(server).not.toContain("lunoraEnvContract");
+                expect(server).not.toContain("export type LunoraEnv");
+                expect(shard).not.toContain("lunoraEnvContract");
+                expect(shard).not.toContain("envConfig");
+            });
+
+            it("types ctx.env as the validated shape on every ctx when the project declares lunora/env.ts", () => {
+                expect.assertions(6);
+
+                writeEnv();
+
+                const { server } = runCodegen({ lint: false, projectRoot: workdir }).generated;
+
+                // The validated shape is recovered from the declaration itself
+                // (`ReturnType` over the accessor's `typeof` — no parallel type
+                // system, no runtime import in server.ts).
+                expect(server).toContain('import type * as lunoraEnvContract from "../env.js";');
+                expect(server).toContain("export type LunoraEnv = ReturnType<typeof lunoraEnvContract.env>;");
+                // ctx.env is typed on EVERY ctx (query/mutation/action).
+                expect(ctxInterface(server, "QueryCtx")).toContain("readonly env: LunoraEnv;");
+                expect(ctxInterface(server, "MutationCtx")).toContain("readonly env: LunoraEnv;");
+                expect(ctxInterface(server, "ActionCtx")).toContain("readonly env: LunoraEnv;");
+                // Each ctx omits the base optional `env` so the narrowed one replaces it.
+                expect(server).toContain('export interface QueryCtx extends Omit<QueryCtxBase, "db" | "storage" | "env">');
+            });
+
+            it("wires ctx.env end-to-end in the ShardDO by applying the accessor to the worker env", () => {
+                expect.assertions(4);
+
+                writeEnv();
+
+                const { shard } = runCodegen({ lint: false, projectRoot: workdir }).generated;
+
+                // Imported as a VALUE namespace (the accessor must run at ctx-build time).
+                expect(shard).toContain('import * as lunoraEnvContract from "../env.js";');
+                expect(shard).toContain("const envConfig = lunoraEnvContract.env(env);");
+                // Rides every ctx, so it is spliced into the shared ctx literal…
+                expect(shard).toContain("\n                env: envConfig,");
+                // …never gated behind the action-only block.
+                expect(shard).not.toContain("ctx.env = envConfig;");
+            });
+
+            it("routes ctx.env types through the lunorash umbrella when the accessor is imported from lunorash/server", () => {
+                expect.assertions(2);
+
+                writeEnv("lunorash/server");
+
+                const { server, shard } = runCodegen({ lint: false, projectRoot: workdir }).generated;
+
+                // The contract module is always `../env.js` regardless of the umbrella —
+                // it is the user's own module, not a base-package specifier.
+                expect(server).toContain("export type LunoraEnv = ReturnType<typeof lunoraEnvContract.env>;");
+                expect(shard).toContain("const envConfig = lunoraEnvContract.env(env);");
+            });
+
+            it("errors when more than one defineEnv is declared", () => {
+                expect.assertions(1);
+
+                writeFileSync(
+                    join(workdir, "lunora", "env.ts"),
+                    `import { defineEnv, v } from "@lunora/server";
+export const env = defineEnv({ PORT: v.number() });
+export const other = defineEnv({ HOST: v.string() });
+`,
+                    "utf8",
+                );
+
+                expect(() => runCodegen({ lint: false, projectRoot: workdir })).toThrow(/exactly one is allowed/u);
+            });
+        });
+
         it("wires ctx.ai end-to-end when a function reads ctx.ai", () => {
             expect.assertions(3);
 
@@ -210,6 +577,88 @@ export const cached = query({ args: { key: v.string() }, handler: async (ctx, { 
             // KV rides every ctx, so it must NOT be gated behind the action-only block.
             expect(result.generated.shard).not.toContain("ctx.kv = kv;");
             expect(result.generated.server).toContain('readonly kv: import("@lunora/bindings/kv").Kv;');
+        });
+
+        it("wires ctx.access end-to-end (every ctx) when a query reads ctx.access", () => {
+            expect.assertions(5);
+
+            writeFileSync(
+                join(workdir, "lunora", "whoami.ts"),
+                `import { query } from "@lunora/server";
+export const whoAmI = query({ args: {}, handler: async (ctx) => ({ email: ctx.access.email, isOps: ctx.access.hasGroup("ops") }) });
+`,
+                "utf8",
+            );
+
+            const result = runCodegen({ lint: false, projectRoot: workdir });
+
+            expect(result.generated.shard).toContain('import { accessFacade } from "@lunora/cloudflare-access/context"');
+            expect(result.generated.shard).toContain("const access = accessFacade(identity, userId);");
+            expect(result.generated.shard).toContain("\n                access,");
+            // Access rides every ctx, so it must NOT be gated behind the action-only block.
+            expect(result.generated.shard).not.toContain("ctx.access = access;");
+            expect(result.generated.server).toContain('readonly access: import("@lunora/cloudflare-access/context").AccessFacade;');
+        });
+
+        it("does not wire ctx.access for a project that doesn't read it", () => {
+            expect.assertions(2);
+
+            const result = runCodegen({ lint: false, projectRoot: workdir });
+
+            expect(result.generated.shard).not.toContain("@lunora/cloudflare-access");
+            expect(result.generated.server).not.toContain("@lunora/cloudflare-access");
+        });
+
+        it("does not wire @lunora/flags for a project without a lunora/flags.ts", () => {
+            expect.assertions(2);
+
+            const result = runCodegen({ lint: false, projectRoot: workdir });
+
+            expect(result.generated.shard).not.toContain("@lunora/flags");
+            expect(result.generated.server).not.toContain("@lunora/flags");
+        });
+
+        it("wires ctx.flags end-to-end (every ctx) when the project declares lunora/flags.ts", () => {
+            expect.assertions(5);
+
+            writeFileSync(
+                join(workdir, "lunora", "flags.ts"),
+                `import { defineFlags } from "@lunora/flags";
+export default defineFlags({ provider: (env) => env.PROVIDER, identify: (auth) => auth.userId ?? undefined });
+`,
+                "utf8",
+            );
+
+            const result = runCodegen({ lint: false, projectRoot: workdir });
+
+            expect(result.generated.shard).toContain('import { createFlags } from "@lunora/flags"');
+            expect(result.generated.shard).toContain('import flagsConfig from "../flags.js"');
+            expect(result.generated.shard).toContain("\n                flags,");
+            // Flags ride every ctx, so they must NOT be gated behind the action-only block.
+            expect(result.generated.shard).not.toContain("ctx.flags = flags;");
+            expect(result.generated.server).toContain('readonly flags: import("@lunora/flags").LunoraFlags;');
+        });
+
+        it("routes ctx.flags imports through the lunorash umbrella when the project depends on `lunorash`", () => {
+            expect.assertions(4);
+
+            writeFileSync(join(workdir, "package.json"), JSON.stringify({ dependencies: { lunorash: "*" }, name: "umbrella-flags-app" }));
+            writeFileSync(
+                join(workdir, "lunora", "flags.ts"),
+                `import { defineFlags } from "lunorash/flags";
+export default defineFlags({ provider: (env) => env.PROVIDER, identify: (auth) => auth.userId ?? undefined });
+`,
+                "utf8",
+            );
+
+            const result = runCodegen({ lint: false, projectRoot: workdir });
+
+            // Flags surface routed through the umbrella…
+            expect(result.generated.shard).toContain('import { createFlags } from "lunorash/flags"');
+            expect(result.generated.server).toContain('readonly flags: import("lunorash/flags").LunoraFlags;');
+            // …and never the granular `@lunora/flags` specifier (the pre-fix bug).
+            expect(result.generated.shard).not.toContain("@lunora/flags");
+            expect(result.generated.server).not.toContain("@lunora/flags");
         });
 
         it("wires ctx.sql (Hyperdrive) end-to-end onto the ActionCtx ONLY (value-level) when an action reads ctx.sql", () => {
@@ -664,6 +1113,25 @@ export default crons;
             expect(existsSync(join(generatedDirectory, "openrpc.ts"))).toBe(false);
         });
 
+        it("removes a now-stale spec file when apiSpec switches away from a format", () => {
+            expect.assertions(4);
+
+            const generatedDirectory = join(workdir, "lunora", "_generated");
+
+            // First run writes the default openapi.* artifacts…
+            runCodegen({ projectRoot: workdir });
+
+            expect(existsSync(join(generatedDirectory, "openapi.json"))).toBe(true);
+            expect(existsSync(join(generatedDirectory, "openapi.ts"))).toBe(true);
+
+            // …switching to openrpc must delete the stale openapi.* files rather
+            // than leave a portable artifact documenting the old API forever.
+            runCodegen({ apiSpec: "openrpc", projectRoot: workdir });
+
+            expect(existsSync(join(generatedDirectory, "openapi.json"))).toBe(false);
+            expect(existsSync(join(generatedDirectory, "openapi.ts"))).toBe(false);
+        });
+
         it("emits openrpc.json modelling RPC functions as methods, excluding internal/stream", () => {
             expect.assertions(5);
 
@@ -860,6 +1328,31 @@ export const cached = query.input({ key: v.string() }).query(async ({ args, ctx 
             expect(result.generated.app).not.toContain("public vectors(");
         });
 
+        it("emits a long-tail .x402() pass-through and wires the ActionCtx-only pay rail when an action reads ctx.x402", () => {
+            expect.assertions(3);
+
+            writeFileSync(
+                join(workdir, "lunora", "buy.ts"),
+                `import { action, v } from "@lunora/server";
+export const buyReport = action.input({ url: v.string() }).action(async ({ args, ctx }) => {
+    const res = await ctx.x402.fetch(args.url);
+    return res.text();
+});
+`,
+                "utf8",
+            );
+
+            const result = runCodegen({ projectRoot: workdir });
+
+            // The fluent builder method + its config-type pass-through are emitted…
+            // eslint-disable-next-line no-secrets/no-secrets -- asserting on a generated builder-method signature, not a credential
+            expect(result.generated.app).toContain('public x402(factory: NonNullable<ShardConfig["x402"]>): this');
+            // …the typed rail rides the ActionCtx…
+            expect(result.generated.server).toContain("readonly x402: X402Pay;");
+            // …and the value is attached only inside the action-only `if (isAction)` block.
+            expect(result.generated.shard).toContain("ctx.x402 = x402;");
+        });
+
         it("emits app.ts with the .auth() method when @lunora/auth is a declared dependency", () => {
             expect.assertions(3);
 
@@ -1049,7 +1542,7 @@ export const ping = query({ args: { id: v.string() }, handler: async (_context, 
         it("imports Doc when a return type references it", () => {
             expect.assertions(3);
 
-            const output = emitApi([makeFunction({ returnType: 'Doc<"posts">[]' })]);
+            const output = emitApi({ functions: [makeFunction({ returnType: 'Doc<"posts">[]' })] });
 
             expect(output).toContain('import type { Doc } from "./dataModel.js";');
             expect(output).not.toContain("import type { Id }");
@@ -1059,7 +1552,7 @@ export const ping = query({ args: { id: v.string() }, handler: async (_context, 
         it("imports both Doc and Id when both are referenced", () => {
             expect.assertions(1);
 
-            const output = emitApi([makeFunction({ args: { id: { kind: "id", tableName: "posts" } }, returnType: 'Doc<"posts">' })]);
+            const output = emitApi({ functions: [makeFunction({ args: { id: { kind: "id", tableName: "posts" } }, returnType: 'Doc<"posts">' })] });
 
             expect(output).toContain('import type { Doc, Id } from "./dataModel.js";');
         });
@@ -1067,7 +1560,7 @@ export const ping = query({ args: { id: v.string() }, handler: async (_context, 
         it("imports only Id when no Doc is referenced", () => {
             expect.assertions(2);
 
-            const output = emitApi([makeFunction({ args: { id: { kind: "id", tableName: "posts" } }, returnType: "{ ok: boolean }" })]);
+            const output = emitApi({ functions: [makeFunction({ args: { id: { kind: "id", tableName: "posts" } }, returnType: "{ ok: boolean }" })] });
 
             expect(output).toContain('import type { Id } from "./dataModel.js";');
             expect(output).not.toContain("Doc");
@@ -1076,7 +1569,7 @@ export const ping = query({ args: { id: v.string() }, handler: async (_context, 
         it("omits the dataModel import when neither is referenced", () => {
             expect.assertions(1);
 
-            const output = emitApi([makeFunction({ returnType: "{ ok: boolean }" })]);
+            const output = emitApi({ functions: [makeFunction({ returnType: "{ ok: boolean }" })] });
 
             expect(output).not.toContain("./dataModel.js");
         });
@@ -1145,6 +1638,11 @@ export const ping = query({ args: { id: v.string() }, handler: async (_context, 
             const output = emitShard({
                 schema: { tables: [], vectorIndexes: [] },
                 studioFeatures: {
+                    analytics: false,
+                    auth: false,
+                    containers: false,
+                    flags: false,
+                    kv: false,
                     mail: false,
                     payments: true,
                     queues: false,
@@ -1170,6 +1668,47 @@ export const ping = query({ args: { id: v.string() }, handler: async (_context, 
         });
     });
 
+    describe("emitShard — feature flags", () => {
+        it("emits no flag overrides when the app wires no flags", () => {
+            expect.assertions(3);
+
+            const output = emitShard({ schema: { tables: [], vectorIndexes: [] } });
+
+            expect(output).not.toContain("LUNORA_FLAG_KEYS");
+            expect(output).not.toContain("evaluateFlags");
+            // eslint-disable-next-line no-secrets/no-secrets -- the generated override's method name asserted absent, not a secret
+            expect(output).not.toContain("runFlagSubscriptionRead");
+        });
+
+        it("emits LUNORA_FLAG_KEYS plus the evaluateFlags + reactive read overrides when flags are wired", () => {
+            expect.assertions(8);
+
+            const output = emitShard({
+                flagKeys: [
+                    { key: "dark-mode", type: "boolean" },
+                    { key: "page-size", type: "number" },
+                ],
+                hasFlags: true,
+                schema: { tables: [], vectorIndexes: [] },
+            });
+
+            expect(output).toContain("const LUNORA_FLAG_KEYS: ReadonlyArray<{ key: string; type: ");
+            expect(output).toContain('"key": "dark-mode"');
+            expect(output).toContain("protected override async evaluateFlags(context?: Record<string, unknown>): Promise<FlagsResult> {");
+            expect(output).toContain("protected override runFlagSubscriptionRead(");
+            expect(output).toContain("FlagsResult");
+            // The per-type chain keeps the typed details.* calls sound.
+            expect(output).toContain("await flags.details.boolean(entry.key, false, evalContext)");
+            // Security: the public reactive channel must (a) serve only statically
+            // discovered flag keys, so a subscriber can't probe arbitrary/internal
+            // flags, and (b) never honor client-supplied targeting context, so a
+            // subscriber can't spoof attributes to unlock a gated flag.
+            expect(output).toContain("!LUNORA_FLAG_KEYS.some((entry) => entry.key === key)");
+            // Robustness: identify is wrapped in a thunk so a throwing identify fails open.
+            expect(output).toContain("targetingKey: () => flagsConfig.identify?.(");
+        });
+    });
+
     describe("emitShard — workflows metadata", () => {
         it("emits the declared workflows into the workflowsMetadata() override", () => {
             expect.assertions(4);
@@ -1177,7 +1716,13 @@ export const ping = query({ args: { id: v.string() }, handler: async (_context, 
             const output = emitShard({
                 schema: { tables: [], vectorIndexes: [] },
                 workflows: [
-                    { bindingName: "WORKFLOW_ORDER_PIPELINE", className: "OrderPipelineWorkflow", exportName: "orderPipeline", name: "order-pipeline" },
+                    {
+                        bindingName: "WORKFLOW_ORDER_PIPELINE",
+                        className: "OrderPipelineWorkflow",
+                        exportName: "orderPipeline",
+                        name: "order-pipeline",
+                        steps: [],
+                    },
                 ],
             });
 
@@ -1237,6 +1782,36 @@ export const ping = query({ args: { id: v.string() }, handler: async (_context, 
             expect(output).toContain("config.hyperdriveGlobal?.(env, { identity, userId }) ?? globalDbStub");
             expect(output).toContain("hyperdriveGlobal?: (env: Record<string, unknown>");
             expect(output).not.toContain("config.d1?.(env");
+        });
+
+        const settingsShape: ShapeIR = { exportName: "allSettings", filePath: "shapes", table: "settings" };
+
+        it("emits the global-shape poll override when a project has shapes AND a `.global()` table", () => {
+            expect.assertions(3);
+
+            const output = emitShard({ schema: globalSchema("d1"), shapes: [settingsShape] });
+
+            // resolveShape flags a `.global()`-table shape so the base serves it via the poll path.
+            expect(output).toContain('const isGlobal = (schema as unknown as SchemaLike).tables[shape.table]?.shardMode?.kind === "global"');
+            // The DO reads the global membership by draining the global backend's findMany.
+            expect(output).toContain("protected override async readGlobalShapeRows");
+            expect(output).toContain("await globalDb.findMany(resolved.table, { cursor, where: resolved.effectiveWhere })");
+        });
+
+        it("does not emit readGlobalShapeRows when the project has shapes but no `.global()` table", () => {
+            expect.assertions(1);
+
+            const output = emitShard({
+                schema: {
+                    tables: [
+                        { indexes: [], name: "messages", rankIndexes: [], relations: [], searchIndexes: [], shape: {}, shardMode: "root", vectorIndexes: [] },
+                    ],
+                    vectorIndexes: [],
+                },
+                shapes: [{ exportName: "msgs", filePath: "shapes", table: "messages" }],
+            });
+
+            expect(output).not.toContain("protected override async readGlobalShapeRows");
         });
     });
 
@@ -1651,6 +2226,59 @@ export const ping = query({ args: { id: v.string() }, handler: async (_context, 
             expect(withoutPayments).not.toContain("readonly payments:");
         });
 
+        it("wires ctx.x402 onto the ACTION ctx ONLY (value-level) via a lazy, Secrets-Store-backed rail when the pay rail is used", () => {
+            expect.assertions(6);
+
+            const schema: SchemaIR = { tables: [], vectorIndexes: [] };
+
+            const output = emitShard({ hasX402: true, schema });
+
+            expect(output).toContain('import { lazyX402Pay } from "@lunora/x402/pay";');
+            expect(output).toContain("x402?: (env: Record<string, unknown>) => X402PayConfig;");
+            expect(output).toContain("const x402Stub: X402Pay");
+            // Lazy by construction — the signer/secret cost is deferred to the first fetch,
+            // and the wallet key is read through the in-scope `secrets` (Secrets Store) facade.
+            expect(output).toContain("lazyX402Pay(config.x402(env), { getSecret: (name: string) => secrets.get(name) })");
+            // Attached only inside the `if (isAction)` block — never spliced into the shared ctx literal.
+            expect(output).toContain("ctx.x402 = x402;");
+            // eslint-disable-next-line no-secrets/no-secrets -- asserting on a generated ctx-builder line, not a credential
+            expect(output).toContain('const isAction = LUNORA_FUNCTIONS[options.functionPath ?? ""]?.kind === "action";');
+        });
+
+        it("never attaches ctx.x402 onto the base ctx literal, and omits the pay rail entirely when unused", () => {
+            expect.assertions(5);
+
+            const schema: SchemaIR = { tables: [], vectorIndexes: [] };
+
+            // Slice everything BEFORE the `isAction` gate to inspect only the shared
+            // (query/mutation/action) ctx body: the money-spending rail must never appear there.
+            const withX402 = emitShard({ hasX402: true, schema });
+            const baseCtxBody = withX402.slice(0, withX402.indexOf("const isAction ="));
+
+            expect(baseCtxBody).not.toContain("\n                x402,");
+
+            const withoutX402 = emitShard({ schema });
+
+            expect(withoutX402).not.toContain("@lunora/x402/pay");
+            expect(withoutX402).not.toContain("lazyX402Pay");
+            expect(withoutX402).not.toContain("x402Stub");
+            expect(withoutX402).not.toContain("ctx.x402 = x402;");
+        });
+
+        it("adds a typed ctx.x402 to the generated ActionCtx when the pay rail is used (and not otherwise)", () => {
+            expect.assertions(4);
+
+            const withX402 = emitServer({ hasX402: true });
+
+            expect(withX402).toContain('import type { X402Pay } from "@lunora/x402/pay";');
+            expect(withX402).toContain("readonly x402: X402Pay;");
+
+            const withoutX402 = emitServer({});
+
+            expect(withoutX402).not.toContain("@lunora/x402/pay");
+            expect(withoutX402).not.toContain("readonly x402:");
+        });
+
         it("adds a typed ctx.ai to the generated ActionCtx when AI is used (and not otherwise)", () => {
             expect.assertions(4);
 
@@ -1688,7 +2316,7 @@ export const ping = query({ args: { id: v.string() }, handler: async (_context, 
                     },
                 ],
                 hasAi: true,
-                workflows: [{ bindingName: "WORKFLOW_ORDERS", className: "OrdersWorkflow", exportName: "orders", name: "orders" }],
+                workflows: [{ bindingName: "WORKFLOW_ORDERS", className: "OrdersWorkflow", exportName: "orders", name: "orders", steps: [] }],
             });
 
             expect(server).toContain("readonly AI?: unknown;");
@@ -1957,7 +2585,7 @@ export const ping = query({ args: { id: v.string() }, handler: async (_context, 
         it("imports ctx types from server.js as type-only (no runtime cycle)", () => {
             expect.assertions(2);
 
-            const output = emitFunctions([makeFunction("ping")]);
+            const output = emitFunctions({ functions: [makeFunction("ping")] });
 
             // functions.ts imports the user modules, so its edge back to server.ts
             // must be type-only — otherwise the two form a runtime cycle again.
@@ -1968,7 +2596,7 @@ export const ping = query({ args: { id: v.string() }, handler: async (_context, 
         it("renders the caller arg as optional only when the function takes none", () => {
             expect.assertions(2);
 
-            const output = emitFunctions([makeFunction("ping"), makeFunction("get", { args: { id: { kind: "id", tableName: "posts" } } })]);
+            const output = emitFunctions({ functions: [makeFunction("ping"), makeFunction("get", { args: { id: { kind: "id", tableName: "posts" } } })] });
 
             expect(output).toContain("ping: (args?: {}) => Promise<unknown>;");
             expect(output).toContain('get: (args: { id: Id<"posts"> }) => Promise<unknown>;');
@@ -1977,7 +2605,7 @@ export const ping = query({ args: { id: v.string() }, handler: async (_context, 
         it("threads a function's concrete return type through the caller", () => {
             expect.assertions(2);
 
-            const output = emitFunctions([makeFunction("count", { returnType: "number" })]);
+            const output = emitFunctions({ functions: [makeFunction("count", { returnType: "number" })] });
 
             expect(output).toContain("count: (args?: {}) => Promise<number>;");
             expect(output).toContain('count: (args) => callRegistered(context, "posts:count", args),');
@@ -1986,7 +2614,7 @@ export const ping = query({ args: { id: v.string() }, handler: async (_context, 
         it("emits an empty caller (and no unused locals) when there are no functions", () => {
             expect.assertions(4);
 
-            const output = emitFunctions([]);
+            const output = emitFunctions({ functions: [] });
 
             // No functions ⇒ no `callRegistered` helper and the `context` parameter
             // is prefixed so it never trips noUnusedParameters in a real project.
@@ -2032,6 +2660,47 @@ export const ping = query({ args: { id: v.string() }, handler: async (_context, 
 
             expect(shard).toContain('at: integer("at").notNull()');
             expect(shard).toContain('due: integer("due").notNull()');
+        });
+    });
+
+    describe("batteries-included sandbox", () => {
+        const sandboxFixtureRoot = join(here, "fixtures", "agent-sandbox");
+        let sandboxWorkdir: string;
+
+        beforeEach(() => {
+            sandboxWorkdir = mkdtempSync(join(tmpdir(), "lunora-sandbox-codegen-"));
+            cpSync(join(sandboxFixtureRoot, "lunora"), join(sandboxWorkdir, "lunora"), { recursive: true });
+        });
+
+        afterEach(() => {
+            rmSync(sandboxWorkdir, { force: true, recursive: true });
+        });
+
+        it("auto-registers the internal sandbox:invoke dispatcher when a sandbox tool is imported", () => {
+            expect.assertions(3);
+
+            const { functions } = runCodegen({ lint: false, projectRoot: sandboxWorkdir }).generated;
+
+            expect(functions).toContain('import { sandboxComponent } from "@lunora/agent/component";');
+            expect(functions).toContain("const lunoraSandbox = sandboxComponent();");
+            expect(functions).toContain('"sandbox:invoke": lunoraSandbox.invoke as unknown as RegisteredLunoraFunction,');
+        });
+
+        it("wires ctx.browser onto the ActionCtx because browserTool drives the headless browser", () => {
+            expect.assertions(1);
+
+            const { server } = runCodegen({ lint: false, projectRoot: sandboxWorkdir }).generated;
+
+            expect(ctxInterface(server, "ActionCtx")).toContain("browser");
+        });
+
+        it("does not register the sandbox dispatcher for a project without a sandbox tool", () => {
+            expect.assertions(1);
+
+            // The `simple` fixture imports no sandbox tool — its output must stay clean.
+            const { functions } = runCodegen({ lint: false, projectRoot: workdir }).generated;
+
+            expect(functions).not.toContain("sandbox:invoke");
         });
     });
 });

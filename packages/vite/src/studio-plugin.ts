@@ -9,11 +9,14 @@ import type { AddressInfo } from "node:net";
 import { detectAgentRules } from "@lunora/config";
 import type { LocalEndpointHandler, StudioAssets } from "@lunora/config/studio-host";
 import {
+    assetContentType,
     handlePolicyScaffoldRequest,
     handleSchemaEditRequest,
     handleSeedRequest,
+    isStandaloneModulePath,
     loadStudioAssets,
     POLICY_SCAFFOLD_ENDPOINT,
+    readStandaloneAsset,
     renderStudioHtml,
     resolveAdminToken,
     SCHEMA_EDIT_ENDPOINT,
@@ -114,6 +117,16 @@ const transportRejectionReason = (request: IncomingMessage): string | undefined 
 
     if (host !== undefined && !LOOPBACK_HOSTS.has(host)) {
         return "Lunora studio rejects a non-localhost Host header in dev.";
+    }
+
+    // A direct loopback browser never sets forwarding headers; their presence
+    // means a reverse proxy/tunnel is relaying a (possibly remote) client, which
+    // must not receive the inlined admin token. Refuse rather than trust Host.
+    const FORWARDING_HEADERS = ["x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "forwarded"] as const;
+
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- `headers` is typed required but partial/mocked requests omit it
+    if (FORWARDING_HEADERS.some((name) => request.headers?.[name] !== undefined)) {
+        return "Lunora studio refuses a proxied (X-Forwarded-*) request in dev.";
     }
 
     return undefined;
@@ -251,10 +264,17 @@ const createStudioHandler = (
     // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- runtime value can be undefined on a mocked server even though the type says string
     const projectRoot = server.config.root ?? process.cwd();
 
-    // Serve a static studio asset (script/styles), re-reading from disk when a
-    // mid-session `@lunora/studio` rebuild changes the bytes. Returns `true` once
-    // it has written a response so the caller can stop dispatching.
-    const serveStaticAsset = (pathname: string, response: ServerResponse): void => {
+    // Serve a static studio asset — the compiled stylesheet, the `studio.js`
+    // entry, or one of its on-demand `chunk-*.js` code-split siblings — re-reading
+    // from disk when a mid-session `@lunora/studio` rebuild changes the bytes.
+    //
+    // The entry + stylesheet sit at stable, unhashed URLs, so the browser would
+    // heuristically cache them and shadow a picked-up rebuild until a hard-reload
+    // (this once masked a fixed render loop behind a stale bundle). Send `no-cache`
+    // + a `${file}-${stamp}` ETag so the browser must revalidate: an unchanged
+    // asset costs a cheap `304`, a rebuild (new stamp, new chunk names) is always
+    // fetched fresh.
+    const serveStaticAsset = (pathname: string, request: IncomingMessage, response: ServerResponse): void => {
         const stamp = studioAssetsStamp();
 
         if (assets === undefined || stamp !== assetsStamp) {
@@ -270,9 +290,48 @@ const createStudioHandler = (
             return;
         }
 
-        const isScript = pathname === STUDIO_SCRIPT_PATH;
+        const isStyle = pathname === STUDIO_STYLE_PATH;
+        // Key the ETag on the requested file (not just its kind) so each chunk
+        // revalidates independently; the rebuild stamp busts them all at once.
+        const fileName = pathname.slice(pathname.lastIndexOf("/") + 1);
+        const etag = stamp === undefined ? undefined : `W/"${fileName}-${String(stamp)}"`;
 
-        sendOk(response, isScript ? assets.script : assets.styles, isScript ? "text/javascript; charset=utf-8" : "text/css; charset=utf-8");
+        response.setHeader("Cache-Control", "no-cache");
+
+        if (etag !== undefined) {
+            response.setHeader("ETag", etag);
+
+            // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- `headers` is typed required but partial/mocked requests omit it
+            if (headerValue(request.headers?.["if-none-match"]) === etag.toLowerCase()) {
+                response.statusCode = 304;
+                response.end();
+
+                return;
+            }
+        }
+
+        if (isStyle) {
+            sendOk(response, assets.styles, "text/css; charset=utf-8");
+
+            return;
+        }
+
+        // `.js` / `.js.map` under the mount: serve the request's basename from the
+        // standalone directory. `readStandaloneAsset` is path-traversal-safe (lone
+        // filenames only), so `/__lunora/../../etc/passwd` can't escape it; an
+        // unknown name answers 404 rather than the SPA document (which would hand a
+        // module request an HTML body).
+        const bytes = readStandaloneAsset(fileName);
+
+        if (bytes === undefined) {
+            response.statusCode = 404;
+            response.setHeader("Content-Type", "text/plain");
+            response.end("Not found");
+
+            return;
+        }
+
+        sendOk(response, bytes, assetContentType(fileName));
     };
 
     return (request: IncomingMessage, response: ServerResponse, next: () => void): void => {
@@ -331,11 +390,14 @@ const createStudioHandler = (
             return;
         }
 
-        // Static assets are exact paths; every other route under the mount is an
-        // SPA route and gets the history fallback (the document) below, so a hard
-        // load of a deep link like `/__lunora/data` boots the router there.
-        if (pathname === STUDIO_SCRIPT_PATH || pathname === STUDIO_STYLE_PATH) {
-            serveStaticAsset(pathname, response);
+        // Static assets: the stylesheet plus every `.js` / `.js.map` under the
+        // mount — the `studio.js` entry and its code-split `chunk-*.js` siblings
+        // (an unknown module name 404s inside `serveStaticAsset`). Every other
+        // route under the mount is an SPA route and gets the history fallback (the
+        // document) below, so a hard load of a deep link like `/__lunora/data`
+        // boots the router there.
+        if (pathname === STUDIO_STYLE_PATH || isStandaloneModulePath(pathname)) {
+            serveStaticAsset(pathname, request, response);
 
             return;
         }

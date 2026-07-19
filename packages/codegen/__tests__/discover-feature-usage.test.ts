@@ -11,9 +11,12 @@ import { buildStudioFeatures, discoverFeatureUsage } from "../src/discover-featu
 let workdir: string;
 
 const ALL_OFF: FeatureUsage = {
+    access: false,
     ai: false,
     analytics: false,
     browser: false,
+    container: false,
+    flags: false,
     hyperdrive: false,
     images: false,
     kv: false,
@@ -25,9 +28,11 @@ const ALL_OFF: FeatureUsage = {
     storage: false,
     vectors: false,
     workflows: false,
+    x402: false,
 };
 
 const NO_SIGNALS = {
+    containerCount: 0,
     cronCount: 0,
     dependencies: new Set<string>(),
     queueCount: 0,
@@ -94,6 +99,22 @@ describe("discover-feature-usage", () => {
         expect(reverse.payments).toBe(true);
     });
 
+    it("detects the x402 pay rail via the `@lunora/x402/pay` import or a `ctx.x402` read", () => {
+        expect.assertions(2);
+
+        // The pay rail is an opt-in add-on subpath, so the exact `@lunora/x402/pay`
+        // specifier flips it (the charge rail lives on `/charge` and does not wire ctx).
+        writeSource("buy.ts", `import { createX402Pay } from "@lunora/x402/pay";\nexport const p = () => createX402Pay({}, {});`);
+        const viaImport = discoverFeatureUsage(newProject(), workdir);
+
+        rmSync(join(workdir, "buy.ts"));
+        writeSource("pay.ts", `export const fetchPaid = async (ctx) => ctx.x402.fetch("https://api.example/paid");`);
+        const viaContext = discoverFeatureUsage(newProject(), workdir);
+
+        expect(viaImport.x402).toBe(true);
+        expect(viaContext.x402).toBe(true);
+    });
+
     it("detects the new Cloudflare-capability features via import or the `ctx.*` helper", () => {
         expect.assertions(12);
 
@@ -136,6 +157,41 @@ describe("discover-feature-usage", () => {
         expect(viaCtx.pipelines).toBe(true);
     });
 
+    it("detects ctx.access via a `ctx.access` read or a bare `@lunora/cloudflare-access` import", () => {
+        expect.assertions(3);
+
+        writeSource("who.ts", `export const whoAmI = async (ctx) => ctx.access.email;`);
+        const viaContext = discoverFeatureUsage(newProject(), workdir);
+
+        rmSync(join(workdir, "who.ts"));
+        writeSource("res.ts", `import { createAccessResolver } from "@lunora/cloudflare-access";\nexport const r = () => createAccessResolver({});`);
+        const viaImport = discoverFeatureUsage(newProject(), workdir);
+
+        // The `accessContext()` middleware imports the `/context` subpath, NOT the
+        // bare specifier — so it must NOT trip the global-wiring probe.
+        rmSync(join(workdir, "res.ts"));
+        writeSource("mw.ts", `import { accessContext } from "@lunora/cloudflare-access/context";\nexport const q = accessContext();`);
+        const viaMiddleware = discoverFeatureUsage(newProject(), workdir);
+
+        expect(viaContext.access).toBe(true);
+        expect(viaImport.access).toBe(true);
+        expect(viaMiddleware.access).toBe(false);
+    });
+
+    it("detects flags via either the `@lunora/flags` import or a `ctx.flags` read", () => {
+        expect.assertions(2);
+
+        writeSource("flags.ts", `import { defineFlags } from "@lunora/flags";\nexport default defineFlags({ provider: () => ({}) });`);
+        const viaImport = discoverFeatureUsage(newProject(), workdir);
+
+        rmSync(join(workdir, "flags.ts"));
+        writeSource("gate.ts", `export const list = async (ctx) => ctx.flags.boolean("x", false);`);
+        const viaContext = discoverFeatureUsage(newProject(), workdir);
+
+        expect(viaImport.flags).toBe(true);
+        expect(viaContext.flags).toBe(true);
+    });
+
     it("flips a flag on a `ctx.*` helper read even without the package import", () => {
         expect.assertions(2);
 
@@ -154,6 +210,35 @@ describe("discover-feature-usage", () => {
         writeSource("upload.ts", `export const put = async (ctx) => {\n  const { storage } = ctx;\n  return storage.put("k", new Blob());\n};`);
 
         expect(discoverFeatureUsage(newProject(), workdir).storage).toBe(true);
+    });
+
+    it("detects a `ctx.*` helper destructured under a local alias (matches the source property, not the alias)", () => {
+        expect.assertions(1);
+
+        // The source property (`storage`) is what identifies the feature, even when
+        // bound to a differently-named local (`bucket`) — the probe keys off the
+        // property name, not the binding.
+        writeSource("upload.ts", `export const put = async (ctx) => {\n  const { storage: bucket } = ctx;\n  return bucket.put("k", new Blob());\n};`);
+
+        expect(discoverFeatureUsage(newProject(), workdir).storage).toBe(true);
+    });
+
+    it("detects containers via either the `@lunora/container` import or a `ctx.containers` read", () => {
+        expect.assertions(2);
+
+        // `lunora/containers.ts` importing `defineContainer` from `@lunora/container`.
+        writeSource(
+            "containers.ts",
+            `import { defineContainer } from "@lunora/container";\nexport const transcoder = defineContainer({ image: "./Dockerfile" });`,
+        );
+        const viaImport = discoverFeatureUsage(newProject(), workdir);
+
+        rmSync(join(workdir, "containers.ts"));
+        writeSource("proxy.ts", `export const scale = async (ctx) => ctx.containers.get("transcoder");`);
+        const viaContext = discoverFeatureUsage(newProject(), workdir);
+
+        expect(viaImport.container).toBe(true);
+        expect(viaContext.container).toBe(true);
     });
 
     it("detects scheduler via either the package import or `ctx.scheduler`", () => {
@@ -185,6 +270,11 @@ describe("discover-feature-usage", () => {
             expect.assertions(1);
 
             expect(buildStudioFeatures(ALL_OFF, NO_SIGNALS)).toStrictEqual({
+                analytics: false,
+                auth: false,
+                containers: false,
+                flags: false,
+                kv: false,
                 mail: false,
                 payments: false,
                 queues: false,
@@ -205,6 +295,7 @@ describe("discover-feature-usage", () => {
             expect.assertions(4);
 
             const result = buildStudioFeatures(ALL_OFF, {
+                containerCount: 0,
                 cronCount: 1,
                 dependencies: new Set<string>(),
                 queueCount: 0,
@@ -229,6 +320,22 @@ describe("discover-feature-usage", () => {
             const result = buildStudioFeatures(ALL_OFF, { ...NO_SIGNALS, dependencies: new Set(["@lunora/mail", "@lunora/payment"]) });
 
             expect(result).toMatchObject({ mail: true, payments: true });
+        });
+
+        it("shows the containers page from code usage, a declared container, or an @lunora/container dependency", () => {
+            expect.assertions(3);
+
+            expect(buildStudioFeatures({ ...ALL_OFF, container: true }, NO_SIGNALS).containers).toBe(true);
+            expect(buildStudioFeatures(ALL_OFF, { ...NO_SIGNALS, containerCount: 1 }).containers).toBe(true);
+            expect(buildStudioFeatures(ALL_OFF, { ...NO_SIGNALS, dependencies: new Set(["@lunora/container"]) }).containers).toBe(true);
+        });
+
+        it("shows the flags page from a ctx.flags read or an @lunora/flags dependency", () => {
+            expect.assertions(3);
+
+            expect(buildStudioFeatures(ALL_OFF, NO_SIGNALS).flags).toBe(false);
+            expect(buildStudioFeatures({ ...ALL_OFF, flags: true }, NO_SIGNALS).flags).toBe(true);
+            expect(buildStudioFeatures(ALL_OFF, { ...NO_SIGNALS, dependencies: new Set(["@lunora/flags"]) }).flags).toBe(true);
         });
     });
 });

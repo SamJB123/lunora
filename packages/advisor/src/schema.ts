@@ -8,6 +8,15 @@ import type { Schema } from "@lunora/server";
  * read — tables, their columns, indexes, and relations.
  */
 export interface AdvisorSchema {
+    /**
+     * Set when the schema opted into `.rls("required")` — every table's `ctx.db`
+     * write path is denied without an RLS-covering procedure UNLESS the table
+     * itself is `.public()` (see {@link AdvisorTable.isPublic}). `undefined` when
+     * the schema never called `.rls("required")`. Read by the
+     * `public_table_rls_optout_confusion` and `allow_unauthenticated_shard_access_enabled`
+     * lints.
+     */
+    rlsMode?: "required";
     tables: ReadonlyArray<AdvisorTable>;
 }
 
@@ -22,6 +31,15 @@ export interface AdvisorTable {
     externallyManaged?: boolean;
 
     /**
+     * Set when the table was declared with `.source(...)` (plan 077) —
+     * materialized from an external Hyperdrive-backed database. Read by the
+     * `external_source_*` lints to enforce the tenant-scope boundary (mandatory
+     * `tenantBy` under `.shardBy()`) and reject sourcing a `.global()` table.
+     * Optional — feeders that don't know about sourced tables omit it.
+     */
+    externalSource?: AdvisorExternalSource;
+
+    /**
      * Declared column names (the `defineTable({...})` keys). Excludes the
      * framework-managed system fields `_id` / `_creationTime`, which every table
      * has implicitly — lints that resolve a column treat those as always valid.
@@ -29,6 +47,16 @@ export interface AdvisorTable {
     fields: ReadonlyArray<string>;
     /** Every declared index, across all kinds (secondary / search / rank / vector). */
     indexes: ReadonlyArray<AdvisorIndex>;
+
+    /**
+     * `true` when the table was declared with `.public()` — an explicit opt-OUT
+     * of the schema's `.rls("required")` enforcement for this one table (the
+     * name is misleading: it means "unprotected by RLS", not "safe to read
+     * publicly"). Has no effect when the schema itself never required RLS.
+     * Defaults to `false`. Read by `public_table_rls_optout_confusion` and
+     * `allow_unauthenticated_shard_access_enabled`.
+     */
+    isPublic?: boolean;
     /** Table name. */
     name: string;
 
@@ -44,6 +72,27 @@ export interface AdvisorTable {
     optionalFields?: ReadonlySet<string>;
     /** Declared relations (`.relations((r) => …)`). */
     relations: ReadonlyArray<AdvisorRelation>;
+
+    /**
+     * Storage tier the table is declared in: `"global"` (a `.global()` table,
+     * lives in D1 — the cross-shard tier), `"shardBy"` (partitioned across
+     * shard DOs by a key), or `"root"` (the default single-DO table). Read by
+     * the `shape_*` lints to flag replication shapes targeting a `.global()`
+     * table (poll-refreshed/latency-tiered, not poke-live). Optional — the
+     * codegen feeder always supplies it, the runtime feeder derives it; a feeder
+     * that omits it leaves tier-sensitive lints to treat the table as local.
+     */
+    shardKind?: "global" | "root" | "shardBy";
+
+    /**
+     * Set when the table opted into `.softDelete()` — the marker column
+     * (`field`, default `deletedAt`) whose presence excludes a row from list
+     * reads unless `includeDeleted: true` is passed. Read by
+     * `soft_delete_include_deleted_from_args` to confirm a read's target actually
+     * soft-deletes before flagging an `includeDeleted` toggle on a public read.
+     * Optional — a feeder that doesn't track soft-delete omits it.
+     */
+    softDelete?: { field: string };
 }
 
 /**
@@ -60,6 +109,25 @@ export interface AdvisorIndex {
     kind: "index" | "rank" | "search" | "vector";
     name: string;
     unique?: boolean;
+}
+
+/** The statically-knowable `.source(...)` bits the `external_source_*` lints read. */
+export interface AdvisorExternalSource {
+    /** `true` when a `reconcileEveryMs` was given — one incremental delete-visibility path the `external_source_incremental_no_delete_path` lint accepts. */
+    hasReconcile?: boolean;
+    /** `true` when a `softDeleteColumn` was given — the other incremental delete-visibility path. */
+    hasSoftDelete?: boolean;
+    /** `true` when a `tenantBy` mapper was given — the tenant-isolation boundary. */
+    hasTenantBy: boolean;
+    /** Delete-detection mode literal, when given (`"full-pull"` or `"incremental"`). */
+    mode?: string;
+
+    /**
+     * `true` when `.source(...)` was declared but its config wasn't a static object
+     * literal, so `hasTenantBy` (and the rest) couldn't be read. Only the codegen
+     * feeder can hit this; the runtime feeder always holds the real config.
+     */
+    unanalyzable?: boolean;
 }
 
 /**
@@ -86,6 +154,7 @@ export interface AdvisorRelation {
  */
 export const fromServerSchema = (schema: Schema): AdvisorSchema => {
     return {
+        rlsMode: schema.rlsMode,
         tables: Object.entries(schema.tables).map(([name, table]) => {
             const indexes: AdvisorIndex[] = [
                 ...table.indexes.map((index): AdvisorIndex => {
@@ -126,10 +195,21 @@ export const fromServerSchema = (schema: Schema): AdvisorSchema => {
 
             return {
                 externallyManaged: table.isExternallyManaged ?? false,
+                externalSource: table.externalSource
+                    ? {
+                          hasReconcile: table.externalSource.reconcileEveryMs !== undefined,
+                          hasSoftDelete: table.externalSource.softDeleteColumn !== undefined,
+                          hasTenantBy: table.externalSource.tenantBy !== undefined,
+                          mode: table.externalSource.mode,
+                      }
+                    : undefined,
                 fields: Object.keys(table.shape),
                 indexes,
+                isPublic: table.isPublic ?? false,
                 name,
                 optionalFields,
+                shardKind: table.shardMode.kind,
+                softDelete: table.softDeleteMode,
                 relations: Object.entries(table.relationMap).map(([accessor, relation]) => {
                     return {
                         field: relation.field,

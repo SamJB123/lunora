@@ -1,41 +1,8 @@
-import applyJurisdiction from "./jurisdiction";
-import type { ArgsOf, FunctionReference, LunoraSchedulerOptions, RunOptions, Scheduler, ScheduleRecord } from "./types";
+import { LunoraError } from "@lunora/errors";
 
-const schedulerStub = (options: LunoraSchedulerOptions) => {
-    const namespace = applyJurisdiction(options.namespace, options.jurisdiction);
-
-    return namespace.get(namespace.idFromName(options.instanceName ?? "default"));
-};
-
-const callDO = async <T>(options: LunoraSchedulerOptions, path: string, body: unknown): Promise<T> => {
-    const stub = schedulerStub(options);
-    const response = await stub.fetch(`https://scheduler.internal${path}`, {
-        body: JSON.stringify(body),
-        headers: { "content-type": "application/json" },
-        method: "POST",
-    });
-
-    if (!response.ok) {
-        const text = await response.text();
-
-        throw new Error(`@lunora/scheduler: SchedulerDO ${path} failed (${String(response.status)}): ${text}`);
-    }
-
-    return await response.json();
-};
-
-const getDO = async <T>(options: LunoraSchedulerOptions, path: string): Promise<T> => {
-    const stub = schedulerStub(options);
-    const response = await stub.fetch(`https://scheduler.internal${path}`, { method: "GET" });
-
-    if (!response.ok) {
-        const text = await response.text();
-
-        throw new Error(`@lunora/scheduler: SchedulerDO ${path} failed (${String(response.status)}): ${text}`);
-    }
-
-    return await response.json();
-};
+import { callDO, getDO } from "./do-client";
+import type { CronTarget, LunoraSchedulerOptions, RunOptions, Scheduler, ScheduleRecord, ScheduleTargetArgs } from "./types";
+import { isWorkflowReference } from "./types";
 
 /**
  * Client-side scheduler — forwards `runAfter` / `runAt` / `cancel` calls to a
@@ -47,46 +14,66 @@ const createScheduler = (options: LunoraSchedulerOptions): Scheduler => {
     // (exercised by createScheduler({} as never) in the tests).
     // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- guards untrusted JS callers despite the required type
     if (!options.namespace) {
-        throw new Error("@lunora/scheduler: `namespace` (SchedulerDO binding) is required");
+        throw new LunoraError("INTERNAL", "@lunora/scheduler: `namespace` (SchedulerDO binding) is required");
     }
 
     if (!options.originUrl) {
-        throw new Error("@lunora/scheduler: `originUrl` is required so the DO can dispatch back to the Worker");
+        throw new LunoraError("INTERNAL", "@lunora/scheduler: `originUrl` is required so the DO can dispatch back to the Worker");
     }
 
-    const runAt = async <F extends FunctionReference>(
+    const runAt = async <T extends CronTarget>(
         date: Date | number,
-        function_: F,
-        args: ArgsOf<F>,
+        target: T,
+        args: ScheduleTargetArgs<T>,
         options_: RunOptions = {},
     ): Promise<{ id: string; scheduledFor: number }> => {
         const scheduledFor = date instanceof Date ? date.getTime() : date;
 
-        return callDO<{ id: string; scheduledFor: number }>(options, "/schedule", {
+        // Shared envelope; the target-specific field (`functionPath` xor
+        // `workflow`) is merged in below. Optional workpool / retry-policy
+        // passthrough is absent for ordinary calls, keeping the wire payload (and
+        // the DO's behaviour) identical to before this feature.
+        const base = {
             args,
-            functionPath: function_.__lunoraRef,
             originUrl: options.originUrl,
-            // Optional workpool / retry-policy passthrough. Absent for ordinary
-            // `runAfter`/`runAt` calls, which keeps the wire payload (and the
-            // DO's behaviour) identical to before this feature.
             pool: options_.pool,
             retry: options_.retry,
             scheduledFor,
             shardKey: options_.shardKey,
-        });
+        };
+
+        if (isWorkflowReference(target)) {
+            // A workflow/agent target starts a fresh durable instance on fire; carry
+            // its `WORKFLOW_*`/`AGENT_*` binding so the runtime can `create()` it.
+            if (typeof target.binding !== "string" || target.binding.length === 0) {
+                throw new LunoraError(
+                    "INTERNAL",
+                    "@lunora/scheduler: workflow/agent schedule target is missing its `binding` — pass the generated `workflows.<name>` / `agents.<name>` reference",
+                );
+            }
+
+            return callDO<{ id: string; scheduledFor: number }>(options, "/schedule", { ...base, workflow: target.binding });
+        }
+
+        // A bare string reaches here via the public string-typed `ctx.scheduler`
+        // surface (`createScheduler(...) as SchedulerLike`); a FunctionReference
+        // carries the path under `__lunoraRef`.
+        const functionPath = typeof (target as unknown) === "string" ? (target as unknown as string) : target.__lunoraRef;
+
+        return callDO<{ id: string; scheduledFor: number }>(options, "/schedule", { ...base, functionPath });
     };
 
-    const runAfter = async <F extends FunctionReference>(
+    const runAfter = async <T extends CronTarget>(
         delayMs: number,
-        function_: F,
-        args: ArgsOf<F>,
+        target: T,
+        args: ScheduleTargetArgs<T>,
         options_: RunOptions = {},
     ): Promise<{ id: string; scheduledFor: number }> => {
         if (!Number.isFinite(delayMs) || delayMs < 0) {
-            throw new Error("@lunora/scheduler: `delayMs` must be a non-negative finite number");
+            throw new LunoraError("INTERNAL", "@lunora/scheduler: `delayMs` must be a non-negative finite number");
         }
 
-        return runAt(Date.now() + delayMs, function_, args, options_);
+        return runAt(Date.now() + delayMs, target, args, options_);
     };
 
     const cancel = async (id: string): Promise<{ cancelled: boolean }> => callDO<{ cancelled: boolean }>(options, "/cancel", { id });

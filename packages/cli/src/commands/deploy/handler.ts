@@ -14,6 +14,8 @@ import {
     readLinkedProject,
     readWranglerJsonc,
     reconcileWranglerBindings,
+    reconcileWranglerCompatibilityDate,
+    reconcileWranglerCrons,
     requiredSecrets,
 } from "@lunora/config";
 import { join } from "@visulima/path";
@@ -26,6 +28,7 @@ import { autoLinkFromDeployOutput } from "../../util/auto-link";
 import type { CommandHandler } from "../../util/command";
 import { defineHandler } from "../../util/command";
 import { renderDeploySummary } from "../../util/deploy-summary";
+import { detectPackageManager, execArgsFor } from "../../util/detect-package-manager";
 import type { DockerProbe } from "../../util/docker";
 import { isDockerAvailable } from "../../util/docker";
 import type { Logger } from "../../util/logger";
@@ -335,7 +338,7 @@ const buildContainerImages = async (cwd: string, options: DeployCommandOptions):
  * best-effort: a failure here must not abort the deploy, since the validator
  * still reports any genuinely missing requirement.
  */
-const provisionBindings = async (cwd: string, logger: Logger): Promise<void> => {
+const provisionBindings = async (cwd: string, logger: Logger, cronTriggers: ReadonlyArray<string> = []): Promise<void> => {
     try {
         const inferred = await inferLunoraBindings({ projectRoot: cwd });
         const reconciled = reconcileWranglerBindings(cwd, inferred);
@@ -351,6 +354,32 @@ const provisionBindings = async (cwd: string, logger: Logger): Promise<void> => 
         const message = error instanceof Error ? error.message : String(error);
 
         logger.warn(`binding inference skipped: ${message}`);
+    }
+
+    try {
+        const reconciled = reconcileWranglerCompatibilityDate(cwd);
+
+        if (reconciled.changed) {
+            logger.success(
+                `bumped compatibility_date to ${reconciled.date ?? "unknown"} (Workers Cache enabled) → ${reconciled.wranglerPath ?? "wrangler.jsonc"}`,
+            );
+        }
+    } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+
+        logger.warn(`compatibility date sync skipped: ${message}`);
+    }
+
+    try {
+        const reconciled = reconcileWranglerCrons(cwd, cronTriggers);
+
+        if (reconciled.changed) {
+            logger.success(`synced ${String(cronTriggers.length)} cron trigger(s) → ${reconciled.wranglerPath ?? "wrangler.jsonc"}`);
+        }
+    } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+
+        logger.warn(`cron trigger sync skipped: ${message}`);
     }
 };
 
@@ -430,10 +459,11 @@ const resolveRequiredSecretKeys = async (cwd: string): Promise<string[]> => {
 const pushMintableSecrets = async (cwd: string, options: DeployCommandOptions, keys: ReadonlyArray<string>): Promise<boolean> => {
     const { logger } = options;
     const spawner = options.spawner ?? defaultSpawner;
+    const manager = detectPackageManager(cwd);
     const environmentFlag = options.env === undefined ? "" : ` --env ${options.env}`;
 
     for (const key of keys) {
-        const args = ["exec", "wrangler", "secret", "put", key];
+        const args = ["secret", "put", key];
 
         if (options.env !== undefined) {
             args.push("--env", options.env);
@@ -443,10 +473,12 @@ const pushMintableSecrets = async (cwd: string, options: DeployCommandOptions, k
             args.push("--temporary");
         }
 
+        const exec = execArgsFor(manager, "wrangler", args);
+
         // `wrangler secret put <name>` reads the value from stdin, so the generated
         // secret never lands on the command line, in env, or in shell history.
         // eslint-disable-next-line no-await-in-loop -- push sequentially so a failure aborts before the rest.
-        const pushResult = await spawner({ args, command: "pnpm", cwd, input: generateSecretValue() });
+        const pushResult = await spawner({ args: exec.args, command: exec.command, cwd, input: generateSecretValue() });
 
         if (pushResult.code !== 0) {
             logger.error(
@@ -822,14 +854,16 @@ const runPreDeployGates = async (cwd: string, options: DeployCommandOptions): Pr
 };
 
 /**
- * Assemble the `pnpm exec wrangler deploy …` argv: the class-B composed-entry
- * positional (when present), `--env`, and `--dry-run`. Extracted from
- * {@link executeDeploy} to keep its cognitive complexity within budget.
+ * Assemble the `wrangler deploy …` argv (the wrangler subcommand + flags): the
+ * class-B composed-entry positional (when present), `--env`, and `--dry-run`.
+ * The package-manager launcher (`pnpm exec` / `npx --` / …) is prepended by the
+ * caller via {@link execArgsFor}. Extracted from {@link executeDeploy} to keep
+ * its cognitive complexity within budget.
  */
 const buildWranglerDeployArgs = (cwd: string, options: DeployCommandOptions): string[] => {
     // `--preview` uploads a new Version (with a preview URL) instead of going
     // live, so production traffic is untouched.
-    const args = options.preview ? ["exec", "wrangler", "versions", "upload"] : ["exec", "wrangler", "deploy"];
+    const args = options.preview ? ["versions", "upload"] : ["deploy"];
 
     // Class-B composition: bundle the `src/worker.ts` wrapper (which the
     // framework's CF adapter can't clobber) instead of the adapter-owned `main`.
@@ -938,7 +972,7 @@ const executeDeploy = async (options: DeployCommandOptions): Promise<DeployComma
         reblessSchemaBaseline = gate.rebless;
     }
 
-    await provisionBindings(cwd, options.logger);
+    await provisionBindings(cwd, options.logger, codegen?.cronTriggers ?? []);
 
     const migratePreflightError = validateMigrateDeployPreflight(options);
 
@@ -984,10 +1018,11 @@ const executeDeploy = async (options: DeployCommandOptions): Promise<DeployComma
     // existing links are never clobbered and subsequent deploys keep full TTY output.
     const shouldAutoLink = !isJsonFormat(options.format) && options.dryRun !== true && options.preview !== true && readLinkedProject(cwd) === undefined;
 
+    const exec = execArgsFor(detectPackageManager(cwd), "wrangler", buildWranglerDeployArgs(cwd, options));
     const descriptor: SpawnDescriptor = {
-        args: buildWranglerDeployArgs(cwd, options),
+        args: exec.args,
         captureStdout: shouldAutoLink,
-        command: "pnpm",
+        command: exec.command,
         cwd,
         // In `--format json` mode stdout is reserved for the single JSON document,
         // so route wrangler's progress + deployed-URL output to stderr instead.

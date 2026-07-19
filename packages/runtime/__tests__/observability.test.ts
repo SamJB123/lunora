@@ -1,3 +1,4 @@
+import { LunoraError } from "@lunora/errors";
 import { beforeEach, describe, expect, it } from "vitest";
 
 import type { ExecutionContextLike } from "../src/create-worker";
@@ -180,7 +181,7 @@ describe("observabilitySink", () => {
             expect.assertions(1);
 
             const { events, sink } = collectEvents();
-            const worker = createWorker({ observability: sink, shardDO: shard.namespace });
+            const worker = createWorker({ allowUnauthenticatedShardAccess: true, observability: sink, shardDO: shard.namespace });
 
             await worker.fetch(
                 new Request("https://app.example/_lunora/rpc", {
@@ -251,7 +252,7 @@ describe("observabilitySink", () => {
 
             // Structural ConflictError shape (name/code/status) — mirrors what
             // `@lunora/do` throws without taking a runtime dependency on it.
-            const conflict = Object.assign(new Error("write conflict"), { code: "CONFLICT", name: "ConflictError", status: 409 });
+            const conflict = new LunoraError("CONFLICT", "write conflict", { name: "ConflictError", status: 409 });
 
             shard.throwOnFetch = conflict;
             const worker = createWorker({ observability: sink, shardDO: shard.namespace });
@@ -280,7 +281,12 @@ describe("observabilitySink", () => {
                     return { data: 42, errors: [], failed: 0, ok: 3 };
                 },
             } as unknown as QueryCoordinator;
-            const worker = createWorker({ observability: sink, queryCoordinator: coordinator, shardDO: shard.namespace });
+            const worker = createWorker({
+                allowUnauthenticatedShardAccess: true,
+                observability: sink,
+                queryCoordinator: coordinator,
+                shardDO: shard.namespace,
+            });
 
             const response = await worker.fetch(
                 new Request("https://app.example/_lunora/rpc", {

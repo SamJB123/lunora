@@ -1,6 +1,6 @@
 {
     "name": "@lunora/mcp",
-    "version": "1.0.0-alpha.3",
+    "version": "1.0.0-alpha.26",
     "description": "Model Context Protocol server exposing a Lunora deployment to AI agents",
     "keywords": [
         "ai-agents",
@@ -53,8 +53,8 @@
         "build:prod": "packem build --production",
         "lint:eslint": "eslint .",
         "lint:eslint:fix": "eslint . --fix",
-        "lint:prettier": "prettier --check .",
-        "lint:prettier:fix": "prettier --write .",
+        "lint:prettier": "prettier --check . --ignore-path ../../.prettierignore",
+        "lint:prettier:fix": "prettier --write . --ignore-path ../../.prettierignore",
         "lint:types": "tsc --noEmit",
         "test": "vitest run",
         "test:coverage": "vitest run --coverage",
@@ -63,7 +63,9 @@
         "fallow:health": "fallow health --score"
     },
     "dependencies": {
-        "@lunora/client": "1.0.0-alpha.3",
+        "@lunora/client": "1.0.0-alpha.24",
+        "@lunora/errors": "1.0.0-alpha.5",
+        "@lunora/x402": "1.0.0-alpha.4",
         "@modelcontextprotocol/sdk": "catalog:mcp"
     },
     "devDependencies": {

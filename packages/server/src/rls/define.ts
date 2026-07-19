@@ -5,6 +5,8 @@
  * additionally validates the set (duplicate detection). The runtime work happens
  * in {@link ./middleware}.
  */
+import { LunoraError } from "@lunora/errors";
+
 import type { DefinePolicyInput, Permission, Policy, Role, TypedDefinePolicyInput } from "./types";
 
 export const definePolicy = <Context = unknown>(input: DefinePolicyInput<Context>): Policy<Context> => {
@@ -23,9 +25,12 @@ export const definePolicy = <Context = unknown>(input: DefinePolicyInput<Context
  * discovered identically by the `rls()` chain.
  */
 export const createPolicyDsl =
-    <DM, REL extends Record<keyof DM, object>>() =>
-    <T extends keyof DM, Context = unknown>(input: TypedDefinePolicyInput<DM, REL, T, Context>): Policy<Context> => {
-        return { on: input.on, table: input.table as string, when: input.when };
+    <DM, REL extends Record<keyof DM, object>, Identity = Record<string, unknown>>() =>
+    <T extends keyof DM, Context = unknown>(input: TypedDefinePolicyInput<DM, REL, T, Context, Identity>): Policy<Context> => {
+        // `when`'s identity param is erased at the stored-policy boundary (the
+        // middleware builds `PolicyContext` from the request); the narrowed
+        // `Identity` is a compile-time-only authoring aid, like `table as string`.
+        return { on: input.on, table: input.table as string, when: input.when as Policy<Context>["when"] };
     };
 
 /**
@@ -65,7 +70,8 @@ export const definePolicies = <Context = unknown>(policies: ReadonlyArray<Policy
         const whens = seenWhenByKey.get(key) ?? new Set<Policy<Context>["when"]>();
 
         if (whens.has(policy.when)) {
-            throw new Error(
+            throw new LunoraError(
+                "INTERNAL",
                 `definePolicies: duplicate policy for (table "${policy.table}", on "${policy.on}") — the same decision function is registered more than once. ` +
                     "Multiple distinct policies per (table, on) are allowed (reads OR, writes AND); remove the duplicate.",
             );

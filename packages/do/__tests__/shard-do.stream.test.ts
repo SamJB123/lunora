@@ -1,5 +1,7 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { LunoraError } from "@lunora/errors";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { encodeWire } from "../../../shared/wire-codec";
 import type { ShardDOState } from "../src/shard-do";
 import { ShardDO } from "../src/shard-do";
 import type { SocketAttachment, SubscriptionEnvelope } from "../src/types";
@@ -149,6 +151,32 @@ describe("shardDO streaming queries", () => {
         expect(frames.filter((f) => f.type === "chunk").map((f) => f.data)).toEqual([{ tick: 1 }, { tick: 2 }, { tick: 3 }]);
     });
 
+    it("decodes wire-encoded stream args so bigint/bytes reach the handler", async () => {
+        expect.assertions(2);
+
+        const shard = new StreamShard(state, {});
+        let received: Record<string, unknown> | undefined;
+
+        shard.registered.set("metrics:echo", async function* echoGen(args) {
+            received = args;
+            yield { ok: true };
+        });
+
+        const ws = createFakeWebSocket();
+
+        shard.registerSocket(ws, { subs: {} });
+        // The client wire-encodes stream args before the WS send (raw JSON.stringify
+        // throws on a bigint); the DO must decodeWire them before invoking the
+        // handler — mirroring the /rpc path.
+        const args = encodeWire({ cursor: 42n, seed: new Uint8Array([9, 8, 7]) }) as Record<string, unknown>;
+
+        await shard.driveMessage(ws, { id: "stream_echo", query: { args, functionPath: "metrics:echo" }, type: "stream" });
+        await waitForTerminator(ws);
+
+        expect(received?.cursor).toBe(42n);
+        expect([...(received?.seed as Uint8Array)]).toEqual([9, 8, 7]);
+    });
+
     it("client unsubscribe mid-stream aborts the iterator and stops further chunks", async () => {
         expect.assertions(3);
 
@@ -268,7 +296,10 @@ describe("shardDO streaming queries", () => {
 
         shard.registered.set("metrics:boom", async function* boomGen() {
             yield 1;
-            throw Object.assign(new Error("kaboom"), { code: "FORBIDDEN" });
+            // A full LunoraError shape (code + numeric status) is the developer-facing
+            // error the redaction gate echoes; a code-only value would (correctly) be
+            // redacted now, since a bare `.code` also rides Node errors like `ENOENT`.
+            throw new LunoraError("FORBIDDEN", "kaboom", { status: 403 });
         });
 
         const ws = createFakeWebSocket();
@@ -284,5 +315,38 @@ describe("shardDO streaming queries", () => {
         expect((errorFrame?.error as { code?: string; message?: string })?.code).toBe("FORBIDDEN");
         expect((errorFrame?.error as { code?: string; message?: string })?.message).toBe("kaboom");
         expect(frames.filter((f) => f.type === "complete")).toHaveLength(0);
+    });
+
+    it("redacts a bare (codeless) handler throw from the stream error frame", async () => {
+        expect.assertions(4);
+
+        const shard = new StreamShard(state, {});
+        const sensitive = "SELECT secret_token FROM users WHERE id = 42";
+
+        shard.registered.set("metrics:leak", async function* leakGen() {
+            yield 1;
+            // A plain Error with no `code` is the generic catch-all — its message
+            // may carry SQL / internal identifiers and must be redacted.
+            throw new Error(sensitive);
+        });
+
+        const ws = createFakeWebSocket();
+        const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+        shard.registerSocket(ws, { subs: {} });
+        await shard.driveMessage(ws, { id: "stream_7", query: { functionPath: "metrics:leak" }, type: "stream" });
+        await waitForTerminator(ws);
+
+        const frames = parseFrames(ws);
+        const errorFrame = frames.find((f) => f.type === "error");
+
+        expect(errorFrame).toBeDefined();
+        // The raw message must not leak; the code falls back to the generic code.
+        expect((errorFrame?.error as { code?: string; message?: string })?.code).toBe("INTERNAL_SERVER_ERROR");
+        expect((errorFrame?.error as { code?: string; message?: string })?.message).toBe("internal error");
+        // ...but it is logged server-side for diagnosis.
+        expect(errorSpy).toHaveBeenCalledWith("[@lunora/do] unhandled stream error:", expect.anything());
+
+        errorSpy.mockRestore();
     });
 });

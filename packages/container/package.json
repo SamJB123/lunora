@@ -1,6 +1,6 @@
 {
     "name": "@lunora/container",
-    "version": "1.0.0-alpha.4",
+    "version": "1.0.0-alpha.12",
     "description": "Cloudflare Containers for Lunora: defineContainer, generated Container DO classes, and the ctx.containers action surface",
     "keywords": [
         "cloudflare",
@@ -46,6 +46,10 @@
             "types": "./dist/bridge.d.ts",
             "import": "./dist/bridge.mjs"
         },
+        "./otel": {
+            "types": "./dist/otel.d.ts",
+            "import": "./dist/otel.mjs"
+        },
         "./package.json": "./package.json"
     },
     "publishConfig": {
@@ -56,8 +60,8 @@
         "build:prod": "pnpm exec packem build --production",
         "lint:eslint": "eslint .",
         "lint:eslint:fix": "eslint . --fix",
-        "lint:prettier": "prettier --check .",
-        "lint:prettier:fix": "prettier --write .",
+        "lint:prettier": "prettier --check . --ignore-path ../../.prettierignore",
+        "lint:prettier:fix": "prettier --write . --ignore-path ../../.prettierignore",
         "lint:types": "tsc --noEmit",
         "test": "vitest run",
         "test:coverage": "vitest run --coverage",
@@ -66,9 +70,11 @@
         "fallow:health": "fallow health --score"
     },
     "dependencies": {
-        "@cloudflare/containers": "catalog:cloudflare"
+        "@lunora/errors": "1.0.0-alpha.5"
     },
     "devDependencies": {
+        "@cloudflare/containers": "catalog:cloudflare",
+        "@cloudflare/vitest-pool-workers": "catalog:cloudflare",
         "@cloudflare/workers-types": "catalog:cloudflare",
         "@types/node": "catalog:types",
         "@visulima/packem": "catalog:build",
@@ -76,7 +82,8 @@
         "esbuild": "catalog:build",
         "fallow": "catalog:lint",
         "typescript": "catalog:tsc",
-        "vitest": "catalog:test"
+        "vitest": "catalog:test",
+        "wrangler": "catalog:cloudflare"
     },
     "engines": {
         "node": "^22.15.0 || >=24.11.0"

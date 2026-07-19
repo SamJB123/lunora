@@ -67,7 +67,6 @@ const usePaginatedCore = function <T>(
 
     const skipped = args === "skip";
     const baseArgs = skipped ? {} : args;
-    const baseArgsKey = JSON.stringify(baseArgs);
 
     const [, forceRender] = useReducer((tick: number) => tick + 1, 0);
     const [pages, setPages] = useState<Page[]>(() => initialPages(initialNumItems));
@@ -75,10 +74,19 @@ const usePaginatedCore = function <T>(
     // Reset to the first page whenever the query identity, base args, page size,
     // or shard changes. Set-state-during-render (guarded by a ref) is React's
     // sanctioned way to derive state from changing inputs without an extra commit.
-    const resetKey = `${function_.__lunoraRef}::${baseArgsKey}::${String(initialNumItems)}::${shardKey ?? ""}`;
+    //
+    // The identity half is built from `serializeQueryKey(lunoraQueryKey(...))`,
+    // the same stable encoder every query key/effect dep uses, rather than a raw
+    // `JSON.stringify(baseArgs)`: raw stringify is property-order-sensitive (so a
+    // conditional-spread arg object of identical content would falsely reset the
+    // feed to page one) and would collapse `shardKey: ""` with `shardKey:
+    // undefined` — which `lunoraQueryKey` keeps distinct (`""` vs `null`).
+    const resetKey = `${serializeQueryKey(lunoraQueryKey(function_, baseArgs, shardKey))}::${String(initialNumItems)}`;
     const resetKeyRef = useRef(resetKey);
 
+    // react-doctor-disable-next-line react-hooks-js/refs -- intentional: React's sanctioned "reset state when an input changes" pattern — compare a render-phase ref to the current reset key and set state during render, guarded so it runs once per change (see comment above).
     if (resetKeyRef.current !== resetKey) {
+        // react-doctor-disable-next-line react-hooks-js/refs -- intentional: writing the ref guard here is what makes the render-phase reset fire exactly once per input change (see above).
         resetKeyRef.current = resetKey;
         setPages(initialPages(initialNumItems));
     }
@@ -86,6 +94,7 @@ const usePaginatedCore = function <T>(
     // Build the (queryKey, args) pair for each loaded page. `cursor`/`endCursor`
     // carry the page's fixed `(lower, upper]` range so the client opens one
     // dedup'd subscription per range.
+    // react-doctor-disable-next-line react-doctor/no-event-handler -- false positive: `pageEntries` is derived render state (the per-page (queryKey, args) list), not a faked event handler; the attach effect below reads it via `desiredRef` and keys on `pageKeysHash`. No user event triggers this derivation.
     const pageEntries = pages.map((page) => {
         const pageArgs = { ...baseArgs, paginationOpts: { cursor: page.lower, endCursor: page.upper, numItems: page.numItems } };
         const key: QueryKey = lunoraQueryKey(function_, pageArgs, shardKey);
@@ -98,10 +107,15 @@ const usePaginatedCore = function <T>(
 
     // Read latest desired entries from a ref so the attach effect's dep list can
     // stay keyed on `pageKeysHash` alone — args/fn changes already move the hash.
-    const desiredRef = useRef<{ entries: typeof pageEntries; fn: FunctionReference; shardKey: string | undefined }>({ entries: [], fn: function_, shardKey });
+    const desiredRef = useRef<{ baseArgs: Record<string, unknown>; entries: typeof pageEntries; fn: FunctionReference; shardKey: string | undefined }>({
+        baseArgs,
+        entries: [],
+        fn: function_,
+        shardKey,
+    });
 
     useEffect(() => {
-        desiredRef.current = { entries: pageEntries, fn: function_, shardKey };
+        desiredRef.current = { baseArgs, entries: pageEntries, fn: function_, shardKey };
     });
 
     // Per-page detach handles so a page falling out of the request set releases
@@ -185,6 +199,7 @@ const usePaginatedCore = function <T>(
 
             detaches.set(hash, registry.attach(queryClient, entry.key, desired.fn, entry.args, desired.shardKey));
         }
+        // react-doctor-disable-next-line react-doctor/exhaustive-deps -- intentional: the attach effect re-runs only when the set of page keys (`pageKeysHash`), the client, or the skip flag changes. `detachesRef`/`desiredRef`/`queryClient` are stable refs read at run time; the latest fn/args/entries come from `desiredRef.current` (updated in a sibling effect). Client swaps are handled explicitly via `detachClientRef`.
     }, [client, queryClient, pageKeysHash, skipped]);
 
     // Release every page on unmount.
@@ -196,6 +211,7 @@ const usePaginatedCore = function <T>(
 
             detachesRef.current.clear();
         },
+        // react-doctor-disable-next-line react-doctor/exhaustive-deps -- intentional: unmount-only cleanup. `detachesRef` is a stable ref, so the empty dep array is correct — the teardown must run once on unmount, not every render.
         [],
     );
 
@@ -221,6 +237,7 @@ const usePaginatedCore = function <T>(
         });
 
         return unsubscribe;
+        // react-doctor-disable-next-line react-doctor/exhaustive-deps -- intentional: the cache subscription re-attaches only when `pageKeysHash` (or the stable `queryClient`) changes. The inner `pageEntries.some(...)` membership check reads this render's entries by closure, but the subscription itself must not re-attach every render — keying on the hash is the point.
     }, [queryClient, pageKeysHash]);
 
     const pageResults: (PaginationResult<T> | undefined)[] = skipped ? [] : pageEntries.map(({ key }) => queryClient.getQueryData<PaginationResult<T>>(key));
@@ -231,36 +248,52 @@ const usePaginatedCore = function <T>(
     // closes over this render's `pages` + `pageResults` directly — no render-phase
     // ref snapshot needed. `rebalance` applies one boundary edit per pass; the
     // resulting re-render drives the next until the layout is balanced.
+    // react-doctor-disable-next-line react-doctor/exhaustive-deps -- intentional: this SPLIT/JOIN maintenance effect deliberately runs every commit (no dep array) so it closes over the freshest `pages`/`pageResults`. `rebalance` applies at most one guarded boundary edit per pass, so the re-render chain converges instead of looping (see the block comment above).
     useEffect(() => {
         if (skipped) {
             return;
         }
 
+        // react-doctor-disable-next-line react-doctor/no-event-handler -- false positive: `rebalance` is a pure derivation over committed `pages`/`pageResults`, run post-commit to converge page sizes — not a side effect that belongs in a user event handler.
         const next = rebalance(pages, pageResults);
 
         if (next) {
+            // react-doctor-disable-next-line react-hooks-js/set-state-in-effect -- intentional: the guarded `setPages` applies one boundary edit per pass; the resulting re-render drives the next until the layout balances (see the block comment above). Convergent, not a cascading render.
             setPages(next);
         }
     });
 
-    const { nextCursor, status } = derivePaginationStatus(skipped, pageResults);
+    const { status } = derivePaginationStatus(skipped, pageResults);
 
-    const nextCursorRef = useRef<null | string | undefined>(undefined);
+    // react-doctor-disable-next-line react-doctor/react-compiler-no-manual-memoization -- load-bearing: the render-phase `resetKeyRef` read above bails React Compiler for this whole hook, so this `useCallback` is the only thing keeping `loadMore`'s identity stable for consumers. Keep it.
+    const loadMore = useCallback(
+        (numberItems: number) => {
+            setPages((current) => {
+                // Resolve the next-page cursor from COMMITTED state at call time —
+                // the authoritative `current` pages plus the live query cache —
+                // rather than a cursor snapshotted into a ref during render. A
+                // render-phase ref write can be left holding a value from an
+                // interrupted/discarded concurrent render, which `loadMore` (a
+                // user-triggered event handler) would then read; deriving here
+                // reads only state that actually committed. `fn`/`baseArgs`/
+                // `shardKey` come from the effect-updated `desiredRef` so the
+                // callback stays identity-stable.
+                const desired = desiredRef.current;
+                const results = current.map((page) => {
+                    const pageArgs = { ...desired.baseArgs, paginationOpts: { cursor: page.lower, endCursor: page.upper, numItems: page.numItems } };
 
-    // Sync the next-page cursor via an effect rather than a render-phase ref
-    // write (which trips React Compiler). It's read only inside the
-    // user-triggered `loadMore` below, so the post-commit value is always current
-    // by the time it fires — and `loadMore` keeps a stable identity.
-    useEffect(() => {
-        nextCursorRef.current = status === "CanLoadMore" ? nextCursor : undefined;
-    });
+                    return queryClient.getQueryData<PaginationResult<T>>(lunoraQueryKey(desired.fn, pageArgs, desired.shardKey));
+                });
 
-    const loadMore = useCallback((numberItems: number) => {
-        const cursor = nextCursorRef.current;
+                const { nextCursor, status: liveStatus } = derivePaginationStatus(false, results);
+                const cursor = liveStatus === "CanLoadMore" ? nextCursor : undefined;
 
-        // applyLoadMore returns undefined when cursor is invalid — no-op.
-        setPages((current) => applyLoadMore(current, cursor, numberItems) ?? current);
-    }, []);
+                // applyLoadMore returns undefined when cursor is invalid — no-op.
+                return applyLoadMore(current, cursor, numberItems) ?? current;
+            });
+        },
+        [queryClient],
+    );
 
     return { loadMore, pageResults, status };
 };

@@ -2,7 +2,7 @@ import type { ArgsOf, FunctionReference, LunoraClient, ReturnOf, Unsubscribe } f
 import type { Page, PaginationResult, PaginationStatus } from "@lunora/client/pagination";
 import { applyLoadMore, derivePaginationStatus, initialPages, rebalance } from "@lunora/client/pagination";
 import type { Readable } from "svelte/store";
-import { derived, readable, writable } from "svelte/store";
+import { derived, get, readable, writable } from "svelte/store";
 
 import { getLunoraClient } from "./context";
 import { isFunctionReference } from "./is-function-reference";
@@ -96,13 +96,7 @@ const createPaginatedEngine = <T>(
      */
     const pendingPageKeys = new Set<string>();
 
-    let currentPages: Page[] = initialPages(initialNumItems);
     const currentBaseArgs: "skip" | Record<string, unknown> = baseArgs;
-
-    // Track currentPages from the store so loadMore can read it synchronously.
-    pagesStore.subscribe((pages) => {
-        currentPages = pages;
-    });
 
     const rebuildPageResults = (): void => {
         if (currentBaseArgs === "skip") {
@@ -111,7 +105,7 @@ const createPaginatedEngine = <T>(
             return;
         }
 
-        const updated = currentPages.map((page) => {
+        const updated = get(pagesStore).map((page) => {
             const key = buildPageKey(function_["__lunoraRef"], buildPageArgs(page, currentBaseArgs));
 
             return resultsByKey.get(key);
@@ -120,7 +114,47 @@ const createPaginatedEngine = <T>(
         pageResultsInternal.set(updated);
     };
 
-    const syncSubscriptions = (): void => {
+    /**
+     * When `rebalance` splits or joins pages the per-page result keys change.
+     * Carry the existing results to the new keys so visible data is preserved
+     * while the server acknowledges the new boundary (a joined page seeds from
+     * the lower of the merged pages; a split page seeds both halves from the
+     * parent). Best-effort — the fresh subscription overwrites it once attached.
+     *
+     * Must run BEFORE `pagesStore.set(next)` / `syncSubscriptions()` so the new
+     * keys are seeded before the stale-subscription sweep prunes the old ones.
+     * Without this, `rebuildPageResults` emits `undefined` for the re-keyed
+     * page(s) and the derived `results`/`pages` stores drop those items until
+     * the new subscription's first frame arrives.
+     */
+    const migrateResultsForRebalance = (oldPages: Page[], newPages: Page[]): void => {
+        if (currentBaseArgs === "skip") {
+            return;
+        }
+
+        const keyOf = (page: Page): string => buildPageKey(function_["__lunoraRef"], buildPageArgs(page, currentBaseArgs));
+
+        for (const newPage of newPages) {
+            const newKey = keyOf(newPage);
+
+            if (resultsByKey.has(newKey)) {
+                continue;
+            }
+
+            // The old page whose lower bound matches covers the start of this range.
+            const donor = oldPages.find((op) => op.lower === newPage.lower);
+
+            if (donor) {
+                const carried = resultsByKey.get(keyOf(donor));
+
+                if (carried) {
+                    resultsByKey.set(newKey, carried);
+                }
+            }
+        }
+    };
+
+    const syncPass = (): void => {
         if (currentBaseArgs === "skip") {
             for (const unsub of activeSubs.values()) {
                 unsub();
@@ -133,23 +167,27 @@ const createPaginatedEngine = <T>(
         }
 
         const baseArgsRecord = currentBaseArgs;
+        const pages = get(pagesStore);
         const wantedKeys = new Set<string>();
 
-        for (const page of currentPages) {
+        for (const page of pages) {
             wantedKeys.add(buildPageKey(function_["__lunoraRef"], buildPageArgs(page, baseArgsRecord)));
         }
 
-        // Close stale subscriptions.
+        // Close stale subscriptions and drop their cached results so a later
+        // re-key that reproduces a superseded key cannot resurrect stale data,
+        // and the result map does not grow unboundedly across loadMore cycles.
         for (const [key, unsub] of activeSubs) {
             if (!wantedKeys.has(key)) {
                 unsub();
                 activeSubs.delete(key);
                 pendingPageKeys.delete(key);
+                resultsByKey.delete(key);
             }
         }
 
         // Open new subscriptions.
-        for (const page of currentPages) {
+        for (const page of pages) {
             const pageArgs = buildPageArgs(page, baseArgsRecord);
             const key = buildPageKey(function_["__lunoraRef"], pageArgs);
 
@@ -176,16 +214,16 @@ const createPaginatedEngine = <T>(
                     // `loadMore`) stays in `pendingPageKeys` until its first result
                     // arrives; joining before that would discard visible content.
                     if (pendingPageKeys.size === 0) {
-                        let updatedResults: (PaginationResult<T> | undefined)[] = [];
-
-                        pageResultsInternal.subscribe((results) => {
-                            updatedResults = results;
-                        })();
-
-                        const next = rebalance(currentPages, updatedResults);
+                        const latestPages = get(pagesStore);
+                        const next = rebalance(latestPages, get(pageResultsInternal));
 
                         if (next) {
+                            // Carry results to the re-keyed pages before swapping the
+                            // page list so the sweep in `syncSubscriptions` cannot drop
+                            // visible items before the new subscription's first frame.
+                            migrateResultsForRebalance(latestPages, next);
                             pagesStore.set(next);
+                            // eslint-disable-next-line @typescript-eslint/no-use-before-define -- runs inside a deferred subscription callback, after syncSubscriptions is defined
                             syncSubscriptions();
                             rebuildPageResults();
                         }
@@ -195,6 +233,40 @@ const createPaginatedEngine = <T>(
             );
 
             activeSubs.set(key, unsub);
+        }
+    };
+
+    // `client.subscribe` replays a cached value to the new subscriber
+    // SYNCHRONOUSLY — the callback fires before `subscribe` returns, i.e. before
+    // this page's `activeSubs.set(key, unsub)` above is recorded. If that replay
+    // empties `pendingPageKeys` and `rebalance` returns a new layout, the callback
+    // re-enters `syncSubscriptions` against half-populated bookkeeping. Re-entering
+    // the open loop there would duplicate still-wanted subs and orphan handles (the
+    // outer frame's `activeSubs.set` overwrites the reentrant entry) — a leaked,
+    // unsubscribable WS subscription. So guard: while a pass is running, a nested
+    // call only flags a re-sync, which the drain below runs once the outer pass has
+    // finished recording every handle — that follow-up pass closes any now-stale
+    // sub and opens the genuinely new pages against complete bookkeeping.
+    let syncing = false;
+    let resyncRequested = false;
+
+    const syncSubscriptions = (): void => {
+        if (syncing) {
+            resyncRequested = true;
+
+            return;
+        }
+
+        syncing = true;
+
+        try {
+            do {
+                resyncRequested = false;
+                syncPass();
+                // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- resyncRequested is set by syncPass through a nested call the flow analyzer cannot track
+            } while (resyncRequested);
+        } finally {
+            syncing = false;
         }
     };
 
@@ -240,11 +312,7 @@ const createPaginatedEngine = <T>(
             return;
         }
 
-        let currentResults: (PaginationResult<T> | undefined)[] = [];
-
-        pageResultsInternal.subscribe((results) => {
-            currentResults = results;
-        })();
+        const currentResults = get(pageResultsInternal);
 
         const { nextCursor, status: currentStatus } = derivePaginationStatus(false, currentResults);
 
@@ -252,6 +320,7 @@ const createPaginatedEngine = <T>(
             return;
         }
 
+        const currentPages = get(pagesStore);
         const next = applyLoadMore(currentPages, nextCursor, numberItems);
 
         if (!next) {
@@ -274,6 +343,9 @@ const createPaginatedEngine = <T>(
 
                 if (carried) {
                     resultsByKey.set(newKey, carried);
+                    // Drop the superseded open-tail entry so a later JOIN that
+                    // reproduces this key cannot serve the pre-loadMore result.
+                    resultsByKey.delete(oldKey);
                 }
             }
         }

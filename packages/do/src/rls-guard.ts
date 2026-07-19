@@ -16,6 +16,7 @@
  * Admin / migration / studio writers (built from `createShardCtxDb` WITHOUT
  * `enforceRls`) are never guarded — they are trusted system paths.
  */
+import { LunoraError } from "@lunora/errors";
 
 /**
  * Well-known symbol the guard hangs the unwrapped writer off of. `Symbol.for`
@@ -27,24 +28,21 @@ const RLS_UNWRAP_SYMBOL: symbol = Symbol.for("lunora.ctxdb.rls-unwrap");
 
 /**
  * Thrown when a raw (non-RLS) handler touches a protected table under a
- * `.rls("required")` schema. `code` / `status` / `table` are own properties (not
- * just inherited prototype state) so structural callers across packages — which
- * deliberately avoid a hard `@lunora/do` runtime dependency — recognise the
- * shape without an `instanceof` check (mirrors `ConflictError`).
+ * `.rls("required")` schema. A `LunoraError` subclass (`code: "RLS_REQUIRED"`,
+ * `status: 403`) recognised structurally across packages (via `isLunoraError`) —
+ * which deliberately avoid a hard `@lunora/do` runtime dependency — without an
+ * `instanceof` check. `table` is kept as an own property.
  */
-class RlsRequiredError extends Error {
-    public readonly code: string = "RLS_REQUIRED";
-
-    public readonly status: number = 403;
-
+class RlsRequiredError extends LunoraError {
     public readonly table: string;
 
     public constructor(table: string) {
         super(
+            "RLS_REQUIRED",
             `ctx.db access to "${table}" is denied: the schema is marked .rls("required"), so this table is protected. ` +
                 `Apply RLS with .use(rls(policies)) in the procedure, or mark the table .public() to opt it out.`,
+            { name: "RlsRequiredError" },
         );
-        this.name = "RlsRequiredError";
         this.table = table;
     }
 }
@@ -74,13 +72,14 @@ interface GuardableWriter {
     count: (tableName: string, whereOrArgs?: unknown) => unknown;
     delete: (id: string, expectedTable?: string, options?: { hard?: boolean }) => unknown;
     deleteMany: (ids: ReadonlyArray<string>, options?: { limit?: number }, expectedTable?: string) => unknown;
+    deleteWhere?: (tableName: string, where: Record<string, unknown>, options?: { limit?: number }) => unknown;
     findFirst: (tableName: string, args?: unknown) => unknown;
     findFirstOrThrow: (tableName: string, args?: unknown) => unknown;
     findMany: (tableName: string, args?: unknown) => unknown;
     get: (id: string, expectedTable?: string) => unknown;
     groupBy: (tableName: string, options: unknown) => unknown;
     insert: (tableName: string, document: unknown, options?: unknown) => unknown;
-    insertMany: (tableName: string, documents: ReadonlyArray<Record<string, unknown>>, options?: { limit?: number }) => unknown;
+    insertMany: (tableName: string, documents: ReadonlyArray<Record<string, unknown>>, options?: { limit?: number; skipDuplicates?: boolean }) => unknown;
     insertManyUnsafe: (
         tableName: string,
         documents: ReadonlyArray<Record<string, unknown>>,
@@ -88,11 +87,12 @@ interface GuardableWriter {
     ) => unknown;
     patch: (id: string, patch: unknown, expectedTable?: string) => unknown;
     patchMany: (patches: ReadonlyArray<{ id: string; patch: Record<string, unknown> }>, options?: { limit?: number }, expectedTable?: string) => unknown;
+    patchWhere?: (tableName: string, args: { patch: Record<string, unknown>; where: Record<string, unknown> }, options?: { limit?: number }) => unknown;
     query: (tableName: string) => unknown;
     rank: (tableName: string, indexName: string, options: unknown) => unknown;
     rankBefore?: (tableName: string, indexName: string, options: unknown) => unknown;
     rankPage: (tableName: string, indexName: string, options?: unknown) => unknown;
-    replace: (id: string, document: unknown, expectedTable?: string) => unknown;
+    replace: (id: string, document: unknown, expectedTable?: string, options?: { allowExplicitId?: boolean }) => unknown;
     restore?: (id: string, expectedTable?: string) => unknown;
 }
 
@@ -186,6 +186,15 @@ const guardWriter = <W>(raw: W, schema: GuardableSchema, tableOfId: TableOfId): 
 
             return base.deleteMany(ids, options, expectedTable);
         },
+        deleteWhere: base.deleteWhere
+            ? async (tableName: string, where: Record<string, unknown>, options?: { limit?: number }) => {
+                  // Where-based: gate the table, then delegate. Per-row policy
+                  // checks happen in the RLS middleware layer above this guard.
+                  guardTable(tableName);
+
+                  return await base.deleteWhere?.(tableName, where, options);
+              }
+            : undefined,
         findFirst: (tableName: string, args?: unknown) => {
             guardTable(tableName);
 
@@ -216,7 +225,7 @@ const guardWriter = <W>(raw: W, schema: GuardableSchema, tableOfId: TableOfId): 
 
             return base.insert(tableName, document, options);
         },
-        insertMany: (tableName: string, documents: ReadonlyArray<Record<string, unknown>>, options?: { limit?: number }) => {
+        insertMany: (tableName: string, documents: ReadonlyArray<Record<string, unknown>>, options?: { limit?: number; skipDuplicates?: boolean }) => {
             // Every row targets the same table, so one table-level guard covers
             // the batch; the payload cap is enforced by the delegated writer.
             guardTable(tableName);
@@ -245,6 +254,15 @@ const guardWriter = <W>(raw: W, schema: GuardableSchema, tableOfId: TableOfId): 
 
             return base.patchMany(patches, options, expectedTable);
         },
+        patchWhere: base.patchWhere
+            ? async (tableName: string, args: { patch: Record<string, unknown>; where: Record<string, unknown> }, options?: { limit?: number }) => {
+                  // Where-based: gate the table, then delegate. Per-row policy
+                  // checks happen in the RLS middleware layer above this guard.
+                  guardTable(tableName);
+
+                  return await base.patchWhere?.(tableName, args, options);
+              }
+            : undefined,
         query: (tableName: string) => {
             guardTable(tableName);
 
@@ -260,10 +278,10 @@ const guardWriter = <W>(raw: W, schema: GuardableSchema, tableOfId: TableOfId): 
 
             return base.rankPage(tableName, indexName, options);
         },
-        replace: async (id: string, document: unknown, expectedTable?: string) => {
+        replace: async (id: string, document: unknown, expectedTable?: string, options?: { allowExplicitId?: boolean }) => {
             await guardById(id, expectedTable);
 
-            return base.replace(id, document, expectedTable);
+            return base.replace(id, document, expectedTable, options);
         },
         restore: async (id: string, expectedTable?: string) => {
             // Restore is a by-id write (clears the soft-delete marker); gate it

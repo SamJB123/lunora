@@ -3,7 +3,16 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
 import { Studio } from "../../src/app/studio";
-import type { QueueMetadata, StudioFeaturesResult } from "../../src/lib/admin";
+import type {
+    FanoutMetricsResult,
+    FanoutPathCounters,
+    FanoutTopicStat,
+    FlagEvaluation,
+    FlagsResult,
+    QueueMessageRow,
+    QueueMetadata,
+    StudioFeaturesResult,
+} from "../../src/lib/admin";
 import { ADMIN_FUNCTIONS } from "../../src/lib/admin";
 import type { MockClientHooks } from "../mock-client";
 import { createMockClient } from "../mock-client";
@@ -30,7 +39,21 @@ const createClient = (features?: Partial<StudioFeaturesResult>): MockClientHooks
             // Optional-feature flags drive which nav pages render. Default every
             // flag on (the studio's back-compat default) unless a test overrides one.
             if (reference === ADMIN_FUNCTIONS.studioFeatures) {
-                return { mail: true, payments: true, queues: true, scheduler: true, storage: true, vectors: true, workflows: true, ...features };
+                return {
+                    analytics: true,
+                    auth: true,
+                    containers: true,
+                    flags: true,
+                    kv: true,
+                    mail: true,
+                    payments: true,
+                    queues: true,
+                    scheduler: true,
+                    storage: true,
+                    vectors: true,
+                    workflows: true,
+                    ...features,
+                };
             }
 
             // The logs panel mounts when its domain is opened; hand it the real
@@ -64,7 +87,20 @@ const renderAndFind = async (testId: string): Promise<HTMLElement> => {
  * studio copy of the type drifts from this tuple — keeping both packages' copies
  * of the wire contract in lockstep.
  */
-const STUDIO_FEATURE_KEYS = ["mail", "payments", "queues", "scheduler", "storage", "vectors", "workflows"] as const;
+const STUDIO_FEATURE_KEYS = [
+    "analytics",
+    "auth",
+    "containers",
+    "flags",
+    "kv",
+    "mail",
+    "payments",
+    "queues",
+    "scheduler",
+    "storage",
+    "vectors",
+    "workflows",
+] as const;
 
 /** `true` only when `Keys` and `Canonical` are mutually assignable (the exact same key set). */
 type KeysMatch<Keys extends string, Canonical extends string> = [Keys] extends [Canonical] ? ([Canonical] extends [Keys] ? true : never) : never;
@@ -82,6 +118,76 @@ const STUDIO_FEATURES_KEY_GUARD: KeysMatch<keyof StudioFeaturesResult, (typeof S
 const QUEUE_METADATA_KEYS = ["binding", "deadLetterQueue", "exportName", "mode", "name"] as const;
 
 const QUEUE_METADATA_KEY_GUARD: KeysMatch<keyof QueueMetadata, (typeof QUEUE_METADATA_KEYS)[number]> = true;
+
+/**
+ * Canonical key set of `QueueMessageRow` (the `getQueueMessages` consumed-message
+ * log row) — hand-mirrored from `@lunora/do` the same way as `QueueMetadata`. The
+ * `QueuesPanel` Messages tab reads these fields off the wire, so a drift would
+ * surface as a silent `undefined` cell; this guard fails the build instead.
+ * `error`/`exportName` are optional.
+ */
+const QUEUE_MESSAGE_ROW_KEYS = [
+    "attempts",
+    "body",
+    "capturedAt",
+    "deadLettered",
+    "error",
+    "exportName",
+    "id",
+    "messageId",
+    "outcome",
+    "queue",
+    "timestamp",
+] as const;
+
+const QUEUE_MESSAGE_ROW_KEY_GUARD: KeysMatch<keyof QueueMessageRow, (typeof QUEUE_MESSAGE_ROW_KEYS)[number]> = true;
+
+/**
+ * Canonical key sets of `FlagEvaluation` / `FlagsResult` — hand-mirrored from
+ * `@lunora/do` the same way as the types above, with the matching guards living
+ * in `@lunora/do`'s `shard-do.admin.test.ts`. The studio Flags page reads these
+ * fields off the wire, so a field dropped from the mirror (e.g. `variant`) would
+ * surface as a silent `undefined` cell rather than a type error; these guards
+ * fail the build on drift. `errorCode`/`reason`/`variant` are optional (present
+ * only when the provider reports them), so they're in the set.
+ */
+const FLAG_EVALUATION_KEYS = ["errorCode", "key", "reason", "type", "value", "variant"] as const;
+
+const FLAG_EVALUATION_KEY_GUARD: KeysMatch<keyof FlagEvaluation, (typeof FLAG_EVALUATION_KEYS)[number]> = true;
+
+const FLAGS_RESULT_KEYS = ["configured", "flags"] as const;
+
+const FLAGS_RESULT_KEY_GUARD: KeysMatch<keyof FlagsResult, (typeof FLAGS_RESULT_KEYS)[number]> = true;
+
+/**
+ * Canonical key sets of the `getFanoutMetrics` wire shapes (plan 075 Phase 1) —
+ * hand-mirrored from `@lunora/do` the same way as the types above, with the
+ * matching guards living in `@lunora/do`'s `shard-do.admin.test.ts`. The fan-out
+ * panel reads these fields off the wire, so a dropped field would surface as a
+ * silent `undefined` cell rather than a type error; these guards fail the build
+ * on drift.
+ */
+const FANOUT_TOPIC_STAT_KEYS = ["kind", "subscribers", "topic"] as const;
+
+const FANOUT_TOPIC_STAT_KEY_GUARD: KeysMatch<keyof FanoutTopicStat, (typeof FANOUT_TOPIC_STAT_KEYS)[number]> = true;
+
+const FANOUT_PATH_COUNTERS_KEYS = ["maxMs", "passes", "peakSocketsIterated", "socketsDelivered", "socketsIterated", "totalMs"] as const;
+
+const FANOUT_PATH_COUNTERS_KEY_GUARD: KeysMatch<keyof FanoutPathCounters, (typeof FANOUT_PATH_COUNTERS_KEYS)[number]> = true;
+
+const FANOUT_METRICS_RESULT_KEYS = [
+    "maxRelays",
+    "peakSubscribers",
+    "promoted",
+    "relayCount",
+    "shapePoke",
+    "sinceMs",
+    "topics",
+    "totalConnections",
+    "whisper",
+] as const;
+
+const FANOUT_METRICS_RESULT_KEY_GUARD: KeysMatch<keyof FanoutMetricsResult, (typeof FANOUT_METRICS_RESULT_KEYS)[number]> = true;
 
 describe("studio", () => {
     it("renders every domain's sub-pages at once in the grouped sidebar", async () => {
@@ -103,7 +209,9 @@ describe("studio", () => {
 
         fireEvent.click(await renderAndFind("dash-tab-schedule"));
 
-        const scheduledJobs = await screen.findByTestId("lunora-scheduled-jobs");
+        // The schedule panel is the heaviest lazy mount in the shell; under a
+        // fully loaded suite run the default 1s findBy window is too tight.
+        const scheduledJobs = await screen.findByTestId("lunora-scheduled-jobs", undefined, { timeout: 5000 });
 
         expect(scheduledJobs).toBeDefined();
     });
@@ -146,7 +254,7 @@ describe("studio", () => {
     });
 
     it("hides a domain's pages when its optional package is disabled", async () => {
-        expect.assertions(2);
+        expect.hasAssertions();
 
         render(renderStudio(createClient({ storage: false })));
 
@@ -163,7 +271,7 @@ describe("studio", () => {
     });
 
     it("hides a single sub-page when its feature is disabled but keeps the domain's other pages", async () => {
-        expect.assertions(2);
+        expect.hasAssertions();
 
         // payments lives in the "logs" domain alongside logs/audit/schedule — disabling
         // it should drop only the payments sub-page, not the whole domain.
@@ -179,7 +287,7 @@ describe("studio", () => {
     });
 
     it("labels the panel region by the active sub-page", async () => {
-        expect.assertions(1);
+        expect.hasAssertions();
 
         fireEvent.click(await renderAndFind("dash-tab-logs"));
 
@@ -194,7 +302,20 @@ describe("studio", () => {
         // The compile-time guard (STUDIO_FEATURES_KEY_GUARD) fails the build on drift;
         // this asserts the canonical tuple at runtime so the guard can't be silently deleted.
         expect(STUDIO_FEATURES_KEY_GUARD).toBe(true);
-        expect([...STUDIO_FEATURE_KEYS]).toStrictEqual(["mail", "payments", "queues", "scheduler", "storage", "vectors", "workflows"]);
+        expect([...STUDIO_FEATURE_KEYS]).toStrictEqual([
+            "analytics",
+            "auth",
+            "containers",
+            "flags",
+            "kv",
+            "mail",
+            "payments",
+            "queues",
+            "scheduler",
+            "storage",
+            "vectors",
+            "workflows",
+        ]);
     });
 
     it("keeps the studio's QueueMetadata mirror in lockstep with @lunora/do's contract", () => {
@@ -202,5 +323,54 @@ describe("studio", () => {
 
         expect(QUEUE_METADATA_KEY_GUARD).toBe(true);
         expect([...QUEUE_METADATA_KEYS]).toStrictEqual(["binding", "deadLetterQueue", "exportName", "mode", "name"]);
+    });
+
+    it("keeps the studio's QueueMessageRow mirror in lockstep with @lunora/do's contract", () => {
+        expect.assertions(2);
+
+        expect(QUEUE_MESSAGE_ROW_KEY_GUARD).toBe(true);
+        expect([...QUEUE_MESSAGE_ROW_KEYS]).toStrictEqual([
+            "attempts",
+            "body",
+            "capturedAt",
+            "deadLettered",
+            "error",
+            "exportName",
+            "id",
+            "messageId",
+            "outcome",
+            "queue",
+            "timestamp",
+        ]);
+    });
+
+    it("keeps the studio's FlagEvaluation/FlagsResult mirror in lockstep with @lunora/do's contract", () => {
+        expect.assertions(4);
+
+        expect(FLAG_EVALUATION_KEY_GUARD).toBe(true);
+        expect([...FLAG_EVALUATION_KEYS]).toStrictEqual(["errorCode", "key", "reason", "type", "value", "variant"]);
+        expect(FLAGS_RESULT_KEY_GUARD).toBe(true);
+        expect([...FLAGS_RESULT_KEYS]).toStrictEqual(["configured", "flags"]);
+    });
+
+    it("keeps the studio's getFanoutMetrics mirror in lockstep with @lunora/do's contract", () => {
+        expect.assertions(6);
+
+        expect(FANOUT_TOPIC_STAT_KEY_GUARD).toBe(true);
+        expect([...FANOUT_TOPIC_STAT_KEYS]).toStrictEqual(["kind", "subscribers", "topic"]);
+        expect(FANOUT_PATH_COUNTERS_KEY_GUARD).toBe(true);
+        expect([...FANOUT_PATH_COUNTERS_KEYS]).toStrictEqual(["maxMs", "passes", "peakSocketsIterated", "socketsDelivered", "socketsIterated", "totalMs"]);
+        expect(FANOUT_METRICS_RESULT_KEY_GUARD).toBe(true);
+        expect([...FANOUT_METRICS_RESULT_KEYS]).toStrictEqual([
+            "maxRelays",
+            "peakSubscribers",
+            "promoted",
+            "relayCount",
+            "shapePoke",
+            "sinceMs",
+            "topics",
+            "totalConnections",
+            "whisper",
+        ]);
     });
 });

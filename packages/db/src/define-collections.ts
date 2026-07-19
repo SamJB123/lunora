@@ -1,13 +1,13 @@
-/* eslint-disable no-underscore-dangle -- `_id` is the Lunora document-id field this binding keys rows by */
 /* eslint-disable import/exports-last -- a types-heavy module: public types are declared next to the helpers they build on */
 import type { FunctionReference, LunoraClient, SubscriptionError } from "@lunora/client";
 import type { Collection, Transaction } from "@tanstack/db";
-import { BTreeIndex, createCollection } from "@tanstack/db";
-import type { OfflineConfig, OfflineExecutor } from "@tanstack/offline-transactions";
-import { startOfflineExecutor } from "@tanstack/offline-transactions";
+import { createCollection, safeRandomUUID } from "@tanstack/db";
+import type { OfflineConfig, OfflineExecutor, OfflineTransaction, StorageDiagnostic } from "@tanstack/offline-transactions";
+import { NonRetriableError, startOfflineExecutor } from "@tanstack/offline-transactions";
 
-import type { Row } from "./internals";
-import { createOptimisticOnlineDetector, makeDiffEmit, runOutboxMutation, toMap } from "./internals";
+import { lunoraCollectionOptions } from "./collection-options";
+import type { OutboxMutationMetadata, Row } from "./internals";
+import { createOptimisticOnlineDetector, createOutboxCarrier, OUTBOX_MUTATION_FN_NAME, registerOutboxCarrier, runOutboxMutation } from "./internals";
 
 /** Element type of an array (the row type a `list` query returns). */
 type Element<T> = T extends ReadonlyArray<infer E> ? E : never;
@@ -44,6 +44,16 @@ export interface CollectionDef<TList extends FunctionReference, TInput = never> 
     list: TList;
 
     /**
+     * When this collection starts syncing — `"lazy"` (default) on the first
+     * `useLiveQuery` subscriber, or `"eager"` at creation, for small "instant"
+     * reference data you want warm at boot. Pairs with `scopeBy` for partial
+     * (per-scope) loading — together they give the full lazy/partial/eager
+     * (Linear `lazy`/`partial`/`instant`) load taxonomy declaratively. No effect
+     * on a `scopeBy` collection (nothing to sync until scoped).
+     */
+    load?: "eager" | "lazy";
+
+    /**
      * Notified when the underlying `list` subscription errors (e.g. the server
      * rejects it). Without this the error would be swallowed and the collection
      * could hang in `loading`; the binding always moves the collection out of
@@ -52,6 +62,14 @@ export interface CollectionDef<TList extends FunctionReference, TInput = never> 
     onError?: (error: SubscriptionError) => void;
     /** A field that scopes the list (e.g. a shard key); makes the collection re-pointable via `scope`. */
     scopeBy?: string;
+
+    /**
+     * Routes the `list` subscription (and the confirmed-mutation watermark its
+     * frames advance the checkpoint gate from) to a specific shard's DO — so a
+     * sharded collection's overlay gate compares against that shard's mutator
+     * sequence line, not the default ("") watermark bucket.
+     */
+    shardKey?: string;
 }
 
 // A collection def with its type params erased to `any` (not `FunctionReference`/
@@ -71,6 +89,67 @@ type RowOf<C extends AnyDef> = C["list"] extends FunctionReference<infer _K, inf
 /** The action input type, inferred structurally from the def's optimistic insert. */
 type InputOf<C> = C extends { insert: { optimistic: (input: infer I, id: string) => unknown } } ? I : never;
 
+/** A queued write that was permanently dropped, passed to {@link DefineCollectionsOptions.onWriteRejected}. */
+export interface WriteRejectedEvent {
+    /**
+     * The machine-readable reason — the server's error `code` (e.g. `CONFLICT`,
+     * `FORBIDDEN`), or `UNKNOWN_MUTATION_FN` when the write referenced a collection
+     * that no longer exists (removed in a deploy). Mirrors the client's
+     * `MutationSettledEvent.code` so a consumer can branch on the verdict.
+     */
+    code?: string;
+    /** The collection/table name the write targeted. */
+    collection: string;
+    /** The error that dropped the write (message carried by the underlying `NonRetriableError`). */
+    error: Error;
+
+    /**
+     * The optimistic row being rolled back (the rollback follows the callback).
+     * Absent only if the dropped transaction carried no recoverable row (e.g. some
+     * `UNKNOWN_MUTATION_FN` cases).
+     */
+    row?: Row;
+}
+
+/** Options for {@link defineCollections}. */
+export interface DefineCollectionsOptions {
+    /**
+     * Invoked when a leadership change occurs across tabs (only the leader tab
+     * drains the durable outbox). Informational — useful for diagnostics; the
+     * library handles the election itself.
+     */
+    onLeadershipChange?: (isLeader: boolean) => void;
+
+    /**
+     * Invoked when the durable outbox's storage layer fails — IndexedDB
+     * unavailable (private mode), blocked, or quota exceeded. The standalone
+     * client surfaces this via `offlineQueue.onPersistenceError`; this is the
+     * collection-layer counterpart. A storage failure means a write is NOT durable
+     * and won't survive a reload, so surface it (e.g. "your change may not be
+     * saved if you close this tab").
+     */
+    onStorageFailure?: (diagnostic: StorageDiagnostic) => void;
+
+    /**
+     * Invoked as a queued write is permanently dropped: a coded application error
+     * from the server (validation, RLS denial, conflict, surfaced as a
+     * `NonRetriableError`), OR a write whose target collection no longer exists —
+     * removed/renamed in a deploy (`code: "UNKNOWN_MUTATION_FN"`). This is the
+     * aggregate, fire-and-forget-safe channel: unlike awaiting the per-action
+     * `transaction` returned by `actions[name](...)`, it fires even when the caller
+     * never retained that handle, so a UI can surface "couldn't save" instead of a
+     * silently vanishing row. Transient failures (offline, 5xx) are retried by the
+     * outbox, not reported here.
+     *
+     * Timing: the callback runs at the point of rejection; the executor's
+     * optimistic-row rollback follows immediately after. The event's `row` is the
+     * (about-to-be-removed) optimistic row, so don't depend on the collection
+     * already reflecting the removal from inside the handler — use `row`/`error`
+     * directly (e.g. for a toast).
+     */
+    onWriteRejected?: (event: WriteRejectedEvent) => void;
+}
+
 /** The wired data layer `defineCollections` returns. */
 // eslint-disable-next-line unicorn/prevent-abbreviations -- "Db" matches the package name `@lunora/db`
 export interface LunoraDb<D extends Record<string, AnyDef>> {
@@ -80,6 +159,16 @@ export interface LunoraDb<D extends Record<string, AnyDef>> {
     collections: { [K in keyof D]: Collection<RowOf<D[K]>, string> };
     /** The shared offline executor (the outbox). */
     executor: OfflineExecutor;
+
+    /**
+     * Number of writes still pending in the durable outbox — the depth for a
+     * "N changes waiting to sync" indicator. A convenience over reaching through
+     * `executor.getPendingCount()`. **Pull-only** (the underlying TanStack
+     * executor exposes no change subscription): read it after a `db.actions.*`
+     * call and on connection-status changes, or poll. The standalone
+     * `LunoraClient` exposes the reactive `onPendingChange` for its built-in queue.
+     */
+    pendingCount: () => number;
     /** Re-point a `scopeBy` collection's subscription (omit `args` to detach) — present for scoped collections. */
     scope: { [K in keyof D]: D[K] extends { scopeBy: string } ? (args?: Record<string, unknown>) => void : never };
 }
@@ -94,108 +183,139 @@ export interface LunoraDb<D extends Record<string, AnyDef>> {
  * This is the hand-written form; `@lunora/codegen` can emit a fully-typed call to
  * it from `schema.ts`, so an app writes nothing.
  */
-export const defineCollections = <D extends Record<string, AnyDef>>(client: LunoraClient, defs: D): LunoraDb<D> => {
+export const defineCollections = <D extends Record<string, AnyDef>>(client: LunoraClient, defs: D, options: DefineCollectionsOptions = {}): LunoraDb<D> => {
     const collections: Record<string, Collection<Row, string>> = {};
     const scope: Record<string, (args?: Record<string, unknown>) => void> = {};
-    const subscriptions: Record<string, (() => void) | undefined> = {};
-    const emitters: Record<string, ((rows: Map<string, Row>) => void) | undefined> = {};
-    const errorHandlers: Record<string, ((error: SubscriptionError) => void) | undefined> = {};
     const mutationFns: OfflineConfig["mutationFns"] = {};
 
     const entries = Object.entries(defs);
 
     for (const [name, definition] of entries) {
-        const getKey = definition.getKey ?? ((row: Row) => row._id);
         const insert = definition.insert as InsertBinding<Row, unknown> | undefined;
-        const synced = new Map<string, Row>();
 
-        collections[name] = createCollection<Row, string>({
-            // Auto-build ordered (B-tree) indexes for whatever the app's live
-            // queries join / filter / sort on, so they stay fast as data grows.
-            autoIndex: "eager",
-            defaultIndexType: BTreeIndex,
-            getKey,
+        // Build the live-sync read path from the shared collection-options core
+        // (same diff-into-channel + auto-index + scoped-resubscribe behavior).
+        const { config, scope: scopeFunction } = lunoraCollectionOptions<Row>({
+            client,
+            getKey: definition.getKey,
             id: name,
-            sync: {
-                sync: (writer) => {
-                    const emit = makeDiffEmit<Row>(synced, writer);
-                    emitters[name] = emit;
-
-                    // Surface a subscription error: forward it to the user's
-                    // `onError` and move the collection out of `loading` so a
-                    // failed subscription never leaves it stuck there forever.
-                    const onError = (error: SubscriptionError) => {
-                        writer.markReady();
-                        definition.onError?.(error);
-                    };
-
-                    errorHandlers[name] = onError;
-
-                    if (definition.scopeBy === undefined) {
-                        // Static collection: subscribe to the unscoped list now.
-                        subscriptions[name] = client.subscribe(
-                            definition.list,
-                            {},
-                            (rows) => {
-                                emit(toMap(rows as Row[], getKey));
-                                writer.markReady();
-                            },
-                            { onError },
-                        );
-                    } else {
-                        // Scoped collection: stays empty until `scope[name](args)`.
-                        writer.markReady();
-                    }
-
-                    return () => {
-                        emitters[name] = undefined;
-                        errorHandlers[name] = undefined;
-                        subscriptions[name]?.();
-                        subscriptions[name] = undefined;
-                    };
-                },
-            },
+            // `AnyDef` erases `list` to `any` (`TList = any`); it's a `FunctionReference` here.
+            list: definition.list as FunctionReference,
+            ...(definition.load === undefined ? {} : { load: definition.load }),
+            onError: definition.onError,
+            scopeBy: definition.scopeBy,
+            shardKey: definition.shardKey,
         });
 
+        collections[name] = createCollection<Row, string>(config);
+
         if (definition.scopeBy !== undefined) {
-            scope[name] = (args) => {
-                subscriptions[name]?.();
-                subscriptions[name] = undefined;
-                // Clear the previous scope's rows from the synced view.
-                emitters[name]?.(new Map());
-
-                if (args === undefined) {
-                    return;
-                }
-
-                subscriptions[name] = client.subscribe(
-                    definition.list,
-                    args,
-                    (rows) => {
-                        emitters[name]?.(toMap(rows as Row[], getKey));
-                    },
-                    { onError: (error) => errorHandlers[name]?.(error) },
-                );
-            };
+            scope[name] = scopeFunction;
         }
 
         if (insert) {
-            mutationFns[name] = async ({ transaction }) => {
-                for (const mutation of transaction.mutations) {
+            mutationFns[name] = async ({ idempotencyKey, transaction }) => {
+                for (const [mutationIndex, mutation] of transaction.mutations.entries()) {
                     const row = mutation.modified as unknown as Row;
+                    // Replay under the executor's stable idempotency key (suffixed
+                    // with the mutation's index so a batched transaction's writes
+                    // stay distinct), NOT a fresh id minted per call: a
+                    // committed-but-unacked write the outbox retries then resends the
+                    // same `x-lunora-mutation-id` and the server dedupes it instead
+                    // of inserting the row twice. Mirrors the reserved
+                    // `__lunora_outbox__` handler, which replays under
+                    // `meta.idempotencyKey`.
+                    const mutationId = `${idempotencyKey}:${String(mutationIndex)}`;
 
-                    // eslint-disable-next-line no-await-in-loop -- sequential keeps the outbox's FIFO ordering
-                    await runOutboxMutation(() => client.mutation(insert.mutation, insert.toArgs(row)));
+                    try {
+                        // eslint-disable-next-line no-await-in-loop -- sequential keeps the outbox's FIFO ordering
+                        await runOutboxMutation(() => client.mutation(insert.mutation, insert.toArgs(row), { mutationId }));
+                    } catch (error) {
+                        // A permanent (coded) rejection: the executor will roll the
+                        // optimistic row back. Report it on the aggregate channel so a
+                        // fire-and-forget caller still learns the write was dropped, then
+                        // rethrow so the rollback proceeds. Transient errors retry — only
+                        // the NonRetriableError verdict is terminal, so only it is reported.
+                        if (error instanceof NonRetriableError && options.onWriteRejected) {
+                            try {
+                                options.onWriteRejected({ code: (error as Error & { code?: string }).code, collection: name, error, row });
+                            } catch {
+                                // A throwing listener must not escape and replace the
+                                // NonRetriableError — that would turn a terminal verdict
+                                // retriable (poison-message loop) and skip the rollback.
+                            }
+                        }
+
+                        throw error;
+                    }
                 }
             };
         }
     }
 
+    // Reserved replay handler for the unified outbox: a raw `client.mutation`
+    // offline write delegated through `createExecutorOutboxSink` rides this
+    // executor (one durable store) rather than the standalone `OfflineQueue`. It
+    // carries no collection mutation — the target lives in `transaction.metadata`
+    // — so we replay it by path and apply the same identity guard the queue path
+    // uses: a write whose captured identity no longer matches the signed-in user
+    // is dropped (NonRetriableError) instead of replaying as someone else.
+    mutationFns[OUTBOX_MUTATION_FN_NAME] = async ({ transaction }) => {
+        const meta = transaction.metadata as OutboxMutationMetadata | undefined;
+
+        if (!meta) {
+            return;
+        }
+
+        if (meta.identity !== client.currentIdentity()) {
+            throw new NonRetriableError("outbox write dropped: identity changed since it was queued");
+        }
+
+        // Replay under the *original* idempotency key (not a fresh one), so a
+        // committed-but-unacked write that the executor retries is deduped by the
+        // server instead of applied twice.
+        await runOutboxMutation(() =>
+            client.mutation({ __lunoraRef: meta.functionPath }, meta.args, { mutationId: meta.idempotencyKey, shardKey: meta.shardKey }),
+        );
+    };
+
+    // The transport carrier for outbox-routed raw writes (see
+    // `createOutboxCarrier`): registered in the executor's collection registry
+    // under the reserved key — so persisted transport transactions
+    // serialize/deserialize across reloads — but NOT exposed on the returned
+    // `collections` surface.
+    const outboxCarrier = createOutboxCarrier();
+
     const executor = startOfflineExecutor({
-        collections,
+        collections: { ...collections, [OUTBOX_MUTATION_FN_NAME]: outboxCarrier },
         mutationFns,
         onlineDetector: createOptimisticOnlineDetector(),
+        ...(options.onLeadershipChange ? { onLeadershipChange: options.onLeadershipChange } : {}),
+        ...(options.onStorageFailure ? { onStorageFailure: options.onStorageFailure } : {}),
+        // A persisted write whose target collection was removed/renamed in a deploy
+        // hits an unregistered mutationFn. The executor drops it as a
+        // NonRetriableError *before* our per-collection `mutationFns` catch runs, so
+        // this hook is the only place to surface it on `onWriteRejected`.
+        onUnknownMutationFn: (name: string, tx: OfflineTransaction) => {
+            try {
+                options.onWriteRejected?.({
+                    code: "UNKNOWN_MUTATION_FN",
+                    collection: name,
+                    error: new Error(`offline write dropped: mutation "${name}" no longer exists (removed or renamed in a deploy?)`),
+                    // Best-effort recovered row: the persisted `modified` shape isn't a
+                    // validated `Row`, and a batched transaction surfaces only its first
+                    // mutation's row. Enough to describe the dropped write to the user.
+                    row: tx.mutations[0]?.modified as Row | undefined,
+                });
+            } catch {
+                // A throwing listener must not escape into the executor's drop path.
+            }
+        },
     });
+
+    // Let `createExecutorOutboxSink(executor)` find the carrier when it persists
+    // a raw `client.mutation` offline write through this executor.
+    registerOutboxCarrier(executor, outboxCarrier);
 
     const actions: Record<string, (input: unknown) => { id: string; transaction: Transaction }> = {};
 
@@ -215,13 +335,17 @@ export const defineCollections = <D extends Record<string, AnyDef>>(client: Luno
         });
 
         actions[name] = (input) => {
-            // eslint-disable-next-line n/no-unsupported-features/node-builtins -- runs in browser/edge/Node ≥22; `crypto.randomUUID` is available in all of them
-            const id = crypto.randomUUID();
+            // `safeRandomUUID` (from @tanstack/db) falls back to
+            // `crypto.getRandomValues` when `crypto.randomUUID` is unavailable —
+            // e.g. a plain-HTTP dev/LAN origin (non-secure context), where
+            // `crypto.randomUUID` is undefined and a bare call would throw,
+            // breaking every `db.actions.*` invocation.
+            const id = safeRandomUUID();
             const transaction = action({ id, input });
 
             return { id, transaction };
         };
     }
 
-    return { actions, collections, executor, scope } as unknown as LunoraDb<D>;
+    return { actions, collections, executor, pendingCount: () => executor.getPendingCount(), scope } as unknown as LunoraDb<D>;
 };

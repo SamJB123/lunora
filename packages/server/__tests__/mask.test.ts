@@ -30,6 +30,21 @@ interface CapturedCall {
     tableOrId?: string;
 }
 
+/** Index-range builder passed to `.withIndex(name, q => …)` — mirrors `@lunora/do`'s `IndexRangeBuilderLike`. */
+interface FakeIndexBuilder {
+    eq: (field: string, value: unknown) => FakeIndexBuilder;
+    gt: (field: string, value: unknown) => FakeIndexBuilder;
+    gte: (field: string, value: unknown) => FakeIndexBuilder;
+    lt: (field: string, value: unknown) => FakeIndexBuilder;
+    lte: (field: string, value: unknown) => FakeIndexBuilder;
+}
+
+/** Search-filter builder passed to `.withSearchIndex(name, q => …)` — mirrors `@lunora/do`'s `SearchFilterBuilderLike`. */
+interface FakeSearchBuilder {
+    eq: (field: string, value: unknown) => FakeSearchBuilder;
+    search: (field: string, query: string) => FakeSearchBuilder;
+}
+
 interface FakeReader {
     collect: () => Promise<Record<string, unknown>[]>;
     filter: (predicate: (document: Record<string, unknown>) => boolean) => FakeReader;
@@ -38,8 +53,8 @@ interface FakeReader {
     paginate: () => Promise<{ continueCursor: null | string; isDone: boolean; page: Record<string, unknown>[] }>;
     take: (limit: number) => Promise<Record<string, unknown>[]>;
     unique: () => Promise<Record<string, unknown> | null>;
-    withIndex: (indexName?: string) => FakeReader;
-    withSearchIndex: () => FakeReader;
+    withIndex: (indexName?: string, range?: (q: FakeIndexBuilder) => FakeIndexBuilder) => FakeReader;
+    withSearchIndex: (indexName: string, search: (q: FakeSearchBuilder) => FakeSearchBuilder) => FakeReader;
 }
 
 interface FakeDatabase {
@@ -48,6 +63,7 @@ interface FakeDatabase {
         aggregate: (tableName: string, options: unknown) => Promise<null | number>;
         count: (tableName: string, whereOrArgs?: unknown) => Promise<number>;
         delete: (id: string) => Promise<void>;
+        deleteWhere: (tableName: string, where: Record<string, unknown>, options?: { limit?: number }) => Promise<{ deleted: number }>;
         findFirst: (tableName: string, args?: unknown) => Promise<Record<string, unknown> | null>;
         findFirstOrThrow: (tableName: string, args?: unknown) => Promise<Record<string, unknown>>;
         findMany: (tableName: string, args?: unknown) => Promise<{ continueCursor: null | string; isDone: boolean; page: Record<string, unknown>[] }>;
@@ -56,6 +72,11 @@ interface FakeDatabase {
         insert: (tableName: string, document: Record<string, unknown>) => Promise<string>;
         lookupById?: (id: string) => Promise<null | { row: Record<string, unknown>; tableName: string }>;
         patch: (id: string, patch: Record<string, unknown>) => Promise<void>;
+        patchWhere: (
+            tableName: string,
+            args: { patch: Record<string, unknown>; where: Record<string, unknown> },
+            options?: { limit?: number },
+        ) => Promise<{ patched: number }>;
         query: (tableName: string) => FakeReader;
         rank: (tableName: string, indexName: string, options: unknown) => Promise<null | { position: number; total: number }>;
         rankPage: (
@@ -92,6 +113,11 @@ const createFakeDatabase = (rows: (Record<string, unknown> & { _id: string; tabl
             },
             async delete(id) {
                 calls.push({ args: undefined, method: "delete", tableOrId: id });
+            },
+            async deleteWhere(tableName, where, options) {
+                calls.push({ args: { options, where }, method: "deleteWhere", tableOrId: tableName });
+
+                return { deleted: rowsOfTable(tableName).length };
             },
             async findFirst(tableName, args) {
                 calls.push({ args, method: "findFirst", tableOrId: tableName });
@@ -135,6 +161,11 @@ const createFakeDatabase = (rows: (Record<string, unknown> & { _id: string; tabl
             },
             async patch(id, patchValue) {
                 calls.push({ args: patchValue, method: "patch", tableOrId: id });
+            },
+            async patchWhere(tableName, args, options) {
+                calls.push({ args: { ...args, options }, method: "patchWhere", tableOrId: tableName });
+
+                return { patched: rowsOfTable(tableName).length };
             },
             query() {
                 throw new Error("query() not used in these tests");
@@ -187,8 +218,32 @@ const enableQueryReader = (database: FakeDatabase, rows: (Record<string, unknown
             },
             take: async (limit) => list.slice(0, limit),
             unique: async () => list[0] ?? null,
-            withIndex: () => makeReader(list),
-            withSearchIndex: () => makeReader(list),
+            // Run the range callback against a chainable no-op builder — mirrors
+            // `@lunora/do`'s reader, and proves the mask guard's recorder pass is
+            // an EXTRA run the (pure) callback survives (the reader still runs it).
+            withIndex: (_indexName, range) => {
+                const builder: FakeIndexBuilder = {
+                    eq: () => builder,
+                    gt: () => builder,
+                    gte: () => builder,
+                    lt: () => builder,
+                    lte: () => builder,
+                };
+
+                range?.(builder);
+
+                return makeReader(list);
+            },
+            withSearchIndex: (_indexName, search) => {
+                const builder: FakeSearchBuilder = {
+                    eq: () => builder,
+                    search: () => builder,
+                };
+
+                search(builder);
+
+                return makeReader(list);
+            },
         };
     };
 
@@ -456,10 +511,328 @@ describe("mask — analytical reductions fail closed", () => {
         expect(database.calls.some((call) => call.method === "aggregate")).toBe(true);
     });
 
+    it("aggregate() with a where on a masked column throws MASK_UNSUPPORTED", async () => {
+        expect.assertions(2);
+
+        const database = createFakeDatabase([{ _id: "u1", ssn: "123-45-6789", table: "users" }]);
+
+        const handler = lunora.query
+            .use(maskForTest({ users: { ssn: "redact" } }))
+            // A `where` over a masked column turns the row-count aggregate into a
+            // value-confirmation oracle (count === 1 ⇒ value matched). Fail closed
+            // before delegating to base.
+            .query(async ({ ctx }) => (ctx as unknown as TestContext).db.aggregate("users", { op: "count", where: { ssn: { eq: "123-45-6789" } } }));
+
+        await expect(handler.handler(makeContext(database, "u1"), {})).rejects.toMatchObject({ code: "MASK_UNSUPPORTED", name: "LunoraError" });
+        expect(database.calls.some((call) => call.method === "aggregate")).toBe(false);
+    });
+
+    it("groupBy() with a where on a masked column throws MASK_UNSUPPORTED", async () => {
+        expect.assertions(2);
+
+        const database = createFakeDatabase([{ _id: "u1", ssn: "123-45-6789", status: "active", table: "users" }]);
+
+        const handler = lunora.query
+            .use(maskForTest({ users: { ssn: "redact" } }))
+            .query(async ({ ctx }) => (ctx as unknown as TestContext).db.groupBy("users", { by: ["status"], where: { ssn: { eq: "123-45-6789" } } }));
+
+        await expect(handler.handler(makeContext(database, "u1"), {})).rejects.toMatchObject({ code: "MASK_UNSUPPORTED", name: "LunoraError" });
+        expect(database.calls.some((call) => call.method === "groupBy")).toBe(false);
+    });
+
+    it("aggregate() with a masked column nested under an OR/NOT where is still rejected", async () => {
+        expect.assertions(1);
+
+        const database = createFakeDatabase([{ _id: "u1", ssn: "123-45-6789", table: "users" }]);
+
+        const handler = lunora.query
+            .use(maskForTest({ users: { ssn: "redact" } }))
+            .query(async ({ ctx }) => (ctx as unknown as TestContext).db.aggregate("users", { op: "count", where: { OR: [{ NOT: { ssn: { eq: "000" } } }] } }));
+
+        await expect(handler.handler(makeContext(database, "u1"), {})).rejects.toMatchObject({ code: "MASK_UNSUPPORTED", name: "LunoraError" });
+    });
+
+    it("aggregate()/groupBy() with a where on a NON-masked column of a masked table pass through", async () => {
+        expect.assertions(2);
+
+        const database = createFakeDatabase([{ _id: "u1", ssn: "123-45-6789", status: "active", table: "users" }]);
+
+        const aggregateHandler = lunora.query
+            .use(maskForTest({ users: { ssn: "redact" } }))
+            .query(async ({ ctx }) => (ctx as unknown as TestContext).db.aggregate("users", { op: "count", where: { status: { eq: "active" } } }));
+
+        const groupByHandler = lunora.query
+            .use(maskForTest({ users: { ssn: "redact" } }))
+            .query(async ({ ctx }) => (ctx as unknown as TestContext).db.groupBy("users", { by: ["status"], where: { status: { eq: "active" } } }));
+
+        await aggregateHandler.handler(makeContext(database, "u1"), {});
+        await groupByHandler.handler(makeContext(database, "u1"), {});
+
+        expect(database.calls.some((call) => call.method === "aggregate")).toBe(true);
+        expect(database.calls.some((call) => call.method === "groupBy")).toBe(true);
+    });
+
     it("mASK_UNSUPPORTED carries HTTP status 422", () => {
         expect.assertions(1);
 
         expect(new LunoraError("MASK_UNSUPPORTED").status).toBe(422);
+    });
+});
+
+describe("mask — value oracle via filter/sort fails closed (regression)", () => {
+    it("findMany with a where on a masked column throws MASK_UNSUPPORTED", async () => {
+        expect.assertions(2);
+
+        const database = createFakeDatabase([{ _id: "u1", ssn: "123-45-6789", table: "users" }]);
+
+        const handler = lunora.query
+            .use(maskForTest({ users: { ssn: "redact" } }))
+            .query(async ({ ctx }) => (ctx as unknown as TestContext).db.findMany("users", { where: { ssn: { eq: "123-45-6789" } } }));
+
+        // Filtering by a masked column would let a caller confirm the exact value
+        // the mask hides (row present ⇒ value matched) — must fail closed.
+        await expect(handler.handler(makeContext(database, "u1"), {})).rejects.toMatchObject({ code: "MASK_UNSUPPORTED", name: "LunoraError" });
+        expect(database.calls.some((call) => call.method === "findMany")).toBe(false);
+    });
+
+    it("a masked column nested under an OR/NOT where is still rejected", async () => {
+        expect.assertions(1);
+
+        const database = createFakeDatabase([{ _id: "u1", ssn: "123-45-6789", table: "users" }]);
+
+        const handler = lunora.query
+            .use(maskForTest({ users: { ssn: "redact" } }))
+            .query(async ({ ctx }) => (ctx as unknown as TestContext).db.findMany("users", { where: { OR: [{ NOT: { ssn: { eq: "000" } } }] } }));
+
+        await expect(handler.handler(makeContext(database, "u1"), {})).rejects.toMatchObject({ code: "MASK_UNSUPPORTED", name: "LunoraError" });
+    });
+
+    it("count with a where on a masked column throws MASK_UNSUPPORTED", async () => {
+        expect.assertions(2);
+
+        const database = createFakeDatabase([{ _id: "u1", ssn: "123-45-6789", table: "users" }]);
+
+        const handler = lunora.query
+            .use(maskForTest({ users: { ssn: "redact" } }))
+            .query(async ({ ctx }) => (ctx as unknown as TestContext).db.count("users", { where: { ssn: { eq: "123-45-6789" } } }));
+
+        await expect(handler.handler(makeContext(database, "u1"), {})).rejects.toMatchObject({ code: "MASK_UNSUPPORTED", name: "LunoraError" });
+        expect(database.calls.some((call) => call.method === "count")).toBe(false);
+    });
+
+    it("a where on a NON-masked column of a masked table passes through", async () => {
+        expect.assertions(1);
+
+        const database = createFakeDatabase([{ _id: "u1", ssn: "123-45-6789", status: "active", table: "users" }]);
+
+        const handler = lunora.query
+            .use(maskForTest({ users: { ssn: "redact" } }))
+            .query(async ({ ctx }) => (ctx as unknown as TestContext).db.findMany("users", { where: { status: { eq: "active" } } }));
+
+        await handler.handler(makeContext(database, "u1"), {});
+
+        expect(database.calls.some((call) => call.method === "findMany")).toBe(true);
+    });
+
+    it("count with a baseWhere on a masked column throws MASK_UNSUPPORTED", async () => {
+        expect.assertions(2);
+
+        const database = createFakeDatabase([{ _id: "u1", ssn: "123-45-6789", table: "users" }]);
+
+        const handler = lunora.query
+            .use(maskForTest({ users: { ssn: "redact" } }))
+            // `baseWhere` reaches the SQL predicate just like `where`, so a masked
+            // column smuggled through it is the same count-oracle — fail closed.
+            .query(async ({ ctx }) => (ctx as unknown as TestContext).db.count("users", { baseWhere: { ssn: { eq: "123-45-6789" } } }));
+
+        await expect(handler.handler(makeContext(database, "u1"), {})).rejects.toMatchObject({ code: "MASK_UNSUPPORTED", name: "LunoraError" });
+        expect(database.calls.some((call) => call.method === "count")).toBe(false);
+    });
+
+    it("findMany with an orderBy on a masked column throws MASK_UNSUPPORTED", async () => {
+        expect.assertions(2);
+
+        const database = createFakeDatabase([{ _id: "u1", ssn: "123-45-6789", table: "users" }]);
+
+        const handler = lunora.query
+            .use(maskForTest({ users: { ssn: "redact" } }))
+            // Masking rewrites cells but preserves row order, so ordering by a
+            // masked column returns masked cells sorted by the true hidden value —
+            // a sort/binary-search oracle. Must fail closed before delegating.
+            .query(async ({ ctx }) => (ctx as unknown as TestContext).db.findMany("users", { orderBy: [{ ssn: "asc" }] }));
+
+        await expect(handler.handler(makeContext(database, "u1"), {})).rejects.toMatchObject({ code: "MASK_UNSUPPORTED", name: "LunoraError" });
+        expect(database.calls.some((call) => call.method === "findMany")).toBe(false);
+    });
+
+    it("findFirst with an orderBy on a masked column throws MASK_UNSUPPORTED", async () => {
+        expect.assertions(2);
+
+        const database = createFakeDatabase([{ _id: "u1", ssn: "123-45-6789", table: "users" }]);
+
+        const handler = lunora.query
+            .use(maskForTest({ users: { ssn: "redact" } }))
+            .query(async ({ ctx }) => (ctx as unknown as TestContext).db.findFirst("users", { orderBy: [{ ssn: "asc" }] }));
+
+        await expect(handler.handler(makeContext(database, "u1"), {})).rejects.toMatchObject({ code: "MASK_UNSUPPORTED", name: "LunoraError" });
+        expect(database.calls.some((call) => call.method === "findFirst")).toBe(false);
+    });
+
+    it("an orderBy on a NON-masked column of a masked table passes through", async () => {
+        expect.assertions(1);
+
+        const database = createFakeDatabase([{ _id: "u1", ssn: "123-45-6789", status: "active", table: "users" }]);
+
+        const handler = lunora.query
+            .use(maskForTest({ users: { ssn: "redact" } }))
+            .query(async ({ ctx }) => (ctx as unknown as TestContext).db.findMany("users", { orderBy: [{ status: "asc" }] }));
+
+        await handler.handler(makeContext(database, "u1"), {});
+
+        expect(database.calls.some((call) => call.method === "findMany")).toBe(true);
+    });
+
+    it("deleteMany({ where }) on a masked column throws MASK_UNSUPPORTED", async () => {
+        expect.assertions(2);
+
+        const database = createFakeDatabase([{ _id: "u1", ssn: "123-45-6789", table: "users" }]);
+
+        const handler = lunora.mutation
+            .use(maskForTest({ users: { ssn: "redact" } }))
+            .mutation(async ({ ctx }) => (ctx as unknown as TestContext).db.deleteWhere("users", { ssn: { eq: "123-45-6789" } }));
+
+        // deleteMany({ where }) routes to the writer's where-based delete — a
+        // masked-column predicate is the same confirm/destroy oracle `where` on
+        // reads already blocks, plus it destroys the probed rows. Must fail closed
+        // and never reach the writer.
+        await expect(handler.handler(makeContext(database, "u1"), {})).rejects.toMatchObject({ code: "MASK_UNSUPPORTED", name: "LunoraError" });
+        expect(database.calls.some((call) => call.method === "deleteWhere")).toBe(false);
+    });
+
+    it("patchMany({ where, values }) on a masked column throws MASK_UNSUPPORTED", async () => {
+        expect.assertions(2);
+
+        const database = createFakeDatabase([{ _id: "u1", ssn: "123-45-6789", table: "users" }]);
+
+        const handler = lunora.mutation
+            .use(maskForTest({ users: { ssn: "redact" } }))
+            .mutation(async ({ ctx }) =>
+                (ctx as unknown as TestContext).db.patchWhere("users", { patch: { status: "flagged" }, where: { ssn: { eq: "123-45-6789" } } }),
+            );
+
+        // patchMany({ where }) routes to the writer's where-based patch — the
+        // `{ patched: n }` count alone confirms/binary-searches the hidden value.
+        // Must fail closed and never reach the writer.
+        await expect(handler.handler(makeContext(database, "u1"), {})).rejects.toMatchObject({ code: "MASK_UNSUPPORTED", name: "LunoraError" });
+        expect(database.calls.some((call) => call.method === "patchWhere")).toBe(false);
+    });
+
+    it("findMany with a baseWhere on a masked column throws MASK_UNSUPPORTED", async () => {
+        expect.assertions(2);
+
+        const database = createFakeDatabase([{ _id: "u1", ssn: "123-45-6789", table: "users" }]);
+
+        const handler = lunora.query
+            .use(maskForTest({ users: { ssn: "redact" } }))
+            // `baseWhere` is a documented, caller-reachable field on `QueryArgs` that
+            // the RLS layer AND-merges into the SQL predicate — the same oracle
+            // `where` is already blocked for, reached through a different field.
+            .query(async ({ ctx }) => (ctx as unknown as TestContext).db.findMany("users", { baseWhere: { ssn: { eq: "123-45-6789" } } }));
+
+        await expect(handler.handler(makeContext(database, "u1"), {})).rejects.toMatchObject({ code: "MASK_UNSUPPORTED", name: "LunoraError" });
+        expect(database.calls.some((call) => call.method === "findMany")).toBe(false);
+    });
+
+    it("deleteMany({ where }) on a NON-masked column of a masked table passes through", async () => {
+        expect.assertions(1);
+
+        const database = createFakeDatabase([{ _id: "u1", ssn: "123-45-6789", status: "active", table: "users" }]);
+
+        const handler = lunora.mutation
+            .use(maskForTest({ users: { ssn: "redact" } }))
+            .mutation(async ({ ctx }) => (ctx as unknown as TestContext).db.deleteWhere("users", { status: { eq: "active" } }));
+
+        await handler.handler(makeContext(database, "u1"), {});
+
+        expect(database.calls.some((call) => call.method === "deleteWhere")).toBe(true);
+    });
+});
+
+describe("mask — value oracle via index readers fails closed (regression)", () => {
+    it("withSearchIndex searching a masked column throws MASK_UNSUPPORTED", async () => {
+        expect.assertions(1);
+
+        const seed = [{ _id: "u1", email: "a@x.com", name: "Ann", table: "users" }];
+        const database = createFakeDatabase(seed);
+
+        enableQueryReader(database, seed);
+
+        const handler = lunora.query
+            .use(maskForTest({ users: { email: "redact" } }))
+            // A search index over a masked column is the headline oracle: the
+            // matched (masked) row confirms the search term equals the hidden
+            // value. Must fail closed before the search ever runs.
+            .query(async ({ ctx }) =>
+                (ctx as unknown as TestContext).db
+                    .query("users")
+                    .withSearchIndex("by_email", (q) => q.search("email", "a@x.com"))
+                    .first(),
+            );
+
+        await expect(handler.handler(makeContext(database, "u1"), {})).rejects.toMatchObject({ code: "MASK_UNSUPPORTED", name: "LunoraError" });
+    });
+
+    it("withIndex ranging over a masked column throws MASK_UNSUPPORTED", async () => {
+        expect.assertions(1);
+
+        const seed = [{ _id: "u1", email: "a@x.com", name: "Ann", table: "users" }];
+        const database = createFakeDatabase(seed);
+
+        enableQueryReader(database, seed);
+
+        const handler = lunora.query
+            .use(maskForTest({ users: { email: "redact" } }))
+            // An index equality/range over a masked column confirms / binary-
+            // searches the hidden value the same way a masked `where` does.
+            .query(async ({ ctx }) =>
+                (ctx as unknown as TestContext).db
+                    .query("users")
+                    .withIndex("by_email", (q) => q.eq("email", "a@x.com"))
+                    .first(),
+            );
+
+        await expect(handler.handler(makeContext(database, "u1"), {})).rejects.toMatchObject({ code: "MASK_UNSUPPORTED", name: "LunoraError" });
+    });
+
+    it("withIndex over a NON-masked column of a masked table still works and masks output (Strategy A)", async () => {
+        expect.assertions(4);
+
+        const seed = [
+            { _id: "u1", createdAt: 1, email: "a@x.com", name: "Ann", table: "users" },
+            { _id: "u2", createdAt: 2, email: "b@x.com", name: "Bo", table: "users" },
+        ];
+        const database = createFakeDatabase(seed);
+
+        enableQueryReader(database, seed);
+
+        const handler = lunora.query
+            .use(maskForTest({ users: { email: "redact" } }))
+            // Ranging over a NON-masked column is a legitimate index read: it must
+            // pass through (precise Strategy A), and the returned rows must still
+            // be masked on output.
+            .query(async ({ ctx }) =>
+                (ctx as unknown as TestContext).db
+                    .query("users")
+                    .withIndex("by_created", (q) => q.gte("createdAt", 1))
+                    .collect(),
+            );
+
+        const rows = await handler.handler(makeContext(database, "u1"), {});
+
+        expect(rows).toHaveLength(2);
+        expect(rows[0]?.["email"]).toBeNull();
+        expect(rows[1]?.["email"]).toBeNull();
+        expect(rows[0]?.["name"]).toBe("Ann");
     });
 });
 

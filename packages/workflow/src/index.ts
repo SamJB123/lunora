@@ -5,6 +5,7 @@ export { defineStep, isStepDefinition } from "./define-step";
 export { defineWorkflow, isWorkflowDefinition, workflowBindingName, workflowClassName, workflowDefaultName } from "./define-workflow";
 export type { NativeNonRetryableErrorConstructor } from "./errors";
 export { convertNonRetryableError, isNonRetryableError, NonRetryableError, toNativeNonRetryableError } from "./errors";
+export { branch, MAX_BRANCHES } from "./fan-out";
 export type {
     WorkflowInstanceAction,
     WorkflowInstanceDetail,
@@ -19,6 +20,7 @@ export { createWorkflowRunContext } from "./run-context";
 export { createRunStep, validateStepArgs } from "./run-step";
 export type {
     ArgsOf,
+    BranchCompensationParams,
     FunctionReference,
     InferStepArgs,
     LunoraWorkflowsOptions,
@@ -32,6 +34,8 @@ export type {
     StepRollbackHandler,
     StepRunContext,
     WorkflowBindingLike,
+    WorkflowBranch,
+    WorkflowBranchOutputs,
     WorkflowConfig,
     WorkflowCreateOptions,
     WorkflowDefinition,
@@ -41,12 +45,15 @@ export type {
     WorkflowInstanceLike,
     WorkflowInstanceStatus,
     WorkflowLogger,
+    WorkflowParallelFunction,
     WorkflowRollbackContextLike,
     WorkflowRollbackHandlerLike,
     WorkflowRunContext,
     WorkflowRunFunction,
     WorkflowRunStepFunction,
     Workflows,
+    WorkflowSpawnFunction,
+    WorkflowSpawnOptions,
     WorkflowStatusResult,
     WorkflowStepConfigLike,
     WorkflowStepContextLike,

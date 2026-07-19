@@ -13,6 +13,8 @@
 import { createReadStream, createWriteStream } from "node:fs";
 import { stat, unlink } from "node:fs/promises";
 
+import { LunoraError } from "@lunora/errors";
+
 import resolveAdminBaseUrl from "../util/admin-url";
 import type { Logger } from "../util/logger";
 import type { FetchLike } from "./run/handler";
@@ -269,6 +271,8 @@ interface ImportCommandOptions {
     table?: string;
     token?: string;
     url?: string;
+    /** Confirm bulk-writing production. Required alongside `--prod`. */
+    yes?: boolean;
 }
 
 interface ImportCommandResult {
@@ -292,6 +296,12 @@ interface ImportRequest {
 const resolveImportRequest = async (options: ImportCommandOptions): Promise<ImportRequest | undefined> => {
     if (options.prod && options.url === undefined) {
         options.logger.error("--prod requires an explicit --url (refusing to import to the implicit localhost worker)");
+
+        return undefined;
+    }
+
+    if (options.prod && options.yes !== true) {
+        options.logger.error("import --prod bulk-writes production. Re-run with --yes to confirm.");
 
         return undefined;
     }
@@ -385,7 +395,7 @@ const runImportCommand = async (options: ImportCommandOptions): Promise<ImportCo
         if (!response.ok) {
             const text = await response.text().catch(() => "<no body>");
 
-            throw new Error(`import batch failed (HTTP ${String(response.status)}): ${text}`);
+            throw new LunoraError("INTERNAL", `import batch failed (HTTP ${String(response.status)}): ${text}`);
         }
 
         const json = (await response.json()) as {
@@ -434,7 +444,7 @@ const runImportCommand = async (options: ImportCommandOptions): Promise<ImportCo
         } catch (error: unknown) {
             const message = error instanceof Error ? error.message : String(error);
 
-            throw new Error(`invalid JSON on line ${String(lineNumber)}: ${message}`, { cause: error });
+            throw new LunoraError("INTERNAL", `invalid JSON on line ${String(lineNumber)}: ${message}`, { cause: error });
         }
 
         batch.push(JSON.stringify({ doc: parsedDocument, table: options.table }));

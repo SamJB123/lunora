@@ -1,7 +1,17 @@
 import type { Validator } from "@lunora/values";
 
 import { validateArgs } from "../functions";
-import type { ActionCtx as ActionContext, ArgsValidator, FunctionKind, InferArgs, MutationCtx as MutationContext, QueryCtx as QueryContext } from "../types";
+import type { RlsTag } from "../rls/policy-tag";
+import { readRlsTag } from "../rls/policy-tag";
+import type {
+    ActionCtx as ActionContext,
+    ArgsValidator,
+    FunctionKind,
+    InferArgs,
+    MutationCtx as MutationContext,
+    QueryCtx as QueryContext,
+    X402ProcedureConfig,
+} from "../types";
 import runMiddlewareChain from "./run-middleware";
 import type {
     ActionBuilder,
@@ -23,6 +33,8 @@ interface BuilderState {
     middlewares: ReadonlyArray<Middleware<unknown, unknown>>;
     /** Validator the handler's result is parsed through when `.output()` was called. */
     output?: Validator;
+    /** Payment tag set by `.x402({ price })`; stamped onto the registered function as `fn.x402`. */
+    x402?: X402ProcedureConfig;
 }
 
 /**
@@ -118,6 +130,38 @@ const makeStreamHandler =
     };
 
 /**
+ * Hoist the read/write policies + roles carried by the chain's `.use(rls(...))`
+ * steps onto the registered function as `fn.rls`. The local-first shape path
+ * reads this to AND-compose a `defineShape` predicate with the table's RLS read
+ * base-where — a shape runs no procedure, so without this surface its membership
+ * reads would bypass the table's read policies (see `rls/shape-read-base.ts`).
+ * Returns `undefined` when no `rls()` middleware is present, so a non-RLS
+ * function carries no `rls` key.
+ *
+ * Each `rls()` step is preserved as its own `{ policies, roles }` tag rather than
+ * flattened into shared arrays: a policy's `auth.can(...)` must resolve against
+ * the role→permission map of the SAME middleware that declared it (exactly as the
+ * request-time `rls()` path does). Flattening would let a permission registered on
+ * one middleware satisfy another middleware's policy, replicating rows an
+ * equivalent guarded query would deny.
+ */
+const collectRls = (middlewares: ReadonlyArray<Middleware<unknown, unknown>>): undefined | { tags: ReadonlyArray<RlsTag> } => {
+    const tags: RlsTag[] = [];
+
+    for (const middleware of middlewares) {
+        const tag = readRlsTag(middleware);
+
+        if (!tag) {
+            continue;
+        }
+
+        tags.push(tag);
+    }
+
+    return tags.length > 0 ? { tags } : undefined;
+};
+
+/**
  * Construct a kind-specific builder. The terminal method is keyed by the kind
  * (`query` / `mutation` / `action`) so codegen reads the kind from the call
  * expression's property name without tracing the builder across files.
@@ -136,11 +180,15 @@ const makeBuilder = (kind: FunctionKind, state: BuilderState, visibility?: "inte
         ...(visibility ? { __lunoraVisibility: visibility } : {}),
         input: (validators: ArgsValidator) => makeBuilder(kind, { ...state, args: { ...state.args, ...validators } }, visibility),
         [kind]: <R>(userHandler: (options: { args: Record<string, unknown>; ctx: unknown }) => Promise<R> | R) => {
+            const rls = collectRls(state.middlewares);
+
             return {
                 args: state.args,
                 handler: makeHandler(state.args, state.middlewares, userHandler, state.output),
                 kind,
+                ...(rls ? { rls } : {}),
                 ...(visibility ? { visibility } : {}),
+                ...(state.x402 ? { x402: state.x402 } : {}),
             };
         },
         output: (validator: Validator) => makeBuilder(kind, { ...state, output: validator }, visibility),
@@ -157,16 +205,25 @@ const makeBuilder = (kind: FunctionKind, state: BuilderState, visibility?: "inte
                           signal: AbortSignal;
                       }) => AsyncGenerator<R, void, void> | AsyncIterable<R>,
                   ) => {
+                      const rls = collectRls(state.middlewares);
+
                       return {
                           args: state.args,
                           handler: makeStreamHandler(state.args, state.middlewares, userHandler),
                           kind: "stream" as const,
+                          ...(rls ? { rls } : {}),
                           ...(visibility ? { visibility } : {}),
+                          ...(state.x402 ? { x402: state.x402 } : {}),
                       };
                   },
               }
             : {}),
         use: (middleware: Middleware<unknown, unknown>) => makeBuilder(kind, { ...state, middlewares: [...state.middlewares, middleware] }, visibility),
+        // `.x402({ price })` marks a public procedure as paid. It's public-only:
+        // internal functions are server-to-server (cron/scheduler/`ctx.run*`) and
+        // never reachable via a client RPC, so there's nothing to charge. Omitting
+        // it on internal builders keeps the runtime shape aligned with the types.
+        ...(visibility ? {} : { x402: (config: X402ProcedureConfig) => makeBuilder(kind, { ...state, x402: config }, visibility) }),
     };
 };
 

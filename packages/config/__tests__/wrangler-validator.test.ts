@@ -172,6 +172,56 @@ describe("wrangler-validator", () => {
             expect(report.errors.some((line) => line.includes("docs-body"))).toBe(true);
         });
 
+        it("does not throw when durable_objects.bindings contains a null entry (JSONC trailing comma)", () => {
+            expect.assertions(2);
+
+            // `"durable_objects": { "bindings": [null] }` — a stray trailing comma in JSONC
+            // parses to exactly this. The validator must report the missing SHARD binding,
+            // not crash with a raw TypeError dereferencing `binding.name`.
+            const wrangler = {
+                compatibility_date: REQUIRED_COMPATIBILITY_DATE,
+                compatibility_flags: [REQUIRED_FLAG],
+                durable_objects: { bindings: [null] },
+            } as unknown as WranglerConfig;
+
+            const report = validateWranglerConfig(wrangler);
+
+            expect(report.valid).toBe(false);
+            expect(report.errors.some((line) => SHARD_BINDING_ERROR_RE.test(line))).toBe(true);
+        });
+
+        it("does not throw when durable_objects.bindings is a non-array value", () => {
+            expect.assertions(2);
+
+            const wrangler = {
+                compatibility_date: REQUIRED_COMPATIBILITY_DATE,
+                compatibility_flags: [REQUIRED_FLAG],
+                durable_objects: { bindings: "SHARD" },
+            } as unknown as WranglerConfig;
+
+            const report = validateWranglerConfig(wrangler);
+
+            expect(report.valid).toBe(false);
+            expect(report.errors.some((line) => SHARD_BINDING_ERROR_RE.test(line))).toBe(true);
+        });
+
+        it("does not throw when d1_databases contains a null entry for a global-table schema", () => {
+            expect.assertions(2);
+
+            const wrangler = {
+                compatibility_date: REQUIRED_COMPATIBILITY_DATE,
+                compatibility_flags: [REQUIRED_FLAG],
+                d1_databases: [null],
+                durable_objects: { bindings: [{ class_name: "ShardDO", name: "SHARD" }] },
+            } as unknown as WranglerConfig;
+
+            const report = validateWranglerConfig(wrangler, { hasGlobalTable: true, vectorIndexNames: [] });
+
+            // The null entry is skipped; the missing "DB" binding is reported structurally.
+            expect(report.valid).toBe(false);
+            expect(report.errors.some((line) => line.includes("d1_databases"))).toBe(true);
+        });
+
         it("rejects a wildcard CORS origin paired with credentials in vars", () => {
             expect.assertions(2);
 
@@ -854,6 +904,23 @@ describe("wrangler-validator", () => {
             expect(missingBinding.errors.join(" ")).toContain('must have a non-empty "binding"');
         });
 
+        it("accepts a well-formed flagship binding; warns on a missing app_id; errors on a missing binding", () => {
+            expect.assertions(4);
+
+            const valid = validateWranglerConfig(validBase({ flagship: [{ app_id: "app-abc", binding: "FLAGS" }] }));
+
+            expect(valid.valid).toBe(true);
+
+            const missingAppId = validateWranglerConfig(validBase({ flagship: [{ binding: "FLAGS" }] }));
+
+            expect(missingAppId.valid).toBe(true);
+            expect(missingAppId.warnings.join(" ")).toMatch(/has no "app_id"/u);
+
+            const missingBinding = validateWranglerConfig(validBase({ flagship: [{ app_id: "app-abc" }] }));
+
+            expect(missingBinding.errors.join(" ")).toContain('must have a non-empty "binding"');
+        });
+
         it("accepts a well-formed hyperdrive binding; warns on a missing id; errors on a missing binding", () => {
             expect.assertions(3);
 
@@ -1000,6 +1067,62 @@ describe("wrangler-validator", () => {
             expect(validateWranglerConfig(validBase({ assets: "x" as never })).errors.join(" ")).toContain("assets must be an object");
             expect(validateWranglerConfig(validBase({ assets: { binding: 5 as never, directory: "./dist/client" } })).errors.join(" ")).toContain(
                 "assets.binding must be a non-empty string",
+            );
+        });
+
+        it("accepts a well-formed cache block and rejects bad shapes", () => {
+            expect.assertions(5);
+
+            expect(validateWranglerConfig(validBase({ cache: { enabled: true }, compatibility_date: "2026-05-01" })).valid).toBe(true);
+            expect(validateWranglerConfig(validBase({ cache: { enabled: false } })).valid).toBe(true);
+            expect(validateWranglerConfig(validBase({ cache: "yes" as never })).errors.join(" ")).toContain("cache must be an object");
+            expect(validateWranglerConfig(validBase({ cache: null })).errors.join(" ")).toContain("cache must be an object");
+            expect(validateWranglerConfig(validBase({ cache: { enabled: "yes" as never } })).errors.join(" ")).toContain("cache.enabled must be a boolean");
+        });
+
+        it("requires compatibility_date >= 2026-05-01 when cache.enabled is true", () => {
+            expect.assertions(7);
+
+            const withCache = { cache: { enabled: true }, compatibility_date: "2026-05-01" };
+            const withCacheOld = { cache: { enabled: true }, compatibility_date: "2026-04-07" };
+            const withoutCache = { compatibility_date: "2026-04-07" };
+            const exportsCacheOld = { exports: { default: { type: "worker", cache: { enabled: true } } }, compatibility_date: "2026-04-07" };
+            const cacheWithMalformedDate = { cache: { enabled: true }, compatibility_date: "2026-4-7" };
+            const nullExportsCache = { exports: null, cache: { enabled: true }, compatibility_date: "2026-04-07" };
+
+            expect(validateWranglerConfig(validBase(withCache)).valid).toBe(true);
+            expect(validateWranglerConfig(validBase(withCacheOld)).errors.join(" ")).toContain('cache.enabled requires compatibility_date >= "2026-05-01"');
+            expect(validateWranglerConfig(validBase(withoutCache)).valid).toBe(true);
+            expect(validateWranglerConfig(validBase(exportsCacheOld)).errors.join(" ")).toContain('cache.enabled requires compatibility_date >= "2026-05-01"');
+
+            const malformedReport = validateWranglerConfig(validBase(cacheWithMalformedDate));
+
+            expect(malformedReport.errors.join(" ")).toContain("YYYY-MM-DD");
+            expect(malformedReport.errors.join(" ")).not.toContain('cache.enabled requires compatibility_date >= "2026-05-01"');
+
+            // `exports: null` should not crash and should still surface the top-level cache date error.
+            expect(validateWranglerConfig(validBase(nullExportsCache)).errors.join(" ")).toContain('cache.enabled requires compatibility_date >= "2026-05-01"');
+        });
+
+        it("accepts a well-formed exports block and rejects malformed entry shapes", () => {
+            expect.assertions(8);
+
+            expect(
+                validateWranglerConfig(validBase({ exports: { default: { type: "worker", cache: { enabled: true } } }, compatibility_date: "2026-05-01" }))
+                    .valid,
+            ).toBe(true);
+            expect(validateWranglerConfig(validBase({ exports: { CachedBackend: { type: "worker", cache: { enabled: false } } } })).valid).toBe(true);
+            expect(validateWranglerConfig(validBase({ exports: "bad" as never })).errors.join(" ")).toContain("exports must be an object");
+            expect(validateWranglerConfig(validBase({ exports: null })).errors.join(" ")).toContain("exports must be an object");
+            expect(validateWranglerConfig(validBase({ exports: { default: "bad" as never } })).errors.join(" ")).toContain(
+                'exports["default"] must be an object',
+            );
+            expect(validateWranglerConfig(validBase({ exports: { default: null } })).errors.join(" ")).toContain('exports["default"] must be an object');
+            expect(validateWranglerConfig(validBase({ exports: { default: { type: "worker", cache: { enabled: 1 as never } } } })).errors.join(" ")).toContain(
+                'exports["default"].cache.enabled must be a boolean',
+            );
+            expect(validateWranglerConfig(validBase({ exports: { default: { type: "worker", cache: null } } })).errors.join(" ")).toContain(
+                'exports["default"].cache must be an object',
             );
         });
     });

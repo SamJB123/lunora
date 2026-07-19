@@ -74,10 +74,24 @@ describe("resolveClient", () => {
 });
 
 describe("createLunoraMcpServer request handlers", () => {
-    it("listTools returns the full tool definition set", async () => {
+    it("listTools returns only the read-only tools by default", async () => {
         expect.assertions(1);
 
         const server = createLunoraMcpServer({ client: mockClient().asClient });
+        const result = (await handlerFor(server, ListToolsRequestSchema.shape.method.value)({})) as ListToolsResult;
+
+        expect(result.tools.map((tool) => tool.name)).toStrictEqual([
+            "lunora_list_functions",
+            "lunora_list_tables",
+            "lunora_get_function_schema",
+            "lunora_run_query",
+        ]);
+    });
+
+    it("listTools includes the write tools when allowWrites is set", async () => {
+        expect.assertions(1);
+
+        const server = createLunoraMcpServer({ allowWrites: true, client: mockClient().asClient });
         const result = (await handlerFor(server, ListToolsRequestSchema.shape.method.value)({})) as ListToolsResult;
 
         expect(result.tools.map((tool) => tool.name)).toStrictEqual([
@@ -123,5 +137,78 @@ describe("createLunoraMcpServer request handlers", () => {
         })) as CallToolResult;
 
         expect(result.isError).toBe(true);
+    });
+});
+
+/** A client double exposing the mutation/query the agent tools dispatch. */
+const agentClient = (): { asClient: LunoraClient; mutation: ReturnType<typeof vi.fn> } => {
+    const mutation = vi.fn(async () => {
+        return { id: "wf-1", threadKey: "t-agent" };
+    });
+    const query = vi.fn(async (reference: unknown) =>
+        (reference as { __lunoraRef: string }).__lunoraRef === "agents:agentMessages" ? [{ content: "answer", role: "assistant" }] : { status: "idle" },
+    );
+
+    return { asClient: { mutation, query } as unknown as LunoraClient, mutation };
+};
+
+const supportExposure = [{ description: "Support", name: "support" }];
+
+describe("createLunoraMcpServer agent tools", () => {
+    it("advertises agent tools only when allowAgents is set with a non-empty agents list", async () => {
+        expect.assertions(2);
+
+        const withAgents = createLunoraMcpServer({ agents: supportExposure, allowAgents: true, client: mockClient().asClient });
+        const withAgentsResult = (await handlerFor(withAgents, ListToolsRequestSchema.shape.method.value)({})) as ListToolsResult;
+
+        expect(withAgentsResult.tools.map((tool) => tool.name)).toStrictEqual([
+            "lunora_list_functions",
+            "lunora_list_tables",
+            "lunora_get_function_schema",
+            "lunora_run_query",
+            "agent_support",
+            "lunora_agent_status",
+        ]);
+
+        // Agents listed but not opted in → no agent tools.
+        const offServer = createLunoraMcpServer({ agents: supportExposure, client: mockClient().asClient });
+        const offResult = (await handlerFor(offServer, ListToolsRequestSchema.shape.method.value)({})) as ListToolsResult;
+
+        expect(offResult.tools.some((tool) => tool.name.startsWith("agent_"))).toBe(false);
+    });
+
+    it("routes an agent_<name> call to the agentRun mutation", async () => {
+        expect.assertions(2);
+
+        const mock = agentClient();
+        const server = createLunoraMcpServer({ agents: supportExposure, agentMaxWaitMs: 10, agentPollIntervalMs: 5, allowAgents: true, client: mock.asClient });
+
+        const result = (await handlerFor(
+            server,
+            CallToolRequestSchema.shape.method.value,
+        )({
+            params: { arguments: { prompt: "help", threadKey: "t-agent" }, name: "agent_support" },
+        })) as CallToolResult;
+
+        expect(mock.mutation).toHaveBeenCalledWith({ __lunoraRef: "agents:agentRun" }, { agent: "support", input: "help", threadKey: "t-agent" });
+        expect(JSON.parse((result.content[0] as { text: string }).text)).toStrictEqual({ status: "idle", text: "answer", threadKey: "t-agent" });
+    });
+
+    it("refuses an agent call fail-closed when allowAgents is not set", async () => {
+        expect.assertions(2);
+
+        const mock = agentClient();
+        // The tool isn't advertised, but a client could still name it — dispatch must refuse.
+        const server = createLunoraMcpServer({ agents: supportExposure, client: mock.asClient });
+
+        const result = (await handlerFor(
+            server,
+            CallToolRequestSchema.shape.method.value,
+        )({
+            params: { arguments: { prompt: "help" }, name: "agent_support" },
+        })) as CallToolResult;
+
+        expect(result.isError).toBe(true);
+        expect(mock.mutation).not.toHaveBeenCalled();
     });
 });

@@ -55,6 +55,7 @@ import {
     encodeAggregateKey,
     encodeCursor,
     encodePartitionKey,
+    fanOutScalarCounts,
     foldAggregateTally,
     ftsTableName,
     hasTrigger,
@@ -85,9 +86,11 @@ import {
     throwingScheduler,
     tokenizeSearch,
 } from "@lunora/do";
+import { LunoraError } from "@lunora/errors";
 import type { SQL } from "drizzle-orm";
 import { sql } from "drizzle-orm";
 
+import { evictOldestEntry } from "../../../shared/evict-oldest";
 import type { SqlDialect, SqlRunResult } from "./dialect";
 import { effectiveColumnKind, sqliteDecode, sqliteEncode } from "./value-codec";
 
@@ -148,6 +151,7 @@ const queryAll = (exec: SqlCtxExec, dialect: SqlDialect, query: SQL): Promise<Re
 };
 
 /** Write twin of {@link queryAll}: render a drizzle {@link SQL} for the engine and run it. */
+// eslint-disable-next-line @typescript-eslint/no-invalid-void-type -- `void` is intentional: mirrors SqlExec.run, whose union accepts a void-returning exec (no affected-rows count)
 const queryRun = (exec: SqlCtxExec, dialect: SqlDialect, query: SQL): Promise<SqlRunResult | void> => {
     const { params, sql: text } = renderSql(dialect.name, query);
 
@@ -193,6 +197,7 @@ interface SqlCtxExec {
     // `SqlRunResult` ({ rowsAffected }) for engines whose OCC needs the affected
     // count (MySQL, which has no `RETURNING`). The union lets a PlanetScale
     // `SqlExec` satisfy this without forcing the D1 execs to report a count.
+    // eslint-disable-next-line @typescript-eslint/no-invalid-void-type -- `void` is intentional: accepts a void-returning exec (one that reports no affected-rows count)
     run: (sql: string, parameters: ReadonlyArray<unknown>) => Promise<SqlRunResult | void>;
 }
 
@@ -342,6 +347,28 @@ const tableColumns = (definition: TableDefinitionLike): [string, ColumnMetaLike]
 };
 
 /**
+ * The `field → effective column kind` mapping for a table, derived once per
+ * (immutable) definition and memoized. `effectiveColumnKind` is pure over the
+ * validator and the shape never mutates after `defineSchema`, so the mapping is
+ * static per definition — precomputing it removes the per-row
+ * `Object.entries(definition.shape)` + `effectiveColumnKind` recomputation on the
+ * decode hot path (a page/global read decodes R rows × M columns). Keyed on the
+ * definition object identity (stable: definitions come from `defineSchema`).
+ */
+const columnKindCache = new WeakMap<TableDefinitionLike, [string, string | undefined][]>();
+
+const columnKinds = (definition: TableDefinitionLike): [string, string | undefined][] => {
+    let kinds = columnKindCache.get(definition);
+
+    if (kinds === undefined) {
+        kinds = Object.entries(definition.shape).map(([field, validator]) => [field, effectiveColumnKind(validator)] as [string, string | undefined]);
+        columnKindCache.set(definition, kinds);
+    }
+
+    return kinds;
+};
+
+/**
  * Decode a SELECTed row back into a document: `id` → `_id`, `_creationTime`
  * preserved, and every column run through the shared {@link sqliteDecode} so the
  * stored form is reversed back into its JS shape. Exported so the data-browser
@@ -356,14 +383,14 @@ const tableColumns = (definition: TableDefinitionLike): [string, ColumnMetaLike]
 const decodeGlobalRow = (definition: TableDefinitionLike, row: Record<string, unknown>): Record<string, unknown> => {
     const decoded: Record<string, unknown> = {};
 
-    for (const [field, validator] of Object.entries(definition.shape)) {
+    for (const [field, kind] of columnKinds(definition)) {
         const raw = row[field];
 
         if (raw === undefined) {
             continue;
         }
 
-        decoded[field] = sqliteDecode(raw, effectiveColumnKind(validator));
+        decoded[field] = sqliteDecode(raw, kind);
     }
 
     decoded["_id"] = row["id"];
@@ -490,12 +517,11 @@ const createTableNameCache = (): {
         set: (id, table) => {
             if (map.has(id)) {
                 map.delete(id);
-            } else if (map.size >= TABLE_NAME_CACHE_CAPACITY) {
-                const oldest = map.keys().next().value;
-
-                if (oldest !== undefined) {
-                    map.delete(oldest);
-                }
+            } else {
+                // New key: bound the cache before inserting. The move-to-tail on
+                // `get` above is what makes this LRU; the eviction itself is the
+                // shared FIFO primitive.
+                evictOldestEntry(map, TABLE_NAME_CACHE_CAPACITY);
             }
 
             map.set(id, table);
@@ -720,7 +746,7 @@ const createSearchBuilder = (
     const builder = {
         eq: (field: string, value: unknown) => {
             if (!search.definition.filterFields?.includes(field)) {
-                throw new Error(`field "${field}" is not a filter field of search index "${search.indexName}" on table "${tableName}"`);
+                throw new LunoraError("INTERNAL", `field "${field}" is not a filter field of search index "${search.indexName}" on table "${tableName}"`);
             }
 
             search.filters.push({ field, value });
@@ -729,7 +755,10 @@ const createSearchBuilder = (
         },
         search: (field: string, query: string) => {
             if (field !== search.definition.field) {
-                throw new Error(`search index "${search.indexName}" on table "${tableName}" indexes "${search.definition.field}", not "${field}"`);
+                throw new LunoraError(
+                    "INTERNAL",
+                    `search index "${search.indexName}" on table "${tableName}" indexes "${search.definition.field}", not "${field}"`,
+                );
             }
 
             // Mutate the caller-owned stage in place (same object the reader
@@ -745,6 +774,21 @@ const createSearchBuilder = (
     };
 
     return builder;
+};
+
+/**
+ * Whether none of the fields a rank index reads (partition / sort / static
+ * `where`) differ between two row versions — the fast path that lets a patch of
+ * an unrelated field skip the rank companion's DELETE+INSERT. Twin of
+ * `@lunora/do`'s `rankIndexFieldsUnchanged` (replicated rather than imported —
+ * it is a private helper there). This is also what keeps `restore()`'s forced
+ * rank re-add correct: a marker-clearing patch touches no rank field, so the
+ * patch-path sync skips and `restore()` performs the single re-INSERT.
+ */
+const rankIndexFieldsUnchanged = (index: RankIndexDefinitionLike, previous: Record<string, unknown>, next: Record<string, unknown>): boolean => {
+    const fields = [...(index.partitionBy ?? []), ...index.sortBy.map((key) => key.field), ...(index.where ? Object.keys(index.where) : [])];
+
+    return fields.every((field) => previous[field] === next[field]);
 };
 
 /**
@@ -834,7 +878,7 @@ const rankPageColumns = (index: RankIndexDefinitionLike, sortColumns: ReadonlyAr
     // a non-empty `sortBy` (packages/server/src/schema.ts), so this is a
     // belt-and-suspenders guard that fails loudly instead of paginating wrong.
     if (index.sortBy.length === 0) {
-        throw new Error(`rankIndex "${index.name}" requires at least one "sortBy" column for stable pagination`);
+        throw new LunoraError("INTERNAL", `rankIndex "${index.name}" requires at least one "sortBy" column for stable pagination`);
     }
 
     const columns: { column: string; direction: "asc" | "desc" }[] = [{ column: "__partition__", direction: "asc" }];
@@ -1338,7 +1382,12 @@ const createSqlCtxDb = (options: SqlCtxDbOptions): DatabaseWriterLike => {
         fieldRef: columnRefSql,
         serialize: serializeColumnValue,
         // MySQL has no `||` string concat; the rest use the portable form compileWhereSql defaults to.
-        ...(dialect.name === "mysql" ? { likeContains: (reference, term) => sql`${reference} LIKE CONCAT('%', ${term}, '%')` } : {}),
+        // The term is wildcard-escaped by compileContains, so pair it with a backslash `ESCAPE` for literal
+        // matching. MySQL treats backslash as a string-literal escape, so the SQL text must contain a DOUBLED
+        // backslash (`ESCAPE '\\'`) to denote one literal backslash; drizzle's `sql` tag uses the COOKED
+        // template string, so `'\\\\'` here renders `'\\'` in the SQL (a single `'\'` would escape the closing
+        // quote and raise a syntax error). SQLite/Postgres take backslash literally and use the portable default.
+        ...(dialect.name === "mysql" ? { likeContains: (reference, term) => sql`${reference} LIKE CONCAT('%', ${term}, '%') ESCAPE '\\\\'` } : {}),
     };
 
     /** NULL-safe equality for the OCC guard, bound to this ctx-db's engine (see the module-level {@link nullSafeEqualsSql}). */
@@ -1968,14 +2017,38 @@ const createSqlCtxDb = (options: SqlCtxDbOptions): DatabaseWriterLike => {
         id: string,
         previous: Record<string, unknown> | undefined,
         next: Record<string, unknown> | undefined,
+        // eslint-disable-next-line sonarjs/cognitive-complexity -- rank companion sync: fast-path + soft-delete + per-index branches are inherent
     ): Promise<void> => {
-        const indexes = schema.tables[tableName]?.rankIndexes;
+        const definition = schema.tables[tableName];
+        const indexes = definition?.rankIndexes;
 
         if (!indexes || indexes.length === 0) {
             return;
         }
 
+        // A soft-deleted `next` row must never (re-)enter the rank companion:
+        // `delete()`'s soft path drops the entry, and any later write into the
+        // still-deleted row (admin fix-up, `$onUpdateFn` stamp, `onSetNull`
+        // cascade) must not resurrect it into `rank()`/`rankPage()`. `restore()`
+        // clears the marker *before* re-adding, so its INSERT still runs.
+        /* eslint-disable @typescript-eslint/no-unnecessary-condition -- the schema type over-narrows softDeleteMode; this guard defends the real runtime shape */
+        const softField = definition?.softDeleteMode?.field;
+        const nextFieldValue = softField === undefined || next === undefined ? undefined : next[softField];
+        const nextSoftDeleted = nextFieldValue !== null && nextFieldValue !== undefined;
+        /* eslint-enable @typescript-eslint/no-unnecessary-condition */
+
         for (const index of indexes) {
+            // Fast path: both images exist and no field THIS index reads
+            // (partition / sort / static `where`) changed — the companion entry
+            // is already correct, so skip the DELETE+INSERT pair entirely
+            // (mirrors the DO twin). Besides the write saving, this is what makes
+            // `restore()`'s forced re-add correct (a marker-clearing patch leaves
+            // every rank field unchanged, so the patch-path sync skips and the
+            // forced `restore()` INSERT is the sole re-add — no duplicate PK).
+            if (previous !== undefined && next !== undefined && rankIndexFieldsUnchanged(index, previous, next)) {
+                continue;
+            }
+
             // eslint-disable-next-line no-secrets/no-secrets -- false positive: this is a function name referenced in a comment, not a secret.
             // The pre-write `ensureRankBackfilledForTable` hook always runs
             // immediately before this sync, populating `rankBackfilled` with
@@ -1998,7 +2071,7 @@ const createSqlCtxDb = (options: SqlCtxDbOptions): DatabaseWriterLike => {
                 await queryRun(exec, dialect, sql`DELETE FROM ${sql.identifier(rankTable)} WHERE ${sql.identifier("__id__")} = ${id}`);
             }
 
-            if (next) {
+            if (next && !nextSoftDeleted) {
                 if (index.where && !matchesRankStaticWhere(next, index.where)) {
                     continue;
                 }
@@ -2257,7 +2330,21 @@ const createSqlCtxDb = (options: SqlCtxDbOptions): DatabaseWriterLike => {
             return [{ key: { ...planned.partial }, value: readAggregateValue(agg.op, { count: row.count, value: aggregateScalar(row.value) }) }];
         }
 
-        // Open group key → enumerate every companion row.
+        // A partially-constraining request (`where` pins a strict subset of the
+        // index's `by`-tuple → `partialKeys.length > 0` but not the full length,
+        // since the fully-specified case returned above) can't be answered by
+        // enumerating the whole companion: that would leak the groups the `where`
+        // filters out (indexed/scan divergence). Fall back to the SQL `GROUP BY`
+        // scan, which compiles and honours the `where`. The static-`where`-carry
+        // case (a partial key sourced from the index's own baked-in `where`, on a
+        // field the request never mentioned) also falls back here — the companion
+        // is scoped to that value, so it likewise can't answer an unfiltered
+        // request over it; the scan is the correct, complete answer either way.
+        if (partialKeys.length > 0) {
+            return undefined;
+        }
+
+        // Fully open group key (no constraint) → enumerate every companion row.
         const rowsIndexed = await queryAll(
             exec,
             dialect,
@@ -2287,7 +2374,8 @@ const createSqlCtxDb = (options: SqlCtxDbOptions): DatabaseWriterLike => {
     };
 
     const crossBackendUnsupported = (childTable: string): never => {
-        throw new Error(
+        throw new LunoraError(
+            "INTERNAL",
             `cross-backend relation: a global table cannot load the shard-local relation '${childTable}' (it spans every shard) — wire a cross-shard reader to support it`,
         );
     };
@@ -2334,7 +2422,7 @@ const createSqlCtxDb = (options: SqlCtxDbOptions): DatabaseWriterLike => {
             const definition = schema.tables[tableName];
 
             if (!definition) {
-                throw new Error(`unknown table: ${tableName}`);
+                throw new LunoraError("INTERNAL", `unknown table: ${tableName}`);
             }
 
             // Ensure the companion tables exist so the indexed fast-path can
@@ -2356,7 +2444,7 @@ const createSqlCtxDb = (options: SqlCtxDbOptions): DatabaseWriterLike => {
             }
 
             if (!aggOptions.field) {
-                throw new Error(`aggregate(${tableName}, { op: "${aggOptions.op}" }): "field" is required for non-count reducers`);
+                throw new LunoraError("INTERNAL", `aggregate(${tableName}, { op: "${aggOptions.op}" }): "field" is required for non-count reducers`);
             }
 
             // Soft delete: aggregate over LIVE rows only; force the scan path (the
@@ -2412,7 +2500,7 @@ const createSqlCtxDb = (options: SqlCtxDbOptions): DatabaseWriterLike => {
             const definition = schema.tables[tableName];
 
             if (!definition) {
-                throw new Error(`unknown table: ${tableName}`);
+                throw new LunoraError("INTERNAL", `unknown table: ${tableName}`);
             }
 
             // Ensure the `__agg_` companion exists so the indexed count path
@@ -2511,7 +2599,8 @@ const createSqlCtxDb = (options: SqlCtxDbOptions): DatabaseWriterLike => {
                 deletedReference: (references) => existing?.[references],
                 findHolders: async (holderTable, field, value) => {
                     if (schema.tables[holderTable]?.shardMode?.kind === "shardBy") {
-                        throw new Error(
+                        throw new LunoraError(
+                            "INTERNAL",
                             `cross-backend cascade from global '${tableName}' into shardBy '${holderTable}' is not supported — would require Query Coordinator fan-out across shards`,
                         );
                     }
@@ -2604,7 +2693,7 @@ const createSqlCtxDb = (options: SqlCtxDbOptions): DatabaseWriterLike => {
             const definition = schema.tables[tableName];
 
             if (!definition) {
-                throw new Error(`unknown table: ${tableName}`);
+                throw new LunoraError("INTERNAL", `unknown table: ${tableName}`);
             }
 
             // The primary list read — provision the global tables first so a
@@ -2620,12 +2709,81 @@ const createSqlCtxDb = (options: SqlCtxDbOptions): DatabaseWriterLike => {
             // as the top-level `relationPredicateFetcher`; aliased here for the
             // nested `with` load.
             const relationFetcher = relationPredicateFetcher;
-            const relationCounter: DatabaseWriterLike["count"] = (childTable, where) => {
-                if (!isShardLocalTarget(childTable)) {
-                    return writer.count(childTable, where);
+
+            /**
+             * Grouped aggregate counter for `_count` relation loading. For
+             * local D1 children, issues one `SELECT :whereField AS __fk__,
+             * COUNT(*) … GROUP BY :whereField` and returns all tallies in a
+             * single round-trip. For shard-local (cross-shard reverse
+             * direction), fans out parallel scalar `crossShardCounter` calls
+             * since the coordinator interface doesn't expose grouped counts.
+             *
+             * CORRECTNESS: `policyWhere` may contain relation predicates (e.g.
+             * `{author:{is:W}}`). These are resolved via `resolveAggregateRelations`
+             * BEFORE `compileWhereSql` so they are rewritten into flat IN clauses
+             * rather than compiled raw as scalar equality (which never matches).
+             * The cross-shard fan-out path routes through `crossShardCounter`,
+             * which uses the full `count()` method and resolves predicates
+             * internally — so only the local D1 path needs this step.
+             */
+            const relationGroupedCounter = async (
+                childTable: string,
+                whereField: string,
+                values: unknown[],
+                policyWhere?: WhereInput,
+            ): Promise<Map<unknown, number>> => {
+                if (isShardLocalTarget(childTable)) {
+                    // Cross-shard reverse direction: parallel scalar counts per FK value.
+                    if (!crossShardCounter) {
+                        return crossBackendUnsupported(childTable);
+                    }
+
+                    return fanOutScalarCounts(crossShardCounter, childTable, whereField, values, policyWhere);
                 }
 
-                return crossShardCounter ? crossShardCounter(childTable, where) : crossBackendUnsupported(childTable);
+                // Local D1 child: one grouped SQL query.
+                const childDefinition = schema.tables[childTable];
+
+                if (!childDefinition) {
+                    throw new LunoraError("INTERNAL", `unknown table: ${childTable}`);
+                }
+
+                // Build WHERE: whereField IN (values) [AND policyWhere] [AND softDeleteScope].
+                // Then resolve any relation predicates before SQL compilation — without
+                // this, a relation predicate in policyWhere is compiled as scalar equality
+                // and silently returns 0 for every group (fail-closed but wrong).
+                const softScope = softDeleteScope(childDefinition.softDeleteMode, undefined);
+                const inFilter: WhereInput = { [whereField]: { in: values } };
+                const combined = mergeWhere(mergeWhere(inFilter, policyWhere), softScope);
+                // resolveAggregateRelations rewrites relation-crossing predicates (e.g.
+                // {author:{is:W}}) into flat IN clauses — consistent with count() /
+                // findMany(). Pass `undefined` for relationBaseWhere (no nested policy
+                // threading, matching what the old scalar counter did).
+                const resolvedCombined = await resolveAggregateRelations(combined, childTable, undefined);
+                const whereCondition = compileWhereSql(resolvedCombined, whereSqlStrategy);
+
+                // `physicalColumn` maps `_id`/`id` → `id`; all other fields are themselves.
+                const fieldRef = columnRefSql(whereField);
+
+                let groupQuery = sql`SELECT ${fieldRef} AS __fk__, COUNT(*) AS count FROM ${sql.identifier(childTable)}`;
+
+                if (whereCondition) {
+                    groupQuery = sql`${groupQuery} WHERE ${whereCondition}`;
+                }
+
+                groupQuery = sql`${groupQuery} GROUP BY ${fieldRef}`;
+
+                const groupRows = await queryAll(exec, dialect, groupQuery);
+                const result = new Map<unknown, number>();
+
+                for (const row of groupRows) {
+                    // JS SameValueZero Map lookup: safe for string ids; numeric FK
+                    // values must arrive from SQL as the same JS type as parent[parentField]
+                    // (the SQL→JS key-equality invariant introduced by the grouped path).
+                    result.set(row["__fk__"], Number(row["count"] ?? 0));
+                }
+
+                return result;
             };
 
             // RLS (3.2) / aggregates (3.1) inject `baseWhere` we AND-merge
@@ -2677,7 +2835,14 @@ const createSqlCtxDb = (options: SqlCtxDbOptions): DatabaseWriterLike => {
 
             if (limit === undefined) {
                 if (args.with) {
-                    await resolveWith({ counter: relationCounter, fetcher: relationFetcher, parents: documents, schema, tableName, with: args.with });
+                    await resolveWith({
+                        fetcher: relationFetcher,
+                        groupedCounter: relationGroupedCounter,
+                        parents: documents,
+                        schema,
+                        tableName,
+                        with: args.with,
+                    });
                 }
 
                 // eslint-disable-next-line unicorn/no-null -- findMany's public return uses `continueCursor: string | null`; an unpaged result has no cursor.
@@ -2689,7 +2854,7 @@ const createSqlCtxDb = (options: SqlCtxDbOptions): DatabaseWriterLike => {
             const last = page.at(-1);
 
             if (args.with) {
-                await resolveWith({ counter: relationCounter, fetcher: relationFetcher, parents: page, schema, tableName, with: args.with });
+                await resolveWith({ fetcher: relationFetcher, groupedCounter: relationGroupedCounter, parents: page, schema, tableName, with: args.with });
             }
 
             return {
@@ -2726,7 +2891,7 @@ const createSqlCtxDb = (options: SqlCtxDbOptions): DatabaseWriterLike => {
             const definition = schema.tables[tableName];
 
             if (!definition) {
-                throw new Error(`unknown table: ${tableName}`);
+                throw new LunoraError("INTERNAL", `unknown table: ${tableName}`);
             }
 
             // Ensure the `__agg_` companion exists so the indexed groupBy path
@@ -2739,7 +2904,7 @@ const createSqlCtxDb = (options: SqlCtxDbOptions): DatabaseWriterLike => {
             aggregateSqlFunction(agg.op);
 
             if (agg.op !== "count" && !agg.field) {
-                throw new Error(`groupBy(${tableName}, { agg: { op: "${agg.op}" } }): "field" is required for non-count reducers`);
+                throw new LunoraError("INTERNAL", `groupBy(${tableName}, { agg: { op: "${agg.op}" } }): "field" is required for non-count reducers`);
             }
 
             // Soft delete: group over LIVE rows only; force the scan path.
@@ -2775,7 +2940,7 @@ const createSqlCtxDb = (options: SqlCtxDbOptions): DatabaseWriterLike => {
                 // guard above; re-check locally so the column ref stays typed
                 // without a non-null assertion.
                 if (!agg.field) {
-                    throw new Error(`groupBy(${tableName}, { agg: { op: "${agg.op}" } }): "field" is required for non-count reducers`);
+                    throw new LunoraError("INTERNAL", `groupBy(${tableName}, { agg: { op: "${agg.op}" } }): "field" is required for non-count reducers`);
                 }
 
                 select.push(sql`${sql.raw(aggregateSqlFunction(agg.op))}(${columnRefSql(agg.field)}) AS value`);
@@ -2814,7 +2979,7 @@ const createSqlCtxDb = (options: SqlCtxDbOptions): DatabaseWriterLike => {
             const definition = schema.tables[tableName];
 
             if (!definition) {
-                throw new Error(`unknown table: ${tableName}`);
+                throw new LunoraError("INTERNAL", `unknown table: ${tableName}`);
             }
 
             // Companion DDL must exist before the sync hooks below run an
@@ -2842,7 +3007,12 @@ const createSqlCtxDb = (options: SqlCtxDbOptions): DatabaseWriterLike => {
                 id = generateId();
                 usedExplicitId = false;
             }
-            const creationTime = typeof withDefaults["_creationTime"] === "number" ? withDefaults["_creationTime"] : clock();
+            // Like `_id` above, a document-supplied `_creationTime` is only honored
+            // under the trusted-import `allowExplicitId` opt-in. The default mutation
+            // path (and the optimistic `clientId` path) mints from `clock()` so a
+            // raw-forwarded client payload can't backdate/forward-date the row —
+            // sync reconciles by `clientId`, not by a client-chosen time.
+            const creationTime = insertOptions?.allowExplicitId && typeof withDefaults["_creationTime"] === "number" ? withDefaults["_creationTime"] : clock();
 
             const documentWithMeta: Record<string, unknown> = { ...withDefaults, _creationTime: creationTime, _id: id };
 
@@ -2898,13 +3068,13 @@ const createSqlCtxDb = (options: SqlCtxDbOptions): DatabaseWriterLike => {
             const tableName = await resolveTableName(id, expectedTable);
 
             if (!tableName) {
-                throw new Error(`document not found: ${id}`);
+                throw new LunoraError("INTERNAL", `document not found: ${id}`);
             }
 
             const definition = schema.tables[tableName];
 
             if (!definition) {
-                throw new Error(`document not found: ${id}`);
+                throw new LunoraError("INTERNAL", `document not found: ${id}`);
             }
 
             // Capture the RAW stored row alongside the decoded `existing` — the
@@ -2915,7 +3085,7 @@ const createSqlCtxDb = (options: SqlCtxDbOptions): DatabaseWriterLike => {
             const existing = decodeRow(definition, snapshot);
 
             if (!existing) {
-                throw new Error(`document not found: ${id}`);
+                throw new LunoraError("INTERNAL", `document not found: ${id}`);
             }
 
             const merged: Record<string, unknown> = { ...existing, ...patch, _id: id };
@@ -2956,14 +3126,14 @@ const createSqlCtxDb = (options: SqlCtxDbOptions): DatabaseWriterLike => {
             const tableName = await resolveTableName(id, expectedTable);
 
             if (!tableName) {
-                throw new Error(`document not found: ${id}`);
+                throw new LunoraError("INTERNAL", `document not found: ${id}`);
             }
 
             const definition = schema.tables[tableName];
             const field = definition?.softDeleteMode?.field;
 
             if (!definition || !field) {
-                throw new Error(`ctx.db.restore: table "${tableName}" is not a .softDelete() table`);
+                throw new LunoraError("INTERNAL", `ctx.db.restore: table "${tableName}" is not a .softDelete() table`);
             }
 
             // Snapshot the raw row before the patch so we know whether it was
@@ -2976,14 +3146,19 @@ const createSqlCtxDb = (options: SqlCtxDbOptions): DatabaseWriterLike => {
             await writer.patch(id, { [field]: null }, expectedTable);
 
             // Soft delete dropped this row's rank-companion entry; `patch`'s rank
-            // sync skips re-adding it (sort fields unchanged), so force a pure
-            // INSERT (`previous=undefined`) — only when restoring an actually
-            // soft-deleted row, to avoid a duplicate on a no-op restore.
+            // sync skips re-adding it (rank fields unchanged, so its fast path
+            // treats the entry as present), so force a pure INSERT
+            // (`previous=undefined`) — only when restoring an actually soft-deleted
+            // row, to avoid a duplicate on a no-op restore. Re-add the RESTORED
+            // image (marker cleared): `snapshot` predates the patch and still
+            // carries the marker, and `syncRanks`' soft-delete guard would skip a
+            // still-deleted `next`.
             if (wasDeleted) {
                 const row = decodeRow(definition, snapshot);
 
                 if (row !== null) {
-                    await syncRanks(tableName, id, undefined, row);
+                    // eslint-disable-next-line unicorn/no-null -- the restored image clears the soft-delete marker, matching what `patch` persisted.
+                    await syncRanks(tableName, id, undefined, { ...row, [field]: null });
                 }
             }
         },
@@ -2992,7 +3167,7 @@ const createSqlCtxDb = (options: SqlCtxDbOptions): DatabaseWriterLike => {
             const definition = schema.tables[tableName];
 
             if (!definition) {
-                throw new Error(`unknown table: ${tableName}`);
+                throw new LunoraError("INTERNAL", `unknown table: ${tableName}`);
             }
 
             const LEGACY_READER_ERROR = "the legacy query()/withIndex() reader is not available on the D1 (global) backend; use findMany";
@@ -3015,17 +3190,17 @@ const createSqlCtxDb = (options: SqlCtxDbOptions): DatabaseWriterLike => {
                 const reader: TableReaderLike = {
                     async collect() {
                         if (!stage) {
-                            throw new Error(LEGACY_READER_ERROR);
+                            throw new LunoraError("INTERNAL", LEGACY_READER_ERROR);
                         }
 
                         return runSearch(stage, undefined);
                     },
                     filter() {
-                        throw new Error(LEGACY_READER_ERROR);
+                        throw new LunoraError("INTERNAL", LEGACY_READER_ERROR);
                     },
                     async first() {
                         if (!stage) {
-                            throw new Error(LEGACY_READER_ERROR);
+                            throw new LunoraError("INTERNAL", LEGACY_READER_ERROR);
                         }
 
                         const rows = await runSearch(stage, 1);
@@ -3043,21 +3218,21 @@ const createSqlCtxDb = (options: SqlCtxDbOptions): DatabaseWriterLike => {
                     // eslint-disable-next-line @typescript-eslint/require-await -- TableReaderLike.paginate returns a Promise; search queries don't support pagination on either backend
                     async paginate() {
                         if (stage) {
-                            throw new Error("pagination is not supported on search queries; use .take(n) or .collect()");
+                            throw new LunoraError("INTERNAL", "pagination is not supported on search queries; use .take(n) or .collect()");
                         }
 
-                        throw new Error(LEGACY_READER_ERROR);
+                        throw new LunoraError("INTERNAL", LEGACY_READER_ERROR);
                     },
                     async take(limit) {
                         if (!stage) {
-                            throw new Error(LEGACY_READER_ERROR);
+                            throw new LunoraError("INTERNAL", LEGACY_READER_ERROR);
                         }
 
                         return runSearch(stage, limit);
                     },
                     async unique() {
                         if (!stage) {
-                            throw new Error(LEGACY_READER_ERROR);
+                            throw new LunoraError("INTERNAL", LEGACY_READER_ERROR);
                         }
 
                         // Over-fetch one past the single row we expect: 0 → null,
@@ -3072,14 +3247,14 @@ const createSqlCtxDb = (options: SqlCtxDbOptions): DatabaseWriterLike => {
                         return rows[0] ?? null;
                     },
                     withIndex() {
-                        throw new Error(LEGACY_READER_ERROR);
+                        throw new LunoraError("INTERNAL", LEGACY_READER_ERROR);
                     },
                     withSearchIndex(indexName, search) {
                         // eslint-disable-next-line sonarjs/no-nested-functions -- the .find predicate sits inside the reader builder's terminal; hoisting it out for one lookup would be more indirection than it saves
                         const searchDefinition = (definition.searchIndexes ?? []).find((index) => index.name === indexName);
 
                         if (!searchDefinition) {
-                            throw new Error(`unknown search index "${indexName}" on table "${tableName}"`);
+                            throw new LunoraError("INTERNAL", `unknown search index "${indexName}" on table "${tableName}"`);
                         }
 
                         const searchStage: SearchStage = {
@@ -3094,7 +3269,7 @@ const createSqlCtxDb = (options: SqlCtxDbOptions): DatabaseWriterLike => {
                         search(createSearchBuilder(searchStage, tableName) as Parameters<typeof search>[0]);
 
                         if (!searchStage.hasQuery) {
-                            throw new Error(`search index "${indexName}" on table "${tableName}" requires a .search(field, query) call`);
+                            throw new LunoraError("INTERNAL", `search index "${indexName}" on table "${tableName}" requires a .search(field, query) call`);
                         }
 
                         return buildReader(searchStage);
@@ -3111,13 +3286,13 @@ const createSqlCtxDb = (options: SqlCtxDbOptions): DatabaseWriterLike => {
             const definition = schema.tables[tableName];
 
             if (!definition) {
-                throw new Error(`unknown table: ${tableName}`);
+                throw new LunoraError("INTERNAL", `unknown table: ${tableName}`);
             }
 
             const index = definition.rankIndexes?.find((i) => i.name === indexName);
 
             if (!index) {
-                throw new Error(`unknown rankIndex "${indexName}" on table "${tableName}"`);
+                throw new LunoraError("INTERNAL", `unknown rankIndex "${indexName}" on table "${tableName}"`);
             }
 
             // Same RLS coupling-seam semantics as count(): position is a
@@ -3210,13 +3385,13 @@ const createSqlCtxDb = (options: SqlCtxDbOptions): DatabaseWriterLike => {
             const definition = schema.tables[tableName];
 
             if (!definition) {
-                throw new Error(`unknown table: ${tableName}`);
+                throw new LunoraError("INTERNAL", `unknown table: ${tableName}`);
             }
 
             const index = definition.rankIndexes?.find((i) => i.name === indexName);
 
             if (!index) {
-                throw new Error(`unknown rankIndex "${indexName}" on table "${tableName}"`);
+                throw new LunoraError("INTERNAL", `unknown rankIndex "${indexName}" on table "${tableName}"`);
             }
 
             // Ensure the `__rank_` companion exists so the indexed rankPage path
@@ -3295,17 +3470,17 @@ const createSqlCtxDb = (options: SqlCtxDbOptions): DatabaseWriterLike => {
             return { continueCursor, isDone: !hasMore, page: documents };
         },
 
-        async replace(id, document, expectedTable) {
+        async replace(id, document, expectedTable, replaceOptions) {
             const tableName = await resolveTableName(id, expectedTable);
 
             if (!tableName) {
-                throw new Error(`document not found: ${id}`);
+                throw new LunoraError("INTERNAL", `document not found: ${id}`);
             }
 
             const definition = schema.tables[tableName];
 
             if (!definition) {
-                throw new Error(`document not found: ${id}`);
+                throw new LunoraError("INTERNAL", `document not found: ${id}`);
             }
 
             // Always snapshot the RAW stored row — it seeds the optimistic-
@@ -3316,13 +3491,18 @@ const createSqlCtxDb = (options: SqlCtxDbOptions): DatabaseWriterLike => {
             const snapshot = await rawRow(tableName, id);
 
             if (snapshot === undefined) {
-                throw new Error(`document not found: ${id}`);
+                throw new LunoraError("INTERNAL", `document not found: ${id}`);
             }
 
             const needsPrevious =
                 hasTrigger(schema, tableName, "update") || (definition.aggregateIndexes ?? []).length > 0 || (definition.rankIndexes ?? []).length > 0;
             const previous = needsPrevious ? (decodeRow(definition, snapshot) ?? undefined) : undefined;
-            const creationTime = typeof document["_creationTime"] === "number" ? document["_creationTime"] : clock();
+            // A client-supplied `_creationTime` is honored only under the
+            // trusted-replay `allowExplicitId` opt-in (CDC replay, data-migration
+            // rewrite — both replay a row's original creation time). The default
+            // mutation path mints from `clock()` so a forged document
+            // `_creationTime` can't overwrite the persisted timestamp.
+            const creationTime = replaceOptions?.allowExplicitId && typeof document["_creationTime"] === "number" ? document["_creationTime"] : clock();
             const replaced: Record<string, unknown> = { ...document, _creationTime: creationTime, _id: id };
 
             applyOnUpdate(definition, document, replaced, auth);

@@ -1,6 +1,6 @@
 {
     "name": "@lunora/bindings",
-    "version": "1.0.0-alpha.1",
+    "version": "1.0.0-alpha.8",
     "description": "Lightweight Cloudflare binding helpers for Lunora — ctx.kv, ctx.images, ctx.analytics, ctx.pipelines, ctx.vectors, ctx.r2sql — one install, per-binding subpaths",
     "keywords": [
         "analytics",
@@ -68,14 +68,17 @@
         "build:prod": "pnpm exec packem build --production",
         "lint:eslint": "eslint .",
         "lint:eslint:fix": "eslint . --fix",
-        "lint:prettier": "prettier --check .",
-        "lint:prettier:fix": "prettier --write .",
+        "lint:prettier": "prettier --check . --ignore-path ../../.prettierignore",
+        "lint:prettier:fix": "prettier --write . --ignore-path ../../.prettierignore",
         "lint:types": "tsc --noEmit",
         "test": "vitest run",
         "test:coverage": "vitest run --coverage",
         "fallow:audit": "fallow audit",
         "fallow:dead-code": "fallow dead-code",
         "fallow:health": "fallow health --score"
+    },
+    "dependencies": {
+        "@lunora/errors": "1.0.0-alpha.5"
     },
     "devDependencies": {
         "@cloudflare/workers-types": "catalog:cloudflare",

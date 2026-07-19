@@ -3,7 +3,7 @@
 
 import type { AdvisoryFinding, DatabaseWriterLike, DataMigrationLike, LogSink, MaskPoliciesResult, MigrationRunResult, RunShardApplyCdcArgs, RunShardMigrationArgs, RlsPoliciesResult, RunShardRankBeforeArgs, RunShardRankPageArgs, RunShardWriteArgs, RunShardWriteResult, SchedulerLike, SchemaLike, ShardDOState, ShardRankPageResult, SqlExec, StorageRulesResult, StudioFeaturesResult, SystemReaderStorageLike } from "lunorash/do";
 import { applyCdcChanges, createShardCtxDb, runDataMigration, runShardMigrations, ShardDO as ShardDOBase } from "lunorash/do";
-import { asBucketStorage, createSecrets } from "lunorash/server";
+import { asBucketStorage, createSecrets, LunoraError } from "lunorash/server";
 import { bindOrm, bindTableFacade } from "lunorash/server";
 import type { LunoraDatabaseLike as LunoraPaymentDbLike, LunoraPayment, PaymentsFromContextOptions } from "@lunora/payment";
 import { paymentsFromContext } from "@lunora/payment";
@@ -541,6 +541,26 @@ const LUNORA_ADVISORIES: AdvisoryFinding[] = [
         "name": "unbounded_string_arg",
         "remediation": "Add a max-length bound via `.check(...)` / `.meta({ maxLength })` on the string validator (e.g. cap a name at 256, a body at a few KB). Size the cap to the field's real-world maximum.",
         "title": "Public string argument has no length bound"
+    },
+    {
+        "cacheKey": "http_action_missing_auth_guard:http:17",
+        "categories": [
+            "SECURITY"
+        ],
+        "description": "An `httpAction`/`httpRoute` handler performs a side effect (`ctx.runMutation`/`ctx.runAction`/a `ctx.db` write) but never reads `ctx.auth` — an unauthenticated HTTP endpoint driving a state change, bypassing the identity/RLS checks that guard the rest of the app.",
+        "detail": "`httpAction` handler `<module>` (http:17) calls `ctx.runAction` but never reads `ctx.auth` — an anonymous caller can drive this write. Authenticate the request before the side effect.",
+        "facing": "EXTERNAL",
+        "level": "WARN",
+        "metadata": {
+            "exportName": "<module>",
+            "file": "http",
+            "kind": "httpAction",
+            "line": 17,
+            "sideEffect": "runAction"
+        },
+        "name": "http_action_missing_auth_guard",
+        "remediation": "Read `ctx.auth` in the handler before the side effect — call `await ctx.auth.getIdentity()` (or check `ctx.auth.userId`) and reject unauthenticated/unauthorized requests, or forward through a `mutation`/`action` whose RLS policies enforce access. If the endpoint is intentionally public (e.g. a signed webhook), verify the provider signature before the write.",
+        "title": "Unauthenticated HTTP handler performs a side effect"
     }
 ];
 
@@ -562,6 +582,11 @@ const LUNORA_STORAGE_RULES: StorageRulesResult = {
 
 /** Which optional package-backed features this app wires up (discovered from imports / `ctx.*` reads / schema signals) served via `__lunora_admin__:studioFeatures` so the studio hides nav pages whose package isn't enabled. */
 const LUNORA_STUDIO_FEATURES: StudioFeaturesResult = {
+    "analytics": false,
+    "auth": false,
+    "containers": false,
+    "flags": false,
+    "kv": false,
     "mail": false,
     "payments": true,
     "queues": false,
@@ -666,11 +691,7 @@ const dispatchRun = async (expected: FunctionKind, functionPath: string, args: R
     }
 
     if (runDepth >= MAX_RUN_DEPTH) {
-        throw Object.assign(new Error(`ctx.run*: composition depth limit (${MAX_RUN_DEPTH}) exceeded — likely a cyclic runQuery/runMutation`), {
-            name: "LunoraError",
-            code: "RUN_DEPTH_EXCEEDED",
-            status: 500,
-        });
+        throw new LunoraError("RUN_DEPTH_EXCEEDED", `ctx.run*: composition depth limit (${MAX_RUN_DEPTH}) exceeded — likely a cyclic runQuery/runMutation`);
     }
 
     runDepth += 1;
@@ -698,11 +719,7 @@ export const createShardDO = (config: ShardDOConfig = {}): new (state: ShardDOSt
             // `isSystemDispatch()`). A client RPC never carries that flag, so its
             // internals stay not-found and never leak across the external boundary.
             if (!registered || (registered.visibility === "internal" && !this.isSystemDispatch())) {
-                throw Object.assign(new Error(`function not registered: ${functionPath}`), {
-                    name: "LunoraError",
-                    code: "FUNCTION_NOT_FOUND",
-                    status: 404,
-                });
+                throw new LunoraError("FUNCTION_NOT_FOUND", `function not registered: ${functionPath}`);
             }
 
             this.ensureMigrated();
@@ -716,8 +733,20 @@ export const createShardDO = (config: ShardDOConfig = {}): new (state: ShardDOSt
             // do external I/O that can't be rolled back, so both dispatch directly.
             // `ctx.run*` composition runs inside this span (it never re-enters
             // handleRpc); runInTransaction's own guard rejects accidental nesting.
+            //
+            // The replay bookkeeping (idempotency dedup row + custom-mutator
+            // watermark advance) commits INSIDE this span via
+            // `commitMutationBookkeeping`, so the writes, the dedup row, and the
+            // watermark are atomic — a crash can't leave the writes durable without
+            // the replay guard.
             if (registered.kind === "mutation") {
-                return this.runInTransaction(() => registered.handler(ctx, args));
+                return this.runInTransaction(async () => {
+                    const result = await registered.handler(ctx, args);
+
+                    this.commitMutationBookkeeping(result);
+
+                    return result;
+                });
             }
 
             return registered.handler(ctx, args);
@@ -800,11 +829,7 @@ export const createShardDO = (config: ShardDOConfig = {}): new (state: ShardDOSt
             const migration = LUNORA_MIGRATIONS[args.id];
 
             if (!migration) {
-                throw Object.assign(new Error(`data migration "${args.id}" is not registered`), {
-                    name: "LunoraError",
-                    code: "MIGRATION_NOT_FOUND",
-                    status: 404,
-                });
+                throw new LunoraError("MIGRATION_NOT_FOUND", `data migration "${args.id}" is not registered`, { status: 404 });
             }
 
             this.ensureMigrated();
@@ -840,18 +865,14 @@ export const createShardDO = (config: ShardDOConfig = {}): new (state: ShardDOSt
             const definition = (schema as unknown as SchemaLike).tables[args.table];
 
             if (!definition) {
-                throw Object.assign(new Error(`unknown table: ${args.table}`), { name: "LunoraError", code: "UNKNOWN_TABLE", status: 404 });
+                throw new LunoraError("UNKNOWN_TABLE", `unknown table: ${args.table}`, { status: 404 });
             }
 
             // `.global()` tables live in D1, not this DO's SQLite — editing them
             // here would corrupt nothing but would fail confusingly, so reject up
             // front with a clear code the studio can surface.
             if (definition.shardMode?.kind === "global") {
-                throw Object.assign(new Error(`table "${args.table}" is global; edit it through D1, not the shard`), {
-                    name: "LunoraError",
-                    code: "GLOBAL_TABLE_NOT_EDITABLE",
-                    status: 400,
-                });
+                throw new LunoraError("GLOBAL_TABLE_NOT_EDITABLE", `table "${args.table}" is global; edit it through D1, not the shard`, { status: 400 });
             }
 
             this.ensureMigrated();
@@ -895,17 +916,13 @@ export const createShardDO = (config: ShardDOConfig = {}): new (state: ShardDOSt
             const definition = (schema as unknown as SchemaLike).tables[table];
 
             if (!definition) {
-                throw Object.assign(new Error(`unknown table: ${table}`), { name: "LunoraError", code: "UNKNOWN_TABLE", status: 404 });
+                throw new LunoraError("UNKNOWN_TABLE", `unknown table: ${table}`, { status: 404 });
             }
 
             // `.global()` tables live in D1, not this DO's SQLite — the same
             // guard `runShardWrite` applies to single-row edits.
             if (definition.shardMode?.kind === "global") {
-                throw Object.assign(new Error(`table "${table}" is global; edit it through D1, not the shard`), {
-                    name: "LunoraError",
-                    code: "GLOBAL_TABLE_NOT_EDITABLE",
-                    status: 400,
-                });
+                throw new LunoraError("GLOBAL_TABLE_NOT_EDITABLE", `table "${table}" is global; edit it through D1, not the shard`, { status: 400 });
             }
 
             this.ensureMigrated();
@@ -946,7 +963,7 @@ export const createShardDO = (config: ShardDOConfig = {}): new (state: ShardDOSt
             // `rankBefore` is optional on `DatabaseWriterLike` (the D1 twin omits it),
             // but the shard writer from `createShardCtxDb` always defines it.
             if (!writer.rankBefore) {
-                throw Object.assign(new Error("rankBefore is unavailable on the shard writer"), { name: "LunoraError", code: "NOT_IMPLEMENTED", status: 500 });
+                throw new LunoraError("NOT_IMPLEMENTED", "rankBefore is unavailable on the shard writer", { status: 500 });
             }
 
             return writer.rankBefore(args.table, args.index, {
@@ -976,7 +993,7 @@ export const createShardDO = (config: ShardDOConfig = {}): new (state: ShardDOSt
             // directions live in the schema's rankIndex, so the shard reads them itself;
             // `args.directions` is only the coordinator's comparator hint and isn't forwarded.
             if (!writer.rankPageRows) {
-                throw Object.assign(new Error("rankPage is unavailable on the shard writer"), { name: "LunoraError", code: "NOT_IMPLEMENTED", status: 500 });
+                throw new LunoraError("NOT_IMPLEMENTED", "rankPage is unavailable on the shard writer", { status: 500 });
             }
 
             return writer.rankPageRows(args.table, args.index, {

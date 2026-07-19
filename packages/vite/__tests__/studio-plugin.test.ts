@@ -173,6 +173,40 @@ describe("studioPlugin", () => {
         expect(next).not.toHaveBeenCalled();
     });
 
+    it("serves studio assets with revalidation headers and honours a matching ETag", () => {
+        // Assertion count is environment-dependent: the ETag branch only runs
+        // when @lunora/studio is built (200); an unbuilt studio (501) skips it.
+        expect.hasAssertions();
+
+        const middleware = installMiddleware("localhost");
+        const next = vi.fn<() => void>();
+        const { response } = makeResponse();
+
+        middleware({ url: `${STUDIO_PATH}/studio.js` }, response, next);
+
+        // No built studio (501) → no asset bytes to cache; skip.
+        // eslint-disable-next-line vitest/no-conditional-in-test -- environment guard: skip when @lunora/studio isn't built (501)
+        if (response.statusCode !== 200) {
+            return;
+        }
+
+        const headers = Object.fromEntries((response.setHeader as ReturnType<typeof vi.fn>).mock.calls as [string, string][]);
+
+        // Unhashed URL → revalidate every load so a rebuild is never shadowed.
+        // The ETag is keyed on the requested file (not just its kind) so each
+        // chunk revalidates independently — so `studio.js` yields `W/"studio.js-…"`.
+        expect(headers["Cache-Control"]).toBe("no-cache");
+        expect(headers.ETag).toMatch(/^W\/"studio\.js-/);
+
+        const second = makeResponse();
+
+        middleware({ headers: { "if-none-match": headers.ETag }, url: `${STUDIO_PATH}/studio.js` } as { url?: string }, second.response, next);
+
+        expect(second.response.statusCode).toBe(304);
+        expect(second.end).toHaveBeenCalledWith();
+        expect(next).not.toHaveBeenCalled();
+    });
+
     it("returns 403 on a non-loopback bind", () => {
         expect.assertions(3);
 
@@ -276,6 +310,23 @@ describe("studioPlugin", () => {
 
         const { response } = callGated(undefined, {
             headers: { host: "evil.example.com" },
+            method: "GET",
+            socket: { remoteAddress: "127.0.0.1" },
+            url: STUDIO_PATH,
+        });
+
+        expect(response.statusCode).toBe(403);
+    });
+
+    it("rejects a proxied request carrying a forwarding header on a loopback peer", () => {
+        expect.assertions(1);
+
+        // A local reverse proxy/tunnel connects from 127.0.0.1 and may rewrite
+        // Host to localhost, but it adds a forwarding header — its presence means
+        // a (possibly remote) client is being relayed, so the admin-token document
+        // must be refused rather than trusting the loopback peer + Host.
+        const { response } = callGated(undefined, {
+            headers: { host: "localhost:5173", "x-forwarded-for": "203.0.113.7" },
             method: "GET",
             socket: { remoteAddress: "127.0.0.1" },
             url: STUDIO_PATH,

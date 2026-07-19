@@ -27,6 +27,102 @@ type DurableObjectJurisdiction = "eu" | "fedramp" | "us";
 /** How a table is routed at runtime. */
 type ShardMode = { backend?: GlobalBackend; kind: "global" } | { field: string; kind: "shardBy" } | { kind: "root" };
 
+/** Poll cadence for a sourced table — `"manual"` (pull only on an explicit trigger) or a fixed interval. */
+type ExternalSourceRefresh = "manual" | { everyMs: number };
+
+/**
+ * Delete-detection mode for external-source ingest (plan 077 / 136).
+ *
+ * `"full-pull"` (the default) reads the **whole** tenant membership each tick and
+ * diffs it, so it observes upstream deletes for free — but costs a full read per tick
+ * (the Phase-0 bench put the ceiling at ~10k rows).
+ *
+ * `"incremental"` pulls **only rows past a durable watermark** (`cursor`), cheap for
+ * large low-churn tables above the full-pull cap. Because an absent row then means
+ * "unchanged", not "deleted", incremental requires a delete-visibility path: either a
+ * `reconcileEveryMs` periodic full-pull sweep, or a `softDeleteColumn` whose
+ * tombstones the pull returns. `defineSchema` throws (and the
+ * `external_source_incremental_no_delete_path` advisor lint fails the build) when an
+ * incremental source declares neither.
+ */
+type ExternalSourceMode = "full-pull" | "incremental";
+
+/**
+ * Incremental-ingest cursor (plan 136): the monotonic watermark column plus the
+ * watermark-parameterized pull query. `column` names the field in the pulled rows
+ * whose max becomes the next watermark (e.g. `"updated_at"`). `query` is a second
+ * SQL that returns only rows changed since the watermark — the watermark binds as
+ * the parameter AFTER `tenantBy`'s params (e.g. Postgres
+ * `... WHERE tenant_id = $1 AND updated_at >= $2 ORDER BY updated_at`). Prefer `>=`
+ * with the idempotent upsert apply so rows sharing the boundary timestamp are never
+ * skipped (re-pulling them is a no-op).
+ */
+interface ExternalSourceCursor {
+    /** The monotonic watermark column in the pulled rows; its max advances the stored watermark. */
+    column: string;
+    /** The incremental pull SQL. `tenantBy`'s params bind first, then the watermark as the trailing param. */
+    query: string;
+}
+
+/**
+ * Config for `.source(...)` (plan 077): declares a table as **materialized from an
+ * external Postgres/MySQL behind Cloudflare Hyperdrive**, not written by user
+ * mutations. A system-driven poll loop reads the tenant slice and lands it in the
+ * DO's SQLite (via the validated CDC writer), after which `defineShape` carries it
+ * to clients unchanged. Orthogonal to `shardMode` — a sourced table almost always
+ * also `.shardBy()`s, in which case `tenantBy` is the mandatory tenant-isolation
+ * boundary (enforced by the `external_source_unscoped` advisor lint).
+ */
+interface ExternalSourceDefinition {
+    /** The wrangler Hyperdrive binding name the poll loop reads from. */
+    binding: string;
+
+    /** Project the materialized rows to these columns (passed to the membership diff). Omit ⇒ the full mapped document. */
+    columns?: ReadonlyArray<string>;
+
+    /** **Required for `mode: "incremental"`**: the watermark column + watermark-parameterized pull query (plan 136). Rejected on a `"full-pull"` source. */
+    cursor?: ExternalSourceCursor;
+
+    /** Column whose value becomes the Lunora `_id`. Defaults to `"id"`. */
+    idColumn?: string;
+
+    /** Transform an external row into the stored document body. Omit ⇒ every selected column except `idColumn` is copied. */
+    map?: (row: Record<string, unknown>) => Record<string, unknown>;
+
+    /** Delete-detection mode. `"full-pull"` (the default) diffs the whole membership; `"incremental"` pulls past a `cursor` watermark. */
+    mode?: ExternalSourceMode;
+
+    /** The full tenant-membership query, with driver-native placeholders (`$1` / `?`). `tenantBy` binds its params. */
+    query: string;
+
+    /**
+     * **Incremental delete-visibility (plan 136)**: run a full-pull sweep at most
+     * this often (millis) to GC upstream deletes an incremental slice can't see.
+     * One of `reconcileEveryMs` / `softDeleteColumn` is required for incremental;
+     * rejected on a `"full-pull"` source.
+     */
+    reconcileEveryMs?: number;
+
+    /** Poll cadence, or `"manual"`. Omit ⇒ the runtime's size-scaled default. */
+    refresh?: ExternalSourceRefresh;
+
+    /**
+     * **Incremental delete-visibility (plan 136)**: the upstream soft-delete
+     * tombstone column (e.g. `"deleted_at"`). When set, the incremental pull must
+     * return tombstoned rows and the ingest turns each into a local delete — an
+     * alternative to `reconcileEveryMs`. Rejected on a `"full-pull"` source.
+     */
+    softDeleteColumn?: string;
+
+    /**
+     * **Mandatory under `.shardBy()`**: map this DO's shard key → the query's bound
+     * params, so a tenant DO can only ever pull its own rows. An unscoped sourced +
+     * sharded table replicates the whole multitenant table into every shard — the
+     * `external_source_unscoped` advisor lint fails the build when this is absent.
+     */
+    tenantBy?: (shardKey: string) => ReadonlyArray<unknown>;
+}
+
 interface IndexDefinition {
     fields: ReadonlyArray<string>;
     name: string;
@@ -153,6 +249,16 @@ interface TableDefinition<Shape extends Record<string, Validator> = Record<strin
      * without scanning the underlying table.
      */
     aggregateIndexes: ReadonlyArray<AggregateIndexDefinition>;
+
+    /**
+     * Set by `.source(...)` (named `externalSource`, not `source`, so the data
+     * field doesn't collide with the fluent `.source()` builder method — same
+     * convention as `shardBy()`/`shardMode`). When present, the table is
+     * materialized from an external Hyperdrive-backed database by a system poll
+     * loop rather than user mutations. Implies `isExternallyManaged`.
+     */
+    externalSource?: ExternalSourceDefinition;
+
     indexes: ReadonlyArray<IndexDefinition>;
 
     /**
@@ -257,6 +363,23 @@ type FunctionKind = "action" | "mutation" | "query" | "stream";
  */
 type FunctionVisibility = "internal" | "public";
 
+/**
+ * x402 payment tag attached by the `.x402({ price })` builder modifier. Marks a
+ * public procedure as paid: the origin worker answers an unpaid client RPC with
+ * HTTP 402, verifies + settles the payment, and only then dispatches to the
+ * shard. The runtime reads only `price` from here — the network, recipient, and
+ * facilitator live in the worker-level x402 charge config, so `@lunora/runtime`
+ * never has to import `@lunora/x402` (and its viem/solana deps).
+ */
+interface X402ProcedureConfig {
+    /**
+     * USD-denominated price: a number of dollars (`0.01`) or a decimal string
+     * (`"0.01"`, or the `"$0.01"` shorthand). Resolved to the network
+     * stablecoin's base units (USDC has 6 decimals) at challenge time.
+     */
+    readonly price: number | string;
+}
+
 interface RegisteredFunction<A extends ArgsValidator, R, Kind extends FunctionKind> {
     readonly args: A;
     readonly handler: (context: unknown, args: InferArgs<A>) => Promise<R> | R;
@@ -270,6 +393,13 @@ interface RegisteredFunction<A extends ArgsValidator, R, Kind extends FunctionKi
      */
     readonly lifecycle?: LifecycleEventKind;
     readonly visibility?: FunctionVisibility;
+
+    /**
+     * Set by the `.x402({ price })` builder modifier. Marks the procedure as paid
+     * so the origin worker gates it behind an x402 402-challenge before dispatch.
+     * Absent on unpaid functions.
+     */
+    readonly x402?: X402ProcedureConfig;
 }
 
 type RegisteredQuery<A extends ArgsValidator, R> = RegisteredFunction<A, R, "query">;
@@ -522,6 +652,17 @@ interface BatchWriteOptions {
     limit?: number;
 }
 
+/** Options accepted by {@link DatabaseWriter.insertMany} and the per-table facade. */
+interface InsertManyOptions extends BatchWriteOptions {
+    /**
+     * When `true`, a UNIQUE-constraint breach for a row resolves to `null`
+     * instead of throwing — the rest of the batch is still inserted. Skipped rows
+     * keep their input-order slot with `null` in the returned array. Mirrors
+     * better-drizzle's `createMany({ skipDuplicates: true })`.
+     */
+    skipDuplicates?: boolean;
+}
+
 interface DatabaseWriter extends DatabaseReader {
     delete: <T extends string>(id: Id<T>) => Promise<void>;
 
@@ -539,6 +680,17 @@ interface DatabaseWriter extends DatabaseReader {
     deleteMany: <T extends string>(ids: ReadonlyArray<Id<T>>, options?: BatchWriteOptions) => Promise<{ deleted: number }>;
 
     /**
+     * Delete every row matching `where` in one call. Matching rows are resolved
+     * first, then each row is deleted through the single-row delete pipeline
+     * (triggers, companion sync, CDC, broadcast) so reactive subscriptions and
+     * search/aggregate companions stay correct.
+     *
+     * **Atomic within a mutation:** the DO wraps a mutation's dispatch in a
+     * BEGIN/COMMIT span, so a mid-batch failure rolls back the whole mutation.
+     */
+    deleteWhere: (tableName: string, where: Record<string, unknown>, options?: BatchWriteOptions) => Promise<{ deleted: number }>;
+
+    /**
      * Insert a document, returning its server id.
      *
      * Pass `options.clientId` (a UUID) to key the row yourself — for an
@@ -554,12 +706,23 @@ interface DatabaseWriter extends DatabaseReader {
      * row gets defaults, validators, triggers, and a per-row RLS check — but the
      * caller pays one round-trip instead of N.
      *
+     * Pass `{ skipDuplicates: true }` to turn UNIQUE-constraint breaches into
+     * `null` results for that row instead of failing the whole batch; the rest of
+     * the batch is still inserted and order is preserved.
+     *
      * **Atomic within a mutation:** the DO wraps a mutation's dispatch in a
      * BEGIN/COMMIT span, so a mid-batch failure (an invalid or RLS-denied row)
      * rolls back the whole mutation. (In an action there is no transaction span,
      * so the prior inserts persist; the in-memory test harness mirrors the span.)
      */
-    insertMany: <T extends string>(tableName: T, documents: ReadonlyArray<Record<string, unknown>>, options?: BatchWriteOptions) => Promise<Id<T>[]>;
+    insertMany: {
+        <T extends string>(
+            tableName: T,
+            documents: ReadonlyArray<Record<string, unknown>>,
+            options: BatchWriteOptions & { skipDuplicates: true },
+        ): Promise<(Id<T> | null)[]>;
+        <T extends string>(tableName: T, documents: ReadonlyArray<Record<string, unknown>>, options?: InsertManyOptions): Promise<Id<T>[]>;
+    };
 
     /**
      * **Trusted** bulk insert: one multi-row `INSERT` that **skips per-row
@@ -583,14 +746,33 @@ interface DatabaseWriter extends DatabaseReader {
 
     /**
      * Patch many rows by id in one call. Each `{ id, patch }` is applied like a
-     * single `patch()` (per-row triggers + RLS).
+     * single `patch()` (per-row triggers + RLS). Returns the number of rows
+     * actually patched.
      *
      * **Atomic within a mutation:** the DO wraps a mutation's dispatch in a
      * BEGIN/COMMIT span, so a mid-batch failure rolls back the whole mutation.
      * (In an action there is no transaction span, so the prior patches persist;
      * the in-memory test harness mirrors the span.)
      */
-    patchMany: <T extends string>(patches: ReadonlyArray<{ id: Id<T>; patch: Record<string, unknown> }>, options?: BatchWriteOptions) => Promise<void>;
+    patchMany: <T extends string>(
+        patches: ReadonlyArray<{ id: Id<T>; patch: Record<string, unknown> }>,
+        options?: BatchWriteOptions,
+    ) => Promise<{ patched: number }>;
+
+    /**
+     * Patch every row matching `where` with the same `patch` in one call. The
+     * matching rows are resolved first, then each row is updated through the
+     * single-row patch pipeline (OCC, triggers, companion sync, CDC, broadcast)
+     * so reactive subscriptions and search/aggregate companions stay correct.
+     *
+     * **Atomic within a mutation:** the DO wraps a mutation's dispatch in a
+     * BEGIN/COMMIT span, so a mid-batch failure rolls back the whole mutation.
+     */
+    patchWhere: (
+        tableName: string,
+        args: { patch: Record<string, unknown>; where: Record<string, unknown> },
+        options?: BatchWriteOptions,
+    ) => Promise<{ patched: number }>;
     replace: <T extends string>(id: Id<T>, document: Record<string, unknown>) => Promise<void>;
 }
 
@@ -620,6 +802,22 @@ interface ScheduledJob {
     shardKey?: string;
 }
 
+/**
+ * A schedulable durable-workflow reference — the generated `workflows.&lt;name>` /
+ * `agents.&lt;name>` object, which carries its `WORKFLOW_*`/`AGENT_*` binding and
+ * stable name. Structural mirror of `@lunora/scheduler`'s `WorkflowReference` so
+ * `ctx.scheduler` can target a workflow/agent without a dependency on
+ * `@lunora/scheduler` / `@lunora/workflow`. A scheduled workflow target starts a
+ * fresh instance on fire (the args become its `params`).
+ */
+interface SchedulableWorkflowReference {
+    /** The `WORKFLOW_*`/`AGENT_*` binding name (present on a generated ref). */
+    readonly binding?: string;
+    readonly isLunoraWorkflow: true;
+    /** The workflow/agent export/stable name (present on a generated ref). */
+    readonly name?: string;
+}
+
 interface Scheduler {
     /** Cancel a pending job by id. `cancelled` is `false` when no such job exists. */
     cancel: (id: string) => Promise<{ cancelled: boolean }>;
@@ -627,8 +825,16 @@ interface Scheduler {
     get: (id: string) => Promise<ScheduledJob | null>;
     /** List all pending scheduled jobs. */
     list: () => Promise<ScheduledJob[]>;
-    runAfter: (delayMs: number, functionPath: string, args?: Record<string, unknown>) => Promise<string>;
-    runAt: (timestampMs: number, functionPath: string, args?: Record<string, unknown>) => Promise<string>;
+
+    /**
+     * Schedule a one-shot run `delayMs` from now. `target` is a function path
+     * (`"ns:fn"`) dispatched as a one-shot, or a generated `workflows.&lt;name>` /
+     * `agents.&lt;name>` reference which starts a fresh durable instance on fire
+     * (the args become its `params`).
+     */
+    runAfter: (delayMs: number, target: SchedulableWorkflowReference | string, args?: Record<string, unknown>) => Promise<string>;
+    /** Like {@link Scheduler.runAfter} but fires at an absolute epoch-ms timestamp. */
+    runAt: (timestampMs: number, target: SchedulableWorkflowReference | string, args?: Record<string, unknown>) => Promise<string>;
 }
 
 // --- Durable workflows -------------------------------------------------------
@@ -692,6 +898,21 @@ interface WorkflowHandle<Params = Record<string, unknown>> {
 interface Workflows {
     /** Resolve the handle for a declared workflow by export name. */
     get: <Params = Record<string, unknown>>(name: string) => WorkflowHandle<Params>;
+}
+
+// --- Workers Cache (action-only) --------------------------------------------
+
+/**
+ * Programmatic cache purge surface exposed on {@link ActionCtx}. Actions run
+ * in the Worker (not the DO), so they can reach the Worker's `ctx.cache.purge`.
+ * Queries and mutations do not expose this — they run inside the Durable Object.
+ */
+interface CachePurge {
+    /**
+     * Purge cached responses matching the given tags, or everything when
+     * `purgeEverything` is true. Only available in action handlers.
+     */
+    purge: (options: { purgeEverything?: boolean; tags?: string[] }) => Promise<unknown>;
 }
 
 // --- Secrets Store (core built-in) -------------------------------------------
@@ -1091,12 +1312,22 @@ interface QueryCtx {
     readonly db: DatabaseReader;
 
     /**
+     * The validated, typed environment. Populated only when the project declares
+     * a `defineEnv(...)` contract in `lunora/env.ts`; codegen then narrows this to
+     * the validated `InferEnv` shape so `ctx.env.STRIPE_KEY` is parsed and
+     * coercion-aware. Absent (optional) without a contract — declare
+     * `lunora/env.ts` to populate and type it.
+     */
+    readonly env?: Record<string, unknown>;
+
+    /**
      * The caller's IP for this request — Cloudflare's trusted `CF-Connecting-IP`,
      * forwarded server-side (never read from a client header). `undefined` when
      * unknown: a live-subscription re-run, a server-initiated dispatch, or
      * non-Cloudflare hosting. A convenient rate-limit key for anonymous traffic.
      */
     readonly ip?: string;
+
     /** Structured, function-attributed logger; see {@link LunoraLogger}. */
     readonly log: LunoraLogger;
 
@@ -1131,12 +1362,22 @@ interface MutationCtx {
     readonly db: DatabaseWriter;
 
     /**
+     * The validated, typed environment. Populated only when the project declares
+     * a `defineEnv(...)` contract in `lunora/env.ts`; codegen then narrows this to
+     * the validated `InferEnv` shape so `ctx.env.STRIPE_KEY` is parsed and
+     * coercion-aware. Absent (optional) without a contract — declare
+     * `lunora/env.ts` to populate and type it.
+     */
+    readonly env?: Record<string, unknown>;
+
+    /**
      * The caller's IP for this request — Cloudflare's trusted `CF-Connecting-IP`,
      * forwarded server-side (never read from a client header). `undefined` when
      * unknown: a live-subscription re-run, a server-initiated dispatch, or
      * non-Cloudflare hosting. A convenient rate-limit key for anonymous traffic.
      */
     readonly ip?: string;
+
     /** Structured, function-attributed logger; see {@link LunoraLogger}. */
     readonly log: LunoraLogger;
 
@@ -1180,7 +1421,25 @@ interface MutationCtx {
 interface ActionCtx {
     readonly auth: AuthState;
 
+    /**
+     * Programmatic Workers Cache purge; see {@link CachePurge}.
+     * **Action-only** — actions run in the Worker, which has a `cache` binding.
+     * Queries and mutations run inside the Durable Object and do not expose this.
+     * Optional at runtime because Workers Cache is only present when enabled.
+     */
+    readonly cache?: CachePurge;
+
     readonly db: DatabaseWriter;
+
+    /**
+     * The validated, typed environment. Populated only when the project declares
+     * a `defineEnv(...)` contract in `lunora/env.ts`; codegen then narrows this to
+     * the validated `InferEnv` shape so `ctx.env.STRIPE_KEY` is parsed and
+     * coercion-aware. Absent (optional) without a contract — declare
+     * `lunora/env.ts` to populate and type it.
+     */
+    readonly env?: Record<string, unknown>;
+
     readonly fetch: typeof globalThis.fetch;
 
     /**
@@ -1190,6 +1449,7 @@ interface ActionCtx {
      * non-Cloudflare hosting. A convenient rate-limit key for anonymous traffic.
      */
     readonly ip?: string;
+
     /** Structured, function-attributed logger; see {@link LunoraLogger}. */
     readonly log: LunoraLogger;
 
@@ -1266,9 +1526,14 @@ export type {
     AnyApi,
     ArgsValidator,
     AuthState,
+    CachePurge,
     DatabaseReader,
     DatabaseWriter,
     DurableObjectJurisdiction,
+    ExternalSourceCursor,
+    ExternalSourceDefinition,
+    ExternalSourceMode,
+    ExternalSourceRefresh,
     FunctionKind,
     FunctionVisibility,
     GlobalBackend,
@@ -1347,4 +1612,5 @@ export type {
     WorkflowInstanceStatus,
     Workflows,
     WorkflowStatusResult,
+    X402ProcedureConfig,
 };

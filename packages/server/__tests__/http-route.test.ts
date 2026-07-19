@@ -1,7 +1,7 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
 
 import type { HttpActionCtx as HttpActionContext, LunoraRouteHandler } from "../src/index";
-import { httpRoute, httpRouter, v } from "../src/index";
+import { httpRoute, httpRouter, LunoraError, v } from "../src/index";
 
 const context = {} as HttpActionContext;
 
@@ -228,7 +228,7 @@ describe("httpRoute output", () => {
     });
 
     it("a result that violates .output() surfaces as a 500, not a 400", async () => {
-        expect.assertions(2);
+        expect.assertions(3);
 
         const route = httpRoute
             .get("/api/me")
@@ -236,9 +236,41 @@ describe("httpRoute output", () => {
             .handler(() => ({ id: 123 }) as unknown as { id: string });
 
         const response = await dispatch(route, "GET", "/api/me", new Request("https://x/api/me"));
+        const body = (await response.json()) as { error: string };
 
         expect(response.status).toBe(500);
-        await expect(response.json()).resolves.toMatchObject({ code: "INTERNAL_SERVER_ERROR" });
+        expect(body).toMatchObject({ code: "INTERNAL_SERVER_ERROR", error: "Internal error" });
+        expect(body.error).not.toContain("Response did not match the declared output schema");
+    });
+});
+
+describe("httpRoute error redaction", () => {
+    it("an internal-coded thrown LunoraError is redacted to a generic message on the wire", async () => {
+        expect.assertions(3);
+
+        const route = httpRoute.get("/api/boom").handler(() => {
+            throw new LunoraError("INTERNAL_SERVER_ERROR", "leaky details");
+        });
+
+        const response = await dispatch(route, "GET", "/api/boom", new Request("https://x/api/boom"));
+        const body = (await response.json()) as { error: string };
+
+        expect(response.status).toBe(500);
+        expect(body).toEqual({ code: "INTERNAL_SERVER_ERROR", error: "Internal error" });
+        expect(body.error).not.toContain("leaky details");
+    });
+
+    it("a non-internal thrown LunoraError still echoes its message", async () => {
+        expect.assertions(2);
+
+        const route = httpRoute.get("/api/bad").handler(() => {
+            throw new LunoraError("BAD_REQUEST", "user-facing reason");
+        });
+
+        const response = await dispatch(route, "GET", "/api/bad", new Request("https://x/api/bad"));
+
+        expect(response.status).toBe(400);
+        await expect(response.json()).resolves.toEqual({ code: "BAD_REQUEST", error: "user-facing reason" });
     });
 });
 
@@ -294,5 +326,43 @@ describe("httpRoute composition", () => {
         await app.fetch(new Request("https://x/api/ctx"), { __lunoraCtx: marker });
 
         expect(seen[0]).toBe(marker);
+    });
+
+    it("attaches Cache-Control, Cache-Tag, and Vary headers when declared on the route", async () => {
+        expect.assertions(4);
+
+        const route = httpRoute
+            .get("/api/products/:id")
+            .params({ id: v.string() })
+            .cacheControl("public, max-age=300")
+            .cacheTag("products")
+            .vary("Accept-Encoding")
+            .handler(({ params }) => {
+                return { id: params.id };
+            });
+
+        const response = await dispatch(route, "GET", "/api/products/:id", new Request("https://x/api/products/123"));
+
+        expect(response.status).toBe(200);
+        expect(response.headers.get("cache-control")).toBe("public, max-age=300");
+        expect(response.headers.get("cache-tag")).toBe("products");
+        expect(response.headers.get("vary")).toBe("Accept-Encoding");
+    });
+
+    it("attaches cache headers on a 204 No Content response", async () => {
+        expect.assertions(4);
+
+        const route = httpRoute
+            .delete("/api/cache")
+            .cacheControl("private, no-store")
+            .cacheTag("session")
+            .handler(() => undefined);
+
+        const response = await dispatch(route, "DELETE", "/api/cache", new Request("https://x/api/cache", { method: "DELETE" }));
+
+        expect(response.status).toBe(204);
+        expect(response.headers.get("cache-control")).toBe("private, no-store");
+        expect(response.headers.get("cache-tag")).toBe("session");
+        await expect(response.text()).resolves.toBe("");
     });
 });

@@ -1,8 +1,9 @@
+import { LunoraError } from "@lunora/errors";
 import { Hono } from "hono";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ExecutionContextLike, HttpActionContext, HttpRouterLike, Route } from "../src/create-worker";
-import { composeWorker, createWorker } from "../src/create-worker";
+import { composeWorker, createLunoraHandler, createWorker } from "../src/create-worker";
 import type { ShardNamespaceLike } from "../src/resolve-shard";
 
 interface ShardSpy {
@@ -60,6 +61,33 @@ describe("createWorker", () => {
         expect(res.status).toBe(404);
     });
 
+    it("answers GET /_lunora/status with an unauthenticated ok probe", async () => {
+        expect.assertions(4);
+
+        const worker = createWorker({ shardDO: shard.namespace });
+
+        const res = await worker.fetch(new Request("https://app.example/_lunora/status"), {}, fakeContext);
+
+        expect(res.status).toBe(200);
+        expect(res.headers.get("cache-control")).toBe("no-store");
+        // Bare ok — no framework name/version, so production deployments don't
+        // hand scanners a fingerprint.
+        await expect(res.json()).resolves.toStrictEqual({ ok: true });
+        // The probe never touches a shard.
+        expect(shard.calls).toHaveLength(0);
+    });
+
+    it("rejects non-GET/HEAD on /_lunora/status with 405", async () => {
+        expect.assertions(2);
+
+        const worker = createWorker({ shardDO: shard.namespace });
+
+        const res = await worker.fetch(new Request("https://app.example/_lunora/status", { method: "POST" }), {}, fakeContext);
+
+        expect(res.status).toBe(405);
+        expect(res.headers.get("allow")).toBe("GET, HEAD");
+    });
+
     it("forwards POST /_lunora/rpc to the default __root__ shard", async () => {
         expect.assertions(4);
 
@@ -86,7 +114,7 @@ describe("createWorker", () => {
     it("uses the envelope shardKey when provided", async () => {
         expect.assertions(1);
 
-        const worker = createWorker({ shardDO: shard.namespace });
+        const worker = createWorker({ allowUnauthenticatedShardAccess: true, shardDO: shard.namespace });
 
         await worker.fetch(
             new Request("https://app.example/_lunora/rpc", {
@@ -186,10 +214,35 @@ describe("createWorker", () => {
         expect(shard.calls).toHaveLength(0);
     });
 
+    it("rejects a relation fan-out whose args.table differs from the authorized fanOut.table (confused-deputy regression)", async () => {
+        expect.assertions(3);
+
+        const worker = createWorker({ shardDO: shard.namespace });
+
+        const res = await worker.fetch(
+            new Request("https://app.example/_lunora/rpc", {
+                body: JSON.stringify({
+                    args: { table: "secrets", where: {} },
+                    fanOut: { merge: { kind: "concat" }, table: "posts" },
+                    functionPath: "__lunora_relation__:read",
+                }),
+                method: "POST",
+            }),
+            {},
+            fakeContext,
+        );
+
+        expect(res.status).toBe(400);
+        await expect(res.json()).resolves.toMatchObject({ error: { code: "BAD_REQUEST" } });
+        // The mismatched envelope is rejected at the edge — the raw, RLS-blind
+        // relation read of `secrets` (authorized only for `posts`) never reaches a shard.
+        expect(shard.calls).toHaveLength(0);
+    });
+
     it("forwards /_lunora/ws upgrades to the correct shard", async () => {
         expect.assertions(2);
 
-        const worker = createWorker({ shardDO: shard.namespace });
+        const worker = createWorker({ allowUnauthenticatedShardAccess: true, shardDO: shard.namespace });
 
         const upgrade = new Request("https://app.example/_lunora/ws?shard=channel-7", {
             headers: { Upgrade: "websocket" },
@@ -207,7 +260,7 @@ describe("createWorker", () => {
         // No resolveIdentity → every caller is anonymous. A forged x-lunora-userid /
         // x-lunora-identity on the upgrade must NOT reach the shard, else an anonymous
         // attacker could spoof a verified identity on the socket.
-        const worker = createWorker({ shardDO: shard.namespace });
+        const worker = createWorker({ allowUnauthenticatedShardAccess: true, shardDO: shard.namespace });
 
         const upgrade = new Request("https://app.example/_lunora/ws?shard=channel-7", {
             headers: { Upgrade: "websocket", "x-lunora-identity": '{"roles":["admin"]}', "x-lunora-userid": "victim" },
@@ -225,6 +278,7 @@ describe("createWorker", () => {
 
         // A forged x-lunora-userid must be replaced by the server-resolved one, never honoured.
         const worker = createWorker({
+            allowUnauthenticatedShardAccess: true,
             resolveIdentity: () => {
                 return { userId: "user_42" };
             },
@@ -249,6 +303,91 @@ describe("createWorker", () => {
         const res = await worker.fetch(new Request("https://app.example/_lunora/ws?shard=x"), {}, fakeContext);
 
         expect(res.status).toBe(426);
+    });
+
+    it("rejects a cross-origin cookie-bearing WS upgrade (CSWSH guard, H1)", async () => {
+        expect.assertions(2);
+
+        const worker = createWorker({ allowUnauthenticatedShardAccess: true, shardDO: shard.namespace });
+
+        // A browser on evil.com auto-attaches the victim's cookie to the handshake;
+        // the cross-origin `Origin` must be rejected before any forwarding.
+        const upgrade = new Request("https://app.example/_lunora/ws", {
+            headers: { cookie: "session=victim", Origin: "https://evil.com", Upgrade: "websocket" },
+        });
+
+        const res = await worker.fetch(upgrade, {}, fakeContext);
+
+        expect(res.status).toBe(403);
+        expect(shard.calls).toHaveLength(0);
+    });
+
+    it("allows a same-origin cookie-bearing WS upgrade", async () => {
+        expect.assertions(1);
+
+        const worker = createWorker({ shardDO: shard.namespace });
+
+        const upgrade = new Request("https://app.example/_lunora/ws", {
+            headers: { cookie: "session=me", Origin: "https://app.example", Upgrade: "websocket" },
+        });
+
+        await worker.fetch(upgrade, {}, fakeContext);
+
+        expect(shard.calls).toHaveLength(1);
+    });
+
+    it("allows a token (no-cookie) cross-origin WS upgrade — CSWSH only rides cookies", async () => {
+        expect.assertions(1);
+
+        const worker = createWorker({ shardDO: shard.namespace });
+
+        // No Cookie header → not a forgeable-by-a-browser credential, so the origin
+        // guard is exempt (bearer/token/server-to-server clients keep working).
+        const upgrade = new Request("https://app.example/_lunora/ws", {
+            headers: { Origin: "https://evil.com", Upgrade: "websocket" },
+        });
+
+        await worker.fetch(upgrade, {}, fakeContext);
+
+        expect(shard.calls).toHaveLength(1);
+    });
+
+    it("default-denies a non-default shard when no authorize callback is configured (M1)", async () => {
+        expect.assertions(2);
+
+        const worker = createWorker({ shardDO: shard.namespace });
+
+        const res = await worker.fetch(
+            new Request("https://app.example/_lunora/rpc", {
+                body: JSON.stringify({ args: {}, functionPath: "messages:list", shardKey: "tenant-b" }),
+                method: "POST",
+            }),
+            {},
+            fakeContext,
+        );
+
+        expect(res.status).toBe(403);
+        expect(shard.calls).toHaveLength(0);
+    });
+
+    it("default-denies a fan-out envelope when no authorize callback is configured (M2)", async () => {
+        expect.assertions(1);
+
+        const worker = createWorker({
+            queryCoordinator: { fanOut: vi.fn<() => never>() } as never,
+            shardDO: shard.namespace,
+        });
+
+        const res = await worker.fetch(
+            new Request("https://app.example/_lunora/rpc", {
+                body: JSON.stringify({ args: {}, fanOut: { merge: { kind: "concat" }, table: "messages" }, functionPath: "messages:list" }),
+                method: "POST",
+            }),
+            {},
+            fakeContext,
+        );
+
+        expect(res.status).toBe(403);
     });
 
     it("invokes custom routes before default handlers", async () => {
@@ -284,7 +423,7 @@ describe("createWorker", () => {
             idFromName: vi.fn<ShardNamespaceLike["idFromName"]>(),
         };
 
-        const worker = createWorker({ shardDO: namespace });
+        const worker = createWorker({ allowUnauthenticatedShardAccess: true, shardDO: namespace });
 
         await worker.fetch(
             new Request("https://app.example/_lunora/rpc", {
@@ -407,6 +546,7 @@ describe("createWorker", () => {
         });
 
         const worker = createWorker({
+            allowUnauthenticatedShardAccess: true,
             queryCoordinator: {
                 fanOut: fanOut as never,
                 orchestrateExport: vi.fn<() => never>(),
@@ -581,6 +721,43 @@ describe("createWorker", () => {
         expect(shard.calls).toHaveLength(0);
     });
 
+    it("exempts a reserved `__lunora_admin__:*` RPC from authorizeShard (the DO's admin-bearer gate authorizes it)", async () => {
+        expect.assertions(4);
+
+        // Even with a fail-closed `authorizeShard`, a token-gated admin RPC must
+        // reach the shard DO (the real admin authority) instead of being 403'd by
+        // the per-tenant gate — an admin request carries an admin bearer, not an
+        // end-user identity, so `authorizeShard(null, …)` would default-deny it.
+        // Regression: this broke E2E mail-capture once the playground configured
+        // `authorizeShard`.
+        const authorizeShard = vi.fn<() => boolean>(() => false);
+        const worker = createWorker({
+            authorizeShard,
+            shardDO: shard.namespace,
+        });
+
+        const res = await worker.fetch(
+            new Request("https://app.example/_lunora/rpc", {
+                // A real admin bearer rides the `authorization` header; this
+                // worker-level test only proves the tenant gate is skipped, so the
+                // mock shard (standing in for the DO's `isAdminAuthorized`) accepts
+                // it unconditionally.
+                body: JSON.stringify({ args: { limit: 50 }, functionPath: "__lunora_admin__:getCapturedMail" }),
+                method: "POST",
+            }),
+            {},
+            fakeContext,
+        );
+
+        expect(res.status).toBe(200);
+        // The per-tenant gate must NOT be consulted for a reserved admin op…
+        expect(authorizeShard).not.toHaveBeenCalled();
+        // …and the request must be forwarded to the (default __root__) shard,
+        // whose `isAdminAuthorized` bearer check is the real gate.
+        expect(shard.calls).toHaveLength(1);
+        expect(shard.calls[0]!.shardKey).toBe("__root__");
+    });
+
     it.each([
         ["unknown merge kind", { merge: { kind: "bogus" }, table: "messages" }],
         ["negative topK.k", { merge: { by: "score", k: -1, kind: "topK" }, table: "messages" }],
@@ -621,6 +798,265 @@ describe("createWorker", () => {
 
         expect(res.status).toBe(400);
         expect(fanOut).not.toHaveBeenCalled();
+    });
+});
+
+describe("createWorker — RPC batch forward failure (Plan 118 toErrorBody migration)", () => {
+    // Plan 118: the batch fan-out's per-sub-batch `forwardToShard` catch now
+    // routes the caught error through `toErrorBody` instead of embedding its raw
+    // `.message` directly into every entry's slot error. Pin both branches: an
+    // unrecognized throw (e.g. a network failure reaching the shard) is redacted,
+    // while a recognized `LunoraError` still surfaces its real code/message. The
+    // slot status stays the protocol-level 502 regardless (independent of the
+    // underlying error), per the existing "shard unreachable" contract.
+    const unreachableNamespace = (thrown: Error): ShardNamespaceLike => {
+        return {
+            get: () => {
+                return {
+                    fetch: (): Promise<Response> => Promise.reject(thrown),
+                };
+            },
+            idFromName: (name) => {
+                return { __name: name };
+            },
+        };
+    };
+
+    it("redacts an unrecognized shard-forward failure instead of leaking its raw message", async () => {
+        expect.assertions(3);
+
+        const worker = createWorker({ shardDO: unreachableNamespace(new Error("connect ECONNREFUSED 10.0.0.1:443")) });
+
+        const res = await worker.fetch(
+            new Request("https://app.example/_lunora/rpc-batch", {
+                body: JSON.stringify({ calls: [{ functionPath: "messages:list", id: 0 }] }),
+                method: "POST",
+            }),
+            {},
+            fakeContext,
+        );
+
+        expect(res.status).toBe(200);
+
+        const body = await res.json<{ results: { body: { error: { code: string; message: string } }; status: number }[] }>();
+
+        expect(body.results).toHaveLength(1);
+        expect(body.results[0]).toMatchObject({ body: { error: { code: "SHARD_UNAVAILABLE", message: "shard unavailable" } }, status: 502 });
+    });
+
+    it("still surfaces a recognized LunoraError's real code + message on a shard-forward failure", async () => {
+        expect.assertions(2);
+
+        const structured = new LunoraError("CONFLICT", "cross-shard join guard tripped", { status: 409 });
+        const worker = createWorker({ shardDO: unreachableNamespace(structured) });
+
+        const res = await worker.fetch(
+            new Request("https://app.example/_lunora/rpc-batch", {
+                body: JSON.stringify({ calls: [{ functionPath: "messages:list", id: 0 }] }),
+                method: "POST",
+            }),
+            {},
+            fakeContext,
+        );
+
+        const body = await res.json<{ results: { body: { error: { code: string; message: string } }; status: number }[] }>();
+
+        expect(body.results).toHaveLength(1);
+        expect(body.results[0]).toMatchObject({ body: { error: { code: "CONFLICT", message: "cross-shard join guard tripped" } }, status: 502 });
+    });
+});
+
+describe("createWorker — RPC batch cross-shard bookmark", () => {
+    // A namespace whose per-shard `/rpc-batch` reply echoes the demux-shaped
+    // `{ results }` and attaches an `x-d1-bookmark` only for the shard keys in
+    // `bookmarks`. Lets a test span shards where only some produce a bookmark.
+    const bookmarkingNamespace = (bookmarks: Record<string, string>): ShardNamespaceLike => {
+        return {
+            get: (id) => {
+                const shardKey = (id as { __name: string }).__name;
+
+                return {
+                    fetch: async (request: Request): Promise<Response> => {
+                        // eslint-disable-next-line @typescript-eslint/no-unnecessary-type-assertion -- request.json() is Promise<unknown> under the build tsconfig; the assertion is required there
+                        const { calls } = (await request.json()) as { calls: { id: string }[] };
+                        const results = calls.map((call) => {
+                            return { body: { shardKey }, id: call.id, status: 200 };
+                        });
+                        const headers: Record<string, string> = { "content-type": "application/json" };
+                        const bookmark = bookmarks[shardKey];
+
+                        if (bookmark !== undefined) {
+                            headers["x-d1-bookmark"] = bookmark;
+                        }
+
+                        return Response.json({ results }, { headers, status: 200 });
+                    },
+                };
+            },
+            idFromName: (name) => {
+                return { __name: name };
+            },
+        };
+    };
+
+    const batchRequest = (calls: unknown[]): Request =>
+        new Request("https://app.example/_lunora/rpc-batch", { body: JSON.stringify({ calls }), method: "POST" });
+
+    it("echoes the bookmark when exactly one shard in the batch produced one", async () => {
+        expect.assertions(1);
+
+        // Shard "a" (the mutation) emits a bookmark; shard "b" (a read) does not.
+        // The single producer's bookmark is safe to pin the client's next read to.
+        const worker = createWorker({ allowUnauthenticatedShardAccess: true, shardDO: bookmarkingNamespace({ a: "bm-a" }) });
+
+        const res = await worker.fetch(
+            batchRequest([
+                { functionPath: "messages:send", id: 0, shardKey: "a" },
+                { functionPath: "messages:list", id: 1, shardKey: "b" },
+            ]),
+            {},
+            fakeContext,
+        );
+
+        expect(res.headers.get("x-d1-bookmark")).toBe("bm-a");
+    });
+
+    it("omits the bookmark when the batch spans shards that each produced one (not comparable across sources)", async () => {
+        expect.assertions(1);
+
+        // Two distinct shards each return a bookmark; their D1 bookmarks are from
+        // different sources and aren't comparable, so pinning the client to an
+        // arbitrary one would silently break read-your-writes — omit instead.
+        const worker = createWorker({ allowUnauthenticatedShardAccess: true, shardDO: bookmarkingNamespace({ a: "bm-a", b: "bm-b" }) });
+
+        const res = await worker.fetch(
+            batchRequest([
+                { functionPath: "messages:send", id: 0, shardKey: "a" },
+                { functionPath: "messages:send", id: 1, shardKey: "b" },
+            ]),
+            {},
+            fakeContext,
+        );
+
+        expect(res.headers.get("x-d1-bookmark")).toBeNull();
+    });
+});
+
+describe("createWorker — x402 paid procedures", () => {
+    let shard: ShardSpy;
+
+    beforeEach(() => {
+        shard = createShardSpy();
+    });
+
+    /** Structural shape of the injected `x402Charge` gate (the type is internal to create-worker). */
+    type ChargeGateStub = (request: Request, spec: { functionPath: string; price: number | string }, dispatch: () => Promise<Response>) => Promise<Response>;
+
+    /** A registry with one paid `.x402({ price })`-tagged query. */
+    const paidFunctions = { "reports:latest": { kind: "query", x402: { price: "$0.05" } } } as const;
+
+    /** A single paid RPC POST for `functionPath`, merging any extra envelope fields (e.g. `fanOut`). */
+    const paidRpc = (functionPath: string, extra: Record<string, unknown> = {}): Request =>
+        new Request("https://app.example/_lunora/rpc", {
+            body: JSON.stringify({ args: {}, functionPath, ...extra }),
+            method: "POST",
+        });
+
+    it("fail-closes a paid function with no x402Charge gate: 500, never served free", async () => {
+        expect.assertions(3);
+
+        const worker = createWorker({ allowUnauthenticatedShardAccess: true, functions: paidFunctions, shardDO: shard.namespace });
+
+        const res = await worker.fetch(paidRpc("reports:latest"), {}, fakeContext);
+
+        expect(res.status).toBe(500);
+        await expect(res.json()).resolves.toMatchObject({ error: { code: "MISCONFIGURED" } });
+        // The crown jewel: a paid function without a paywall is refused, NOT dispatched free.
+        expect(shard.calls).toHaveLength(0);
+    });
+
+    it("runs the injected charge gate around dispatch and withholds the shard when unpaid", async () => {
+        expect.assertions(4);
+
+        // A gate that always challenges (unpaid): it must never invoke `dispatch`.
+        const x402Charge = vi.fn<ChargeGateStub>(() => Promise.resolve(new Response(null, { status: 402 })));
+
+        const worker = createWorker({ allowUnauthenticatedShardAccess: true, functions: paidFunctions, shardDO: shard.namespace, x402Charge });
+
+        const res = await worker.fetch(paidRpc("reports:latest"), {}, fakeContext);
+
+        expect(res.status).toBe(402);
+        expect(x402Charge).toHaveBeenCalledTimes(1);
+        // The gate is handed the paid function's path + declared price as the charge spec.
+        expect(x402Charge.mock.calls[0]![1]).toStrictEqual({ functionPath: "reports:latest", price: "$0.05" });
+        // Unpaid: the gate never ran `dispatch`, so no shard was touched.
+        expect(shard.calls).toHaveLength(0);
+    });
+
+    it("dispatches to the shard once the gate settles the payment", async () => {
+        expect.assertions(2);
+
+        // A gate that treats the request as paid: run the real dispatch.
+        const x402Charge = vi.fn<ChargeGateStub>((_request, _spec, dispatch) => dispatch());
+
+        const worker = createWorker({ allowUnauthenticatedShardAccess: true, functions: paidFunctions, shardDO: shard.namespace, x402Charge });
+
+        const res = await worker.fetch(paidRpc("reports:latest"), {}, fakeContext);
+
+        expect(res.status).toBe(200);
+        // Paid: the gate ran `dispatch`, forwarding to the shard exactly once.
+        expect(shard.calls).toHaveLength(1);
+    });
+
+    it("refuses to fan out a paid function: 400, gate never consulted, coordinator untouched", async () => {
+        expect.assertions(3);
+
+        const x402Charge = vi.fn<ChargeGateStub>((_request, _spec, dispatch) => dispatch());
+        const fanOut = vi.fn<() => never>();
+
+        const worker = createWorker({
+            allowUnauthenticatedShardAccess: true,
+            // Allow the fan-out past the authorization gate so the paid-fan-out refusal is what's under test.
+            authorizeFanOut: () => true,
+            functions: paidFunctions,
+            queryCoordinator: { fanOut } as never,
+            shardDO: shard.namespace,
+            x402Charge,
+        });
+
+        const res = await worker.fetch(paidRpc("reports:latest", { fanOut: { merge: { kind: "concat" }, table: "reports" } }), {}, fakeContext);
+
+        expect(res.status).toBe(400);
+        // A paid fan-out is one payment fanned across N shards — refused before the gate or the coordinator runs.
+        expect(x402Charge).not.toHaveBeenCalled();
+        expect(fanOut).not.toHaveBeenCalled();
+    });
+
+    it("rejects a paid function inside a batch: 400 for the whole batch, no shard forward", async () => {
+        expect.assertions(3);
+
+        const x402Charge = vi.fn<ChargeGateStub>((_request, _spec, dispatch) => dispatch());
+
+        const worker = createWorker({ allowUnauthenticatedShardAccess: true, functions: paidFunctions, shardDO: shard.namespace, x402Charge });
+
+        const res = await worker.fetch(
+            new Request("https://app.example/_lunora/rpc-batch", {
+                body: JSON.stringify({
+                    calls: [
+                        { functionPath: "messages:list", id: 0 },
+                        { functionPath: "reports:latest", id: 1 },
+                    ],
+                }),
+                method: "POST",
+            }),
+            {},
+            fakeContext,
+        );
+
+        expect(res.status).toBe(400);
+        await expect(res.json()).resolves.toMatchObject({ error: { code: "BAD_REQUEST" } });
+        // The batch is refused whole — no entry (paid or free) reaches a shard, and the gate never runs.
+        expect(shard.calls).toHaveLength(0);
     });
 });
 
@@ -947,6 +1383,39 @@ describe("createWorker — HTTP actions", () => {
         expect(action).not.toHaveBeenCalled();
     });
 
+    it("exposes ctx.cache on c.var.lunora.cache for HTTP action handlers", async () => {
+        expect.assertions(3);
+
+        const purgedTags: string[] = [];
+        const fakeCacheContext: ExecutionContextLike = {
+            ...fakeContext,
+            cache: {
+                purge: async (options: { purgeEverything?: boolean; tags?: string[] }) => {
+                    if (options.tags) {
+                        purgedTags.push(...options.tags);
+                    }
+                },
+            },
+        };
+
+        const worker = createWorker({
+            httpRouter: honoApp((app) =>
+                app.post("/purge", async (c) => {
+                    await c.var.lunora.cache!.purge({ tags: ["products", "users"] });
+
+                    return new Response("ok");
+                }),
+            ),
+            shardDO: shard.namespace,
+        });
+
+        const res = await worker.fetch(new Request("https://app.example/purge", { method: "POST" }), {}, fakeCacheContext);
+
+        expect(res.status).toBe(200);
+        await expect(res.text()).resolves.toBe("ok");
+        expect(purgedTags).toEqual(["products", "users"]);
+    });
+
     it("the internal RPC path is never shadowed by a catch-all router", async () => {
         expect.assertions(3);
 
@@ -1050,6 +1519,82 @@ describe("composeWorker — meta-framework composition (PLAN4 §2.2)", () => {
     });
 });
 
+describe("createLunoraHandler — framework-neutral mount seam", () => {
+    let shard: ShardSpy;
+
+    beforeEach(() => {
+        shard = createShardSpy();
+    });
+
+    it("defaults shardDO to env.SHARD and forwards /_lunora/rpc", async () => {
+        expect.assertions(2);
+
+        const handler = createLunoraHandler();
+
+        const res = await handler(
+            new Request("https://app.example/_lunora/rpc", { body: JSON.stringify({ args: {}, functionPath: "x:y" }), method: "POST" }),
+            { SHARD: shard.namespace },
+            fakeContext,
+        );
+
+        expect(res.status).toBe(200);
+        expect(shard.calls).toHaveLength(1);
+    });
+
+    it("honours an explicit shardDO over env.SHARD", async () => {
+        expect.assertions(2);
+
+        const ignored = createShardSpy();
+        const handler = createLunoraHandler({ shardDO: shard.namespace });
+
+        const res = await handler(
+            new Request("https://app.example/_lunora/rpc", { body: JSON.stringify({ args: {}, functionPath: "x:y" }), method: "POST" }),
+            { SHARD: ignored.namespace },
+            fakeContext,
+        );
+
+        expect(res.status).toBe(200);
+        expect(ignored.calls).toHaveLength(0);
+    });
+
+    it("supports an (env) => options factory", async () => {
+        expect.assertions(1);
+
+        const handler = createLunoraHandler((env) => {
+            return { shardDO: (env as { CUSTOM: ShardNamespaceLike }).CUSTOM };
+        });
+
+        const res = await handler(
+            new Request("https://app.example/_lunora/rpc", { body: JSON.stringify({ args: {}, functionPath: "x:y" }), method: "POST" }),
+            { CUSTOM: shard.namespace },
+            fakeContext,
+        );
+
+        expect(res.status).toBe(200);
+    });
+
+    it("defaults the ExecutionContext when the host omits one", async () => {
+        expect.assertions(1);
+
+        const handler = createLunoraHandler({ shardDO: shard.namespace });
+
+        const res = await handler(
+            new Request("https://app.example/_lunora/rpc", { body: JSON.stringify({ args: {}, functionPath: "x:y" }), method: "POST" }),
+            {},
+        );
+
+        expect(res.status).toBe(200);
+    });
+
+    it("throws a clear error when no shard namespace resolves", () => {
+        expect.assertions(1);
+
+        const handler = createLunoraHandler();
+
+        expect(() => handler(new Request("https://app.example/_lunora/rpc", { method: "POST" }), {})).toThrow(/no shard Durable Object namespace/);
+    });
+});
+
 describe("createWorker auth-metrics instrumentation (PLAN3 §2.3)", () => {
     let shard: ShardSpy;
     /** Captures `waitUntil` promises so the test can await the fire-and-forget recording. */
@@ -1146,5 +1691,113 @@ describe("createWorker auth-metrics instrumentation (PLAN3 §2.3)", () => {
 
         expect(res.status).toBe(404);
         expect(authHandler).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe("createWorker — relay-tier routing (plan 075 Phase 2)", () => {
+    interface Forward {
+        binding: null | string;
+        name: string;
+        system: null | string;
+        userId: null | string;
+    }
+
+    const routingNamespace = (relayCount: number, forwards: Forward[]): ShardNamespaceLike => {
+        return {
+            get: (id) => {
+                const name = (id as { __name: string }).__name;
+
+                return {
+                    fetch: async (request: Request) => {
+                        if (new URL(request.url).pathname === "/_lunora/route") {
+                            return Response.json({ relayCount }, { headers: { "content-type": "application/json" } });
+                        }
+
+                        forwards.push({
+                            binding: request.headers.get("x-lunora-shard-binding"),
+                            name,
+                            system: request.headers.get("x-lunora-system"),
+                            userId: request.headers.get("x-lunora-userid"),
+                        });
+
+                        return new Response(null, { status: 101 });
+                    },
+                };
+            },
+            idFromName: (name) => {
+                return { __name: name };
+            },
+        };
+    };
+
+    const upgrade = (shardKey: string): Request => new Request(`https://app.example/_lunora/ws?shard=${shardKey}`, { headers: { Upgrade: "websocket" } });
+
+    it("routes a new WS connection on a promoted shard to one of its relays", async () => {
+        expect.assertions(3);
+
+        const forwards: Forward[] = [];
+        const namespace = routingNamespace(2, forwards);
+        const worker = createWorker({ allowUnauthenticatedShardAccess: true, shardDO: namespace });
+
+        await worker.fetch(upgrade("promoted-a"), { SHARD: namespace }, fakeContext);
+
+        expect(forwards).toHaveLength(1);
+        expect(forwards[0]?.name).toMatch(/^promoted-a::relay::[01]$/u); // routed to a relay
+        expect(forwards[0]?.binding).toBe("SHARD"); // told the DO its namespace binding
+    });
+
+    it("keeps a new WS connection on the owner when the shard is not promoted", async () => {
+        expect.assertions(2);
+
+        const forwards: Forward[] = [];
+        const namespace = routingNamespace(0, forwards);
+        const worker = createWorker({ allowUnauthenticatedShardAccess: true, shardDO: namespace });
+
+        await worker.fetch(upgrade("cold-b"), { SHARD: namespace }, fakeContext);
+
+        expect(forwards).toHaveLength(1);
+        expect(forwards[0]?.name).toBe("cold-b"); // owner-served
+    });
+
+    it("stays owner-served when the namespace binding can't be found (relay tier inert)", async () => {
+        expect.assertions(2);
+
+        const forwards: Forward[] = [];
+        const namespace = routingNamespace(2, forwards);
+        const worker = createWorker({ allowUnauthenticatedShardAccess: true, shardDO: namespace });
+
+        // `env` does not expose the namespace → no binding → no probe, no relay routing.
+        await worker.fetch(upgrade("cold-c"), {}, fakeContext);
+
+        expect(forwards[0]?.name).toBe("cold-c");
+        expect(forwards[0]?.binding).toBeNull();
+    });
+
+    it("strips forged x-lunora-* headers from the upgrade before forwarding to the DO", async () => {
+        expect.assertions(4);
+
+        const forwards: Forward[] = [];
+        const namespace = routingNamespace(2, forwards);
+        const worker = createWorker({ allowUnauthenticatedShardAccess: true, shardDO: namespace });
+
+        // Attacker forges control headers on the WS upgrade. With `env` not exposing
+        // the namespace, `resolveShardBindingName` returns undefined, so the forged
+        // `x-lunora-shard-binding` is never overwritten — it must be *stripped*
+        // instead, along with the forged `x-lunora-system`/`x-lunora-userid`.
+        const forged = new Request("https://app.example/_lunora/ws?shard=forged-d", {
+            headers: {
+                Upgrade: "websocket",
+                "x-lunora-shard-binding": "EVIL",
+                "x-lunora-system": "1",
+                "x-lunora-userid": "attacker",
+            },
+        });
+
+        await worker.fetch(forged, {}, fakeContext);
+
+        expect(forwards).toHaveLength(1);
+        expect(forwards[0]?.binding).toBeNull(); // forged "EVIL" stripped, no binding resolved to re-set it
+        expect(forwards[0]?.system).toBeNull(); // forged x-lunora-system stripped
+        expect(forwards[0]?.userId).toBeNull(); // forged x-lunora-userid stripped (anonymous upgrade)
     });
 });

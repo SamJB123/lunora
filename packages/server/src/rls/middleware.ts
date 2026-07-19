@@ -46,6 +46,7 @@ import type { Middleware } from "../builder/types";
 import { LunoraError } from "../error";
 import type { FacadeEntry } from "../facade";
 import { bindOrm, bindTableFacade } from "../facade";
+import { tagRlsMiddleware } from "./policy-tag";
 import type { Permission, Policy, PolicyContext, RlsOptions, Role, WhereInput } from "./types";
 
 /**
@@ -157,6 +158,7 @@ interface DatabaseWriterLike {
     count: (tableName: string, whereOrArgs?: CountArgs | WhereInput) => Promise<number>;
     delete: (id: string, expectedTable?: string, options?: { hard?: boolean }) => Promise<void>;
     deleteMany: (ids: ReadonlyArray<string>, options?: { limit?: number }, expectedTable?: string) => Promise<{ deleted: number }>;
+    deleteWhere?: (tableName: string, where: WhereInput, options?: { limit?: number }) => Promise<{ deleted: number }>;
     findFirst: (tableName: string, args?: QueryArgs) => Promise<Record<string, unknown> | null>;
     findFirstOrThrow: (tableName: string, args?: QueryArgs) => Promise<Record<string, unknown>>;
     findMany: (tableName: string, args?: QueryArgs) => Promise<QueryPage>;
@@ -169,7 +171,11 @@ interface DatabaseWriterLike {
      */
     groupBy: (tableName: string, options: GroupByArgs) => Promise<ReadonlyArray<{ key: Record<string, unknown>; value: null | number }>>;
     insert: (tableName: string, document: Record<string, unknown>) => Promise<string>;
-    insertMany: (tableName: string, documents: ReadonlyArray<Record<string, unknown>>, options?: { limit?: number }) => Promise<string[]>;
+    insertMany: (
+        tableName: string,
+        documents: ReadonlyArray<Record<string, unknown>>,
+        options?: { limit?: number; skipDuplicates?: boolean },
+    ) => Promise<(string | null)[]>;
     insertManyUnsafe: (
         tableName: string,
         documents: ReadonlyArray<Record<string, unknown>>,
@@ -186,7 +192,12 @@ interface DatabaseWriterLike {
      */
     lookupById?: (id: string, expectedTable?: string) => Promise<null | { row: Record<string, unknown>; tableName: string }>;
     patch: (id: string, patch: Record<string, unknown>, expectedTable?: string) => Promise<void>;
-    patchMany: (patches: ReadonlyArray<{ id: string; patch: Record<string, unknown> }>, options?: { limit?: number }, expectedTable?: string) => Promise<void>;
+    patchMany: (
+        patches: ReadonlyArray<{ id: string; patch: Record<string, unknown> }>,
+        options?: { limit?: number },
+        expectedTable?: string,
+    ) => Promise<{ patched: number }>;
+    patchWhere?: (tableName: string, args: { patch: Record<string, unknown>; where: WhereInput }, options?: { limit?: number }) => Promise<{ patched: number }>;
     query: (tableName: string) => TableReaderLike;
 
     /**
@@ -808,14 +819,6 @@ const isFacadeEntry = (value: unknown): value is Record<string, unknown> => {
  */
 const wrapDatabase = <Context>(base: RlsDatabase, raw: RlsDatabase, perTable: Map<string, Policy<Context>[]>, context: PolicyContext<Context>): RlsDatabase => {
     /**
-     * Route a table to the writer that should service it: `raw` for a policy
-     * table (already authorized here — must bypass the guard), `base` for any
-     * other table (so the secure-by-default guard denies a protected,
-     * policy-less table and passes a `.public()` one through).
-     */
-    const route = (tableName: string): RlsDatabase => (perTable.has(tableName) ? raw : base);
-
-    /**
      * Cached effective read `baseWhere` per table. Cached for the lifetime
      * of one wrapped writer — i.e. one request — so a single procedure
      * doesn't re-evaluate the same policy chain on every read.
@@ -846,6 +849,19 @@ const wrapDatabase = <Context>(base: RlsDatabase, raw: RlsDatabase, perTable: Ma
 
         return result;
     };
+
+    /**
+     * Route a READ to the writer that should service it. Uses `raw` (bypassing the
+     * secure-by-default guard) only when the table has an active `on:"read"` policy
+     * — i.e. `readBase(table).restricts` is true — because that read is authorized
+     * and filtered by the policy `baseWhere`. Otherwise it routes to the guarded
+     * `base`: a protected table that appears in the bundle only via a WRITE policy
+     * has no read policy, so it must fail closed under `.rls("required")` rather
+     * than returning every row unfiltered, while a `.public()` table passes
+     * through. This keeps read routing in fail-closed parity with `guardWriter` and
+     * `shape-read-base.ts`; writes route via `gateById`/insert, not this router.
+     */
+    const route = (tableName: string): RlsDatabase => (readBase(tableName).restricts ? raw : base);
 
     /**
      * The read filter for a TARGET table, attached to every read so `@lunora/do`'s
@@ -974,7 +990,13 @@ const wrapDatabase = <Context>(base: RlsDatabase, raw: RlsDatabase, perTable: Ma
             const writeOk = evaluateWrite(policies, op, { ...context, row: located.row }, nextRow);
 
             if (!writeOk) {
-                throw new LunoraError("FORBIDDEN", `${op} on "${located.tableName}" denied by policy`);
+                // Reject the denied write with FORBIDDEN — the intended, tested
+                // contract for an authorized-but-policy-denied mutation. SECURITY:
+                // do NOT interpolate the owning table name into the message (it was
+                // formerly `${op} on "${located.tableName}" denied by policy`) — an
+                // attacker holding a candidate id could otherwise learn which table
+                // a hidden record lives in. The generic message is table-agnostic.
+                throw new LunoraError("FORBIDDEN", `${op} denied by policy`);
             }
         }
 
@@ -1040,6 +1062,22 @@ const wrapDatabase = <Context>(base: RlsDatabase, raw: RlsDatabase, perTable: Ma
             return { deleted: ids.length };
         },
 
+        async deleteWhere(tableName, where, options) {
+            // Where-based delete: resolve matching rows through the RLS-filtered
+            // reader so hidden rows are excluded, then gate each id like a single
+            // delete. The read + writes share the mutation-span (if any).
+            const { baseWhere } = readBase(tableName);
+            const resolved = await route(tableName).findMany(tableName, {
+                baseWhere: mergeBaseWhere(where, baseWhere),
+                relationBaseWhere: relationReadFilter,
+            });
+            const ids = resolved.page.map((row) => String(row["_id"]));
+
+            assertBatchLimit(ids.length, options?.limit, "deleteWhere");
+
+            return wrapped.deleteMany(ids, options);
+        },
+
         async findFirst(tableName, args) {
             const { baseWhere } = readBase(tableName);
 
@@ -1096,9 +1134,20 @@ const wrapDatabase = <Context>(base: RlsDatabase, raw: RlsDatabase, perTable: Ma
 
             const { baseWhere, restricts } = readBase(located.tableName);
 
-            // The owning table participates in RLS but the read policy doesn't
-            // restrict (e.g. policy returned `true`) → return the row as-is.
-            if (!restricts || !baseWhere) {
+            // The owning table participates in the bundle but has NO active read
+            // policy (e.g. it only carries a write/insert policy). `located.row` was
+            // read through the UNGUARDED `raw` writer, so returning it here would
+            // bypass the secure-by-default guard and leak every row of a protected
+            // table. Defer to the GUARDED `base.get` instead: a protected table
+            // fails closed under `.rls("required")` and a `.public()` one returns
+            // the row. Mirrors the `route`/`readRoute` fail-closed parity.
+            if (!restricts) {
+                return base.get(id, expectedTable);
+            }
+
+            // The owning table participates in RLS and the read policy grants
+            // unconditionally (`true` predicate → no `baseWhere`) → return the row.
+            if (!baseWhere) {
                 return located.row;
             }
 
@@ -1218,6 +1267,26 @@ const wrapDatabase = <Context>(base: RlsDatabase, raw: RlsDatabase, perTable: Ma
                     expectedTable,
                 );
             }
+
+            return { patched: patches.length };
+        },
+
+        async patchWhere(tableName, args, options) {
+            // Where-based patch: resolve matching rows through the RLS-filtered
+            // reader so hidden rows are excluded, then gate each id like a single
+            // patch. The read + writes share the mutation-span (if any).
+            const { baseWhere } = readBase(tableName);
+            const resolved = await route(tableName).findMany(tableName, {
+                baseWhere: mergeBaseWhere(args.where, baseWhere),
+                relationBaseWhere: relationReadFilter,
+            });
+            const patches = resolved.page.map((row) => {
+                return { id: String(row["_id"]), patch: args.patch };
+            });
+
+            assertBatchLimit(patches.length, options?.limit, "patchWhere");
+
+            return wrapped.patchMany(patches, options);
         },
 
         query(tableName) {
@@ -1387,7 +1456,7 @@ const rls = <Context extends RlsContextIn = RlsContextIn>(policies: ReadonlyArra
     const perTable = indexByTable(policies);
     const rolePermissions = indexRolePermissions(options.roles);
 
-    return async ({ ctx, next }) => {
+    const middleware: Middleware<Context, Context> = async ({ ctx, next }) => {
         const auth = ctx.auth ?? {};
         // Resolve identity once per RLS-protected procedure so policies can
         // branch on claims (`ctx.auth.identity.email` etc.) without each
@@ -1446,6 +1515,14 @@ const rls = <Context extends RlsContextIn = RlsContextIn>(policies: ReadonlyArra
 
         return next({ ctx: extension });
     };
+
+    // Surface the policies + roles on the middleware so the procedure builder
+    // can hoist them onto the registered function — the local-first shape path
+    // composes a `defineShape` predicate with the table's read base-where from
+    // these (see `shape-read-base.ts`). Cast to the erased `Policy<unknown>`
+    // the tag stores; the closures are evaluated against a structurally-built
+    // PolicyContext, exactly like this middleware does at request time.
+    return tagRlsMiddleware(middleware, { policies: policies as ReadonlyArray<Policy>, roles: options.roles ?? [] });
 };
 
 export { rls };

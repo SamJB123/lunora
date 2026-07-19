@@ -1,9 +1,97 @@
 /* eslint-disable no-underscore-dangle -- `_id` is the Lunora document-id field; test fixtures mirror it verbatim */
+import { LunoraError } from "@lunora/errors";
 import { NonRetriableError } from "@tanstack/offline-transactions";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { Row, SyncWriter } from "../src/internals";
-import { createOptimisticOnlineDetector, makeDiffEmit, runOutboxMutation, toMap } from "../src/internals";
+import type { OutboxExecutor, OutboxMutationMetadata, Row, SyncWriter } from "../src/internals";
+import { createExecutorOutboxSink, createOptimisticOnlineDetector, makeDiffEmit, OUTBOX_MUTATION_FN_NAME, runOutboxMutation, toMap } from "../src/internals";
+
+/**
+ * A fake `OfflineExecutor` slice: every `createOfflineTransaction(...).mutate()`
+ * appends a persisted entry and `getPendingCount` reports the depth. Records the
+ * metadata each transaction carried so the sink's persisted payload can be asserted.
+ */
+const fakeExecutor = (): { committed: OutboxMutationMetadata[]; executor: OutboxExecutor; outbox: { id: string }[] } => {
+    const outbox: { id: string }[] = [];
+    const committed: OutboxMutationMetadata[] = [];
+    let counter = 0;
+
+    return {
+        committed,
+        executor: {
+            createOfflineTransaction: (options) => {
+                return {
+                    mutate: () => {
+                        counter += 1;
+                        outbox.push({ id: `tx-${counter.toString()}` });
+                        committed.push(options.metadata as OutboxMutationMetadata);
+                    },
+                };
+            },
+            getPendingCount: () => outbox.length,
+        },
+        outbox,
+    };
+};
+
+const outboxMutation = (mutationId: number) => {
+    return {
+        args: { text: `m${mutationId.toString()}` },
+        clientId: "c1",
+        functionPath: "messages:send",
+        idempotencyKey: `c1:${mutationId.toString()}`,
+        identity: "ident-a",
+        mutationId,
+    };
+};
+
+describe(createExecutorOutboxSink, () => {
+    it("persists each write as an executor transaction carrying the replay metadata", async () => {
+        const { committed, executor, outbox } = fakeExecutor();
+        const sink = createExecutorOutboxSink(executor);
+
+        await sink.enqueue({ ...outboxMutation(1), shardKey: "room-7" });
+
+        expect(outbox).toHaveLength(1);
+        expect(committed[0]).toStrictEqual({
+            args: { text: "m1" },
+            clientId: "c1",
+            functionPath: "messages:send",
+            idempotencyKey: "c1:1",
+            identity: "ident-a",
+            mutationId: 1,
+            shardKey: "room-7",
+        });
+    });
+
+    it("rejects with OFFLINE_QUEUE_OVERFLOW at capacity instead of evicting", async () => {
+        const { executor, outbox } = fakeExecutor();
+        const sink = createExecutorOutboxSink(executor, { maxItems: 2 });
+
+        await sink.enqueue(outboxMutation(1));
+        await sink.enqueue(outboxMutation(2));
+
+        // At capacity — the next write is rejected, and no persisted write is dropped.
+        await expect(sink.enqueue(outboxMutation(3))).rejects.toMatchObject({ code: "OFFLINE_QUEUE_OVERFLOW" });
+        expect(outbox.map((entry) => entry.id)).toStrictEqual(["tx-1", "tx-2"]);
+    });
+
+    it("uses the configured reserved mutationFn name", async () => {
+        const seen: string[] = [];
+        const executor: OutboxExecutor = {
+            createOfflineTransaction: (options) => {
+                seen.push(options.mutationFnName);
+
+                return { mutate: () => undefined };
+            },
+            getPendingCount: () => 0,
+        };
+
+        await createExecutorOutboxSink(executor).enqueue(outboxMutation(1));
+
+        expect(seen).toStrictEqual([OUTBOX_MUTATION_FN_NAME]);
+    });
+});
 
 /** A SyncWriter that records the writes it received, in order. */
 const recordingWriter = (): { ops: ({ key: string; type: "delete" } | { type: "insert" | "update"; value: Row })[]; writer: SyncWriter<Row> } => {
@@ -21,9 +109,10 @@ const recordingWriter = (): { ops: ({ key: string; type: "delete" } | { type: "i
 
 describe(makeDiffEmit, () => {
     it("emits only the rows that changed between snapshots", () => {
-        const synced = new Map<string, Row>();
+        // syncedJson is the single Map<string, string> cache owned at the caller level.
+        const syncedJson = new Map<string, string>();
         const { ops, writer } = recordingWriter();
-        const emit = makeDiffEmit(synced, writer);
+        const emit = makeDiffEmit(syncedJson, writer);
 
         // First snapshot: two inserts.
         emit(
@@ -40,7 +129,7 @@ describe(makeDiffEmit, () => {
             { type: "insert", value: { _id: "a", text: "1" } },
             { type: "insert", value: { _id: "b", text: "2" } },
         ]);
-        expect(synced.size).toBe(2);
+        expect(syncedJson.size).toBe(2);
 
         // Second snapshot: `a` changed, `b` removed, `c` added.
         ops.length = 0;
@@ -62,9 +151,9 @@ describe(makeDiffEmit, () => {
     });
 
     it("writes nothing when the snapshot is unchanged", () => {
-        const synced = new Map<string, Row>();
+        const syncedJson = new Map<string, string>();
         const { ops, writer } = recordingWriter();
-        const emit = makeDiffEmit(synced, writer);
+        const emit = makeDiffEmit(syncedJson, writer);
         const snapshot = (): Map<string, Row> => toMap([{ _id: "a", text: "1" }] satisfies Row[], (r) => r._id);
 
         emit(snapshot());
@@ -72,6 +161,70 @@ describe(makeDiffEmit, () => {
         emit(snapshot());
 
         expect(ops).toStrictEqual([]);
+    });
+
+    it("does not emit spurious updates for unchanged rows after a sync restart", () => {
+        // Simulates the sync-restart path in collection-options: syncedJson is
+        // owned at the outer closure level and shared across makeDiffEmit calls.
+        // A new `emit` closure (representing a sync.sync restart) must receive
+        // the same syncedJson reference so already-committed rows are seen as
+        // known, not inserted/updated anew.
+        const syncedJson = new Map<string, string>();
+        const { ops: ops1, writer: writer1 } = recordingWriter();
+
+        // First sync session: two rows arrive.
+        const emit1 = makeDiffEmit(syncedJson, writer1);
+        emit1(
+            toMap(
+                [
+                    { _id: "a", text: "hello" },
+                    { _id: "b", text: "world" },
+                ] satisfies Row[],
+                (r) => r._id,
+            ),
+        );
+
+        expect(ops1).toStrictEqual([
+            { type: "insert", value: { _id: "a", text: "hello" } },
+            { type: "insert", value: { _id: "b", text: "world" } },
+        ]);
+        expect(syncedJson.size).toBe(2);
+
+        // Sync restart: a new writer (and therefore a new emit closure) is created,
+        // but the same syncedJson is passed — the committed state must be preserved.
+        const { ops: ops2, writer: writer2 } = recordingWriter();
+        const emit2 = makeDiffEmit(syncedJson, writer2);
+
+        // Server re-delivers the same rows (identical snapshot after reconnect).
+        // No writes should be emitted — they are NOT new or changed.
+        emit2(
+            toMap(
+                [
+                    { _id: "a", text: "hello" },
+                    { _id: "b", text: "world" },
+                ] satisfies Row[],
+                (r) => r._id,
+            ),
+        );
+
+        expect(ops2).toStrictEqual([]);
+    });
+
+    it("correctly detects a change on the first emit after a sync restart", () => {
+        // After restart, a row whose value actually changed must still emit "update".
+        const syncedJson = new Map<string, string>();
+        const { writer: writer1 } = recordingWriter();
+        const emit1 = makeDiffEmit(syncedJson, writer1);
+
+        emit1(toMap([{ _id: "a", text: "v1" }] satisfies Row[], (r) => r._id));
+
+        // Restart with a new writer/closure, same syncedJson.
+        const { ops: ops2, writer: writer2 } = recordingWriter();
+        const emit2 = makeDiffEmit(syncedJson, writer2);
+
+        emit2(toMap([{ _id: "a", text: "v2" }] satisfies Row[], (r) => r._id));
+
+        expect(ops2).toStrictEqual([{ type: "update", value: { _id: "a", text: "v2" } }]);
     });
 });
 
@@ -98,7 +251,7 @@ describe(runOutboxMutation, () => {
     });
 
     it("wraps a coded server rejection in NonRetriableError so the optimistic insert rolls back", async () => {
-        const rejected = Object.assign(new Error("duplicate name"), { code: "CONFLICT" });
+        const rejected = new LunoraError("CONFLICT", "duplicate name");
 
         await expect(runOutboxMutation(() => Promise.reject(rejected))).rejects.toBeInstanceOf(NonRetriableError);
     });

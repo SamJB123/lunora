@@ -1,5 +1,6 @@
 import type { SchemaLike } from "@lunora/do";
 import { createShardCtxDb, runShardMigrations } from "@lunora/do";
+import { LunoraError } from "@lunora/errors";
 import type {
     ActionCtx,
     ArgsValidator,
@@ -77,6 +78,20 @@ type FunctionRegistry = Record<string, RegisteredAction<any, any> | RegisteredMu
  * clearly-throwing stubs for unsupported surfaces.
  */
 interface LunoraTestOptions {
+    /**
+     * Injectable `ctx.env` for every context (query / mutation / action). When
+     * provided, handlers that read `ctx.env.SOME_KEY` (the validated `defineEnv`
+     * surface) see this object. Left unset it stays `undefined` — matching the
+     * optional `ctx.env?` field, so graceful `ctx.env?.KEY` access still yields
+     * `undefined` rather than throwing. Not a throwing stub for exactly that
+     * reason: `env` is designed to be legitimately absent.
+     * @example
+     * ```ts
+     * const t = lunoraTest(schema, { env: { STRIPE_KEY: "sk_test_…" } });
+     * ```
+     */
+    env?: Record<string, unknown>;
+
     /**
      * Injectable `fetch` implementation for action contexts. When provided,
      * `ctx.fetch` in every `action` (and `withIdentity` views) resolves to this
@@ -218,7 +233,7 @@ const registeredFunctionVisibility = (value: unknown): "internal" | "public" =>
  * functions that never reach for it still run.
  */
 const unavailable = (surface: string): never => {
-    throw new Error(`ctx.${surface} is not available in the in-memory @lunora/testing harness (v1)`);
+    throw new LunoraError("INTERNAL", `ctx.${surface} is not available in the in-memory @lunora/testing harness (v1)`);
 };
 
 /**
@@ -264,8 +279,16 @@ type RunRegisteredFunction = (
 const buildSubscribe = (runRegistered: RunRegisteredFunction, queryContext: QueryCtx, mutationListeners: Set<() => void>): TestHarness["subscribe"] => {
     const factory = (referenceOrInline: unknown, args?: unknown): TestSubscription<unknown> => {
         let done = false;
-        let pendingResolve: ((value: IteratorResult<unknown>) => void) | undefined;
+        // Parked `next()` callers awaiting the next emit. An array (not a single
+        // slot) so concurrent `next()` calls — e.g. `Promise.all([sub.next(),
+        // sub.next()])` — all settle rather than the later call orphaning the
+        // earlier one's promise. Every waiter settles from the same emit.
+        const pendingWaiters: { reject: (error: unknown) => void; resolve: (value: IteratorResult<unknown>) => void }[] = [];
         let pendingResult: IteratorResult<unknown> | undefined;
+        // A buffered re-evaluation FAILURE (mutually exclusive with pendingResult;
+        // each emit clears the other). Wrapped in an object so an `undefined`
+        // thrown value is still distinguishable from "no error buffered".
+        let pendingError: { error: unknown } | undefined;
 
         // Monotonic notification sequence. Listener re-evaluations run concurrently
         // (each is a `runQuery().then(emit)`), so their promises can resolve out of
@@ -294,18 +317,47 @@ const buildSubscribe = (runRegistered: RunRegisteredFunction, queryContext: Quer
 
             const iterResult: IteratorResult<unknown> = { done: false, value };
 
-            if (pendingResolve === undefined) {
+            if (pendingWaiters.length === 0) {
                 // No one is waiting — buffer for the next next() call, coalescing
-                // any previously buffered result.
+                // any previously buffered result/error.
                 pendingResult = iterResult;
+                pendingError = undefined;
             } else {
-                const resolve = pendingResolve;
-
-                pendingResolve = undefined;
-                // This emit is the freshest snapshot; discard any older buffered one
-                // so a later next() doesn't resurface a superseded result.
+                // This emit is the freshest snapshot; discard any older buffered
+                // result/error so a later next() doesn't resurface a superseded one.
                 pendingResult = undefined;
-                resolve(iterResult);
+                pendingError = undefined;
+
+                for (const waiter of pendingWaiters.splice(0)) {
+                    waiter.resolve(iterResult);
+                }
+            }
+        };
+
+        /**
+         * Surface a re-evaluation FAILURE at `seq`. Without this a query that
+         * throws during a post-mutation re-eval would leave `appliedSeq` stuck
+         * below `latestSeq` forever, so every later `next()` parks and never
+         * settles. Advancing `appliedSeq` and rejecting/buffering the error lets
+         * `next()` reject instead of hanging.
+         */
+        const emitError = (seq: number, error: unknown): void => {
+            if (seq < appliedSeq) {
+                return;
+            }
+
+            appliedSeq = seq;
+
+            if (pendingWaiters.length === 0) {
+                pendingError = { error };
+                pendingResult = undefined;
+            } else {
+                pendingResult = undefined;
+                pendingError = undefined;
+
+                for (const waiter of pendingWaiters.splice(0)) {
+                    waiter.reject(error);
+                }
             }
         };
 
@@ -314,6 +366,13 @@ const buildSubscribe = (runRegistered: RunRegisteredFunction, queryContext: Quer
             (seq: number) =>
             (value: unknown): void => {
                 emit(seq, value);
+            };
+
+        /** Curry `emitError` so the seq is captured for a `.catch(emitErrorAt(seq))`. */
+        const emitErrorAt =
+            (seq: number) =>
+            (error: unknown): void => {
+                emitError(seq, error);
             };
 
         const listener = (): void => {
@@ -325,11 +384,10 @@ const buildSubscribe = (runRegistered: RunRegisteredFunction, queryContext: Quer
 
             const seq = latestSeq;
 
-            // Fire-and-forget: re-run the query and emit. The void is deliberate —
-            // subscription listeners do not propagate errors back to mutations.
-            runQuery()
-                .then(emitAt(seq))
-                .catch(() => undefined);
+            // Fire-and-forget: re-run the query and emit. A rejection is surfaced to
+            // waiting/next next() callers via emitError (not propagated back to the
+            // mutation that triggered the re-eval).
+            runQuery().then(emitAt(seq)).catch(emitErrorAt(seq));
         };
 
         mutationListeners.add(listener);
@@ -344,32 +402,53 @@ const buildSubscribe = (runRegistered: RunRegisteredFunction, queryContext: Quer
                     return Promise.resolve({ done: true, value: undefined });
                 }
 
-                // A buffered result is safe to return only if it reflects the most
-                // recent notification (`appliedSeq === latestSeq`). If a newer
+                // A buffered result/error is safe to consume only if it reflects the
+                // most recent notification (`appliedSeq === latestSeq`). If a newer
                 // re-evaluation is still in flight, the buffer is stale — fall through
                 // and wait for that emit so next() never resolves to a superseded
                 // snapshot (the schedule-then-write race, where the schedule's empty
                 // re-eval buffers before the write's re-eval lands).
-                if (pendingResult !== undefined && appliedSeq === latestSeq) {
-                    const result = pendingResult;
+                if (appliedSeq === latestSeq) {
+                    if (pendingError !== undefined) {
+                        const { error } = pendingError;
 
-                    pendingResult = undefined;
+                        pendingError = undefined;
 
-                    return Promise.resolve(result);
+                        // eslint-disable-next-line @typescript-eslint/prefer-promise-reject-errors -- re-surfaces the subscription's original thrown value verbatim
+                        return Promise.reject(error);
+                    }
+
+                    if (pendingResult !== undefined) {
+                        const result = pendingResult;
+
+                        pendingResult = undefined;
+
+                        return Promise.resolve(result);
+                    }
                 }
 
                 if (appliedSeq < latestSeq) {
                     // A newer notification is mid-flight; wait for its emit rather than
-                    // racing it with our own runQuery().
-                    return new Promise<IteratorResult<unknown>>((resolve) => {
-                        pendingResolve = resolve;
+                    // racing it with our own runQuery(). Multiple concurrent next()
+                    // calls each park their own resolver so none is orphaned.
+                    return new Promise<IteratorResult<unknown>>((resolve, reject) => {
+                        pendingWaiters.push({ reject, resolve });
                     });
                 }
 
-                // No notification outstanding — return the current query result.
+                // No notification outstanding — return the current query result. If
+                // the query itself rejects, this next() rejects (surfacing the error).
                 return runQuery().then((value) => {
-                    // A mutation may have buffered a newer result while we evaluated;
-                    // prefer it.
+                    // A mutation may have buffered a newer result/error while we
+                    // evaluated; prefer it.
+                    if (pendingError !== undefined) {
+                        const { error } = pendingError;
+
+                        pendingError = undefined;
+
+                        throw error;
+                    }
+
                     if (pendingResult !== undefined) {
                         const result = pendingResult;
 
@@ -386,11 +465,9 @@ const buildSubscribe = (runRegistered: RunRegisteredFunction, queryContext: Quer
                 done = true;
                 mutationListeners.delete(listener);
 
-                if (pendingResolve !== undefined) {
-                    const resolve = pendingResolve;
-
-                    pendingResolve = undefined;
-                    resolve({ done: true, value: undefined });
+                // Settle every parked next() as done so no caller hangs after return().
+                for (const waiter of pendingWaiters.splice(0)) {
+                    waiter.resolve({ done: true, value: undefined });
                 }
 
                 return Promise.resolve({ done: true, value: undefined });
@@ -398,10 +475,9 @@ const buildSubscribe = (runRegistered: RunRegisteredFunction, queryContext: Quer
         };
 
         // Emit the initial snapshot (seq 0, the baseline) so the first next() sees
-        // data immediately without waiting for a mutation.
-        runQuery()
-            .then(emitAt(0))
-            .catch(() => undefined);
+        // data immediately without waiting for a mutation. A failing initial query
+        // is surfaced through emitError so the first next() rejects rather than hangs.
+        runQuery().then(emitAt(0)).catch(emitErrorAt(0));
 
         return iterator;
     };
@@ -420,6 +496,8 @@ const buildSubscribe = (runRegistered: RunRegisteredFunction, queryContext: Quer
  *
  * **v1 surfaces now supported:**
  *
+ * - `ctx.env` (all contexts): inject the validated env via `options.env`; unset it
+ * stays `undefined`, matching the optional `ctx.env?` field.
  * - `ctx.fetch` (actions): inject a custom `fetch` via `options.fetch`.
  * - `ctx.scheduler` (mutations + actions): fully functional fake with virtual clock;
  * control via `harness.scheduler.advance(ms)` / `runPending()` / `list()`.
@@ -444,42 +522,59 @@ const lunoraTest = (schema: TestSchema, options?: LunoraTestOptions): TestHarnes
     // it made, matching production. `ctx.run*` composition dispatches through the
     // internal path INSIDE the already-open span (a mutation's composed writes ride
     // the outer transaction; an action's composed mutation runs unwrapped, exactly
-    // as in production); the depth guard is a backstop against an accidental nested
-    // entry. The `.exec` is routed through a `.call` indirection — the secret-scan
-    // hook flags a literal `.exec(` (see do-exec.ts / node-sqlite.ts for the dance).
+    // as in production). Top-level entries are serialized through a promise queue
+    // (see `runInMutationTransaction`) so concurrently-issued mutations never share
+    // or interleave a span. The `.exec` is routed through a `.call` indirection — the
+    // secret-scan hook flags a literal `.exec(` (see do-exec.ts / node-sqlite.ts).
     const execStatement = (statement: string): void => {
         const runner = sql.exec as (this: typeof sql, query: string) => unknown;
 
         runner.call(sql, statement);
     };
-    let transactionDepth = 0;
-    const runInMutationTransaction = async <R>(function_: () => Promise<R> | R): Promise<R> => {
-        if (transactionDepth > 0) {
-            // Already inside a mutation's span (a `ctx.run*` composition) — ride it
-            // so the inner write is part of the outer all-or-nothing.
-            return function_();
-        }
+    // Serialize top-level mutation/`run` entries so concurrently-issued mutations
+    // (e.g. `Promise.all([t.mutation(a), t.mutation(b)])`) never interleave their
+    // BEGIN/COMMIT spans. This mirrors the real DO's single-writer semantics
+    // (input gates): each top-level entry runs to completion — commit or rollback —
+    // before the next begins, so no entry ever rides (and is rolled back by)
+    // another's transaction, and two spans never nest into an illegal nested BEGIN.
+    //
+    // Only top-level entries (`t.mutation` / `t.run` / a scheduled mutation) reach
+    // here; `ctx.run*` composition dispatches through `runInternal` → `runRegistered`
+    // directly, running synchronously inside the already-open span without a fresh
+    // BEGIN. So every call to this function is a top-level entry that must queue.
+    let mutationQueue: Promise<unknown> = Promise.resolve();
 
-        transactionDepth = 1;
-        execStatement("BEGIN");
+    const runInMutationTransaction = <R>(function_: () => Promise<R> | R): Promise<R> => {
+        const runTransaction = async (): Promise<R> => {
+            execStatement("BEGIN");
 
-        try {
-            const result = await function_();
-
-            execStatement("COMMIT");
-
-            return result;
-        } catch (error) {
             try {
-                execStatement("ROLLBACK");
-            } catch {
-                // A failed rollback (broken handle) must not mask the original throw.
-            }
+                const result = await function_();
 
-            throw error;
-        } finally {
-            transactionDepth = 0;
-        }
+                execStatement("COMMIT");
+
+                return result;
+            } catch (error) {
+                try {
+                    execStatement("ROLLBACK");
+                } catch {
+                    // A failed rollback (broken handle) must not mask the original throw.
+                }
+
+                throw error;
+            }
+        };
+
+        const result = mutationQueue.then(runTransaction);
+
+        // Advance the queue tail whether or not this entry succeeds, so a rejected
+        // mutation never wedges every later one.
+        mutationQueue = result.then(
+            () => undefined,
+            () => undefined,
+        );
+
+        return result;
     };
 
     // One native SQLite handle backs every harness view (including `withIdentity`
@@ -518,28 +613,50 @@ const lunoraTest = (schema: TestSchema, options?: LunoraTestOptions): TestHarnes
 
     let scheduledDispatchRef: ScheduledDispatch | undefined;
     let mutationContextRef: unknown;
+    let actionContextRef: unknown;
+
+    // `ctx.now` for every context: captured once so a harness sees one stable
+    // instant (production captures it per execution). Overridable via `options.now`.
+    // Computed BEFORE the scheduler so the fake scheduler's virtual clock starts
+    // from the same instant — otherwise a handler that does
+    // `ctx.scheduler.runAt(ctx.now + delay, …)` schedules against a clock that
+    // disagrees with `ctx.now`.
+    const harnessNow = options?.now ?? Date.now();
 
     const { controls: schedulerControls, scheduler: fakeScheduler } = createFakeScheduler(
         () => {
             if (scheduledDispatchRef === undefined) {
-                throw new Error("[fake-scheduler] dispatch not yet available — scheduler.advance called before harness construction completed");
+                throw new LunoraError(
+                    "INTERNAL",
+                    "[fake-scheduler] dispatch not yet available — scheduler.advance called before harness construction completed",
+                );
             }
 
             return scheduledDispatchRef;
         },
         () => {
             if (mutationContextRef === undefined) {
-                throw new Error("[fake-scheduler] mutationContext not yet available — scheduler.advance called before harness construction completed");
+                throw new LunoraError(
+                    "INTERNAL",
+                    "[fake-scheduler] mutationContext not yet available — scheduler.advance called before harness construction completed",
+                );
             }
 
             return mutationContextRef;
         },
-        () => functionRegistryMap,
-    );
+        () => {
+            if (actionContextRef === undefined) {
+                throw new LunoraError(
+                    "INTERNAL",
+                    "[fake-scheduler] actionContext not yet available — scheduler.advance called before harness construction completed",
+                );
+            }
 
-    // `ctx.now` for every context: captured once so a harness sees one stable
-    // instant (production captures it per execution). Overridable via `options.now`.
-    const harnessNow = options?.now ?? Date.now();
+            return actionContextRef;
+        },
+        () => functionRegistryMap,
+        harnessNow,
+    );
 
     const makeHarness = (identity: null | TestIdentity): TestHarness => {
         const auth: AuthState = {
@@ -552,6 +669,7 @@ const lunoraTest = (schema: TestSchema, options?: LunoraTestOptions): TestHarnes
         const queryContext: QueryCtx = {
             auth,
             db: database,
+            env: options?.env,
             log: noopLog,
             now: harnessNow,
             // eslint-disable-next-line @typescript-eslint/no-use-before-define -- lazy closure: `runInternal` is invoked only when a handler calls ctx.runQuery, after construction completes
@@ -564,6 +682,7 @@ const lunoraTest = (schema: TestSchema, options?: LunoraTestOptions): TestHarnes
         const mutationContext: MutationCtx = {
             auth,
             db: database,
+            env: options?.env,
             log: noopLog,
             now: harnessNow,
             // eslint-disable-next-line @typescript-eslint/no-use-before-define -- lazy closure: `runInternal` is invoked only when a handler calls ctx.runMutation, after construction completes
@@ -585,6 +704,7 @@ const lunoraTest = (schema: TestSchema, options?: LunoraTestOptions): TestHarnes
         const actionContext: ActionCtx = {
             auth,
             db: database,
+            env: options?.env,
             // Use the injected fetch when provided; fall back to the v1 stub otherwise.
             fetch: options?.fetch ?? (stubProxy("fetch") as ActionCtx["fetch"]),
             log: noopLog,
@@ -602,6 +722,12 @@ const lunoraTest = (schema: TestSchema, options?: LunoraTestOptions): TestHarnes
             workflows: stubProxy("workflows") as ActionCtx["workflows"],
         };
 
+        // Wire the action-context reference for the fake scheduler thunk (mirrors
+        // mutationContextRef above): only set on the first call (the base harness);
+        // withIdentity views share the same scheduler so the base actionContext is
+        // the canonical one.
+        actionContextRef ??= actionContext;
+
         const runRegistered = (
             expected: "action" | "mutation" | "query",
             reference: { handler: (context: unknown, args: never) => unknown },
@@ -612,12 +738,13 @@ const lunoraTest = (schema: TestSchema, options?: LunoraTestOptions): TestHarnes
             const kind = registeredFunctionKind(reference);
 
             if (kind !== expected) {
-                throw new Error(`expected a registered ${expected}, received a ${kind ?? "non-function"} reference`);
+                throw new LunoraError("INTERNAL", `expected a registered ${expected}, received a ${kind ?? "non-function"} reference`);
             }
 
             if (!allowInternal && registeredFunctionVisibility(reference) === "internal") {
-                throw new Error(
-                    `"${expected}" is an internal function — it is unreachable from the external RPC boundary in production. ` +
+                throw new LunoraError(
+                    "INTERNAL",
+                    `This ${expected} is an internal function — it is unreachable from the external RPC boundary in production. ` +
                         `Call it through ctx.run${expected.charAt(0).toUpperCase()}${expected.slice(1)} from another function instead.`,
                 );
             }

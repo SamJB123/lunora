@@ -8,14 +8,15 @@
  * This is the single-worker composition the void.cloud Nuxt approach uses,
  * inverted: instead of Lunora owning the worker entry, Lunora is mounted
  * inside* Nitro as a server route, and the `ShardDO` class is re-exported to
- * the Cloudflare worker entrypoint via the project's `exports.cloudflare.ts`.
+ * the Cloudflare worker entrypoint via the project's root `worker.ts` wrapper.
  *
  * Kept framework-neutral (a `LunoraWorkerLike` + the resolved `env`/`ctx`, not
  * an H3 event) so it can be unit-tested with a stub worker — no Nuxt or workerd
  * boot required. The thin H3 adapter that reads `env`/`ctx` off the event and
  * the raw `Request`/`Response` lives in the `[...].ts` route module.
  */
-import type { ExecutionContextLike } from "./cloudflare";
+import type { ExecutionContextLike } from "@lunora/runtime";
+import { NOOP_EXECUTION_CONTEXT } from "@lunora/runtime";
 
 /**
  * Structural view of the Lunora worker the route delegates to — just the
@@ -26,12 +27,6 @@ import type { ExecutionContextLike } from "./cloudflare";
 interface LunoraWorkerLike {
     fetch: (request: Request, env: unknown, context: ExecutionContextLike) => Promise<Response> | Response;
 }
-
-/** A no-op `ExecutionContext` used when the Cloudflare runtime didn't supply one (so `worker.fetch` always gets a valid 3rd arg). */
-const NOOP_EXECUTION_CONTEXT: ExecutionContextLike = {
-    passThroughOnException: () => {},
-    waitUntil: () => {},
-};
 
 /**
  * Forward one inbound request to the Lunora worker. `env` must be the Cloudflare
@@ -62,4 +57,6 @@ const delegateToLunora = async (
 };
 
 export type { LunoraWorkerLike };
-export { delegateToLunora, NOOP_EXECUTION_CONTEXT };
+export { delegateToLunora };
+
+export { NOOP_EXECUTION_CONTEXT } from "@lunora/runtime";

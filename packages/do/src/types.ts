@@ -1,3 +1,5 @@
+import type { WhereInput } from "./where-types";
+
 export interface SubscriptionQuery {
     args?: Record<string, unknown>;
 
@@ -40,7 +42,37 @@ export interface SubscriptionQuery {
     table?: string;
 }
 
+/**
+ * A live shape subscription registered on a socket — the partial-replication
+ * parallel to {@link SubscriptionQuery}. The client names a `defineShape` shape
+ * and supplies validated `args`; the DO resolves it to a table + RLS-composed
+ * `effectiveWhere` under the socket's verified identity (never the client's
+ * word) and pokes the membership diff. `sinceSeq`/`sinceEpoch` carry the
+ * client's last applied checkpoint for resume.
+ */
+export interface ShapeSubscriptionQuery {
+    /** Validated shape arguments (e.g. `{ channelId }`); forwarded to `resolveShape`. */
+    args?: Record<string, unknown>;
+
+    /** Registered shape name (the `defineShape` export the codegen subclass resolves). */
+    name: string;
+
+    /** Resume epoch the client persisted alongside {@link ShapeSubscriptionQuery.sinceSeq} (see {@link SubscriptionQuery.sinceEpoch}). */
+    sinceEpoch?: string;
+
+    /** Resume checkpoint: the `__cdc_log` cursor the client's view of this shape last reflected (see {@link SubscriptionQuery.sinceSeq}). */
+    sinceSeq?: number;
+}
+
 export interface SubscriptionEnvelope {
+    /**
+     * Stable per-client id carried by the `connect` envelope. Recorded on the
+     * socket attachment so a shape poke can echo this client's
+     * `__client_watermark` as its `lastMutationId`. Ignored on other envelope
+     * types; absent for clients that don't use custom mutators.
+     */
+    clientId?: string;
+
     /**
      * App-supplied connection context carried by the `connect` envelope (e.g.
      * `{ roomId, sessionId }`). Merged into the socket attachment and forwarded
@@ -55,6 +87,19 @@ export interface SubscriptionEnvelope {
     data?: unknown;
     id: string;
     query?: SubscriptionQuery;
+
+    /**
+     * Shape descriptor of a `shape_subscribe` envelope: the named shape + its
+     * validated args. Carries the client's resume checkpoint via
+     * {@link SubscriptionEnvelope.sinceCheckpoint}/{@link SubscriptionEnvelope.sinceEpoch}.
+     */
+    shape?: { args?: Record<string, unknown>; name: string };
+
+    /** Resume checkpoint on a `shape_subscribe` envelope (the `__cdc_log` cursor the client's shape view is at). */
+    sinceCheckpoint?: number;
+
+    /** CDC epoch the {@link SubscriptionEnvelope.sinceCheckpoint} belongs to. */
+    sinceEpoch?: string;
 
     /**
      * Topic of a `whisper`/`whisper_subscribe`/`whisper_unsubscribe` envelope —
@@ -75,7 +120,17 @@ export interface SubscriptionEnvelope {
      * this shard with NO SQLite/CDC write (AnyCable-style whispering — typing
      * indicators, live cursors). The sender never receives its own whisper.
      */
-    type: "ack" | "connect" | "stream" | "subscribe" | "unsubscribe" | "whisper" | "whisper_subscribe" | "whisper_unsubscribe";
+    type:
+        | "ack"
+        | "connect"
+        | "shape_subscribe"
+        | "shape_unsubscribe"
+        | "stream"
+        | "subscribe"
+        | "unsubscribe"
+        | "whisper"
+        | "whisper_subscribe"
+        | "whisper_unsubscribe";
 }
 
 /**
@@ -156,6 +211,16 @@ export interface SocketAttachment {
     admin?: boolean;
 
     /**
+     * Stable per-client id from the `connect` envelope (the same id the client
+     * stamps on its custom-mutator pushes). Lets a shape poke echo this client's
+     * `__client_watermark` as the poke's `lastMutationId`, so a `@lunora/db`
+     * collection can drop the optimistic overlay for writes this poke has
+     * synced. Absent for clients that don't use custom mutators. Persisted so it
+     * survives hibernation.
+     */
+    clientId?: string;
+
+    /**
      * `true` once the socket's `connect` envelope has fired the `onConnect`
      * hooks. Gates the dispatch so a client that re-sends `connect` (or a
      * duplicate frame) can't re-fire the hooks for an already-announced socket —
@@ -193,6 +258,15 @@ export interface SocketAttachment {
      * hooks so they run under the connecting user.
      */
     identity?: Record<string, unknown>;
+
+    /**
+     * Live shape subscriptions registered on this socket, keyed by the
+     * client-supplied subscription id. The partial-replication parallel to
+     * {@link SocketAttachment.subs}: the poke protocol fans membership diffs to
+     * these, while `subs` drives the legacy `data`/`delta` re-execution path.
+     * Absent until the socket sends its first `shape_subscribe`.
+     */
+    shapes?: Record<string, ShapeSubscriptionQuery>;
     subs: Record<string, SubscriptionQuery>;
 
     /**
@@ -208,4 +282,36 @@ export interface SocketAttachment {
      * survives hibernation; absent until the socket joins a topic.
      */
     whispers?: string[];
+}
+
+/**
+ * A `shape_subscribe`'s resolved query: which `table` to replicate, the
+ * identity-scoped `effectiveWhere` (the shape predicate AND-merged with the
+ * table's RLS read base-where), the optional projected `columns` allow-list,
+ * and whether the table is `.global()` (served by the latency-tiered poll path
+ * rather than the CDC poke path). The codegen subclass's `resolveShape` builds
+ * it under the socket's verified identity, so the membership query the poke
+ * protocol runs is RLS-correct by construction.
+ */
+export interface ResolvedShape {
+    columns?: ReadonlyArray<string>;
+    effectiveWhere?: WhereInput;
+    /** `true` when the shape's table is `.global()` (lives in D1, not this DO's SQLite) — no per-DO op-log to diff, so served by the poll path. */
+    global?: boolean;
+    table: string;
+}
+
+/**
+ * Identity a subscription/shape query is executed under, threaded EXPLICITLY
+ * into the codegen `resolveShape`/`buildCtx` rather than read from the shared,
+ * per-request identity fields. The value passed is the socket's OWN verified
+ * identity (stamped on the {@link SocketAttachment} at the WS upgrade from the
+ * runtime-minted `x-lunora-userid`/`x-lunora-identity` headers the client can't
+ * forge), passed BY VALUE so a deferred refresh or interleaved RPC can't clobber
+ * it. An anonymous socket leaves both fields `undefined`, so an RLS/`ctx.auth`
+ * query fails closed (empty/denied) rather than leaking another user's data.
+ */
+export interface SubscriptionIdentity {
+    identity?: Record<string, unknown>;
+    userId?: string;
 }

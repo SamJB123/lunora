@@ -23,7 +23,10 @@ const hmacSha256Base64 = async (keyBytes: BufferSource, payload: string): Promis
     return bytesToBase64(signature);
 };
 
-/** Constant-time string comparison to avoid leaking byte positions via timing. */
+/**
+ * Constant-time string comparison to avoid leaking byte positions via timing.
+ * @experimental
+ */
 export const constantTimeEqual = (a: string, b: string): boolean => {
     if (a.length !== b.length) {
         return false;
@@ -39,84 +42,15 @@ export const constantTimeEqual = (a: string, b: string): boolean => {
     return mismatch === 0;
 };
 
+/**
+ * `hmacSha256Hex` is part of the experimental `@lunora/payment` API and may change without a major version bump.
+ * @experimental
+ */
 export const hmacSha256Hex = async (secret: string, payload: string): Promise<string> => {
     const key = await crypto.subtle.importKey("raw", encoder.encode(secret), { hash: "SHA-256", name: "HMAC" }, false, ["sign"]);
     const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(payload));
 
     return toHex(signature);
-};
-
-export interface StripeSignatureParts {
-    readonly signatures: string[];
-    readonly timestamp: number;
-}
-
-/** Parse a Stripe-style `t=...,v1=...,v1=...` signature header. */
-export const parseStripeSignatureHeader = (header: string): StripeSignatureParts => {
-    let timestamp = Number.NaN;
-    const signatures: string[] = [];
-
-    for (const part of header.split(",")) {
-        const index = part.indexOf("=");
-
-        if (index === -1) {
-            continue;
-        }
-
-        const scheme = part.slice(0, index).trim();
-        const value = part.slice(index + 1).trim();
-
-        if (scheme === "t") {
-            timestamp = Number(value);
-        } else if (scheme === "v1") {
-            signatures.push(value);
-        }
-    }
-
-    return { signatures, timestamp };
-};
-
-export interface VerifyStripeSignatureInput {
-    /** Injectable clock (ms since epoch) for tests. */
-    readonly now?: number;
-    /** Raw request body, exactly as received. */
-    readonly payload: string;
-    readonly secret: string;
-    /** The `Stripe-Signature` header value. */
-    readonly signatureHeader: string;
-    /** Whole-second tolerance for the signed timestamp (default 300). */
-    readonly toleranceSeconds?: number;
-}
-
-/**
- * Verify a Stripe-scheme webhook signature: `HMAC_SHA256(secret, "{t}.{payload}")` compared
- * against the header's `v1` values, with a timestamp tolerance to reject replays. Throws a
- * {@link LunoraPaymentError} on any failure.
- */
-export const verifyStripeSignature = async (input: VerifyStripeSignatureInput): Promise<void> => {
-    // Fail closed on an empty/missing secret: WebCrypto would happily MAC with a zero-length (or
-    // "undefined"-stringified) key the attacker also knows, making the signature forgeable.
-    if (!input.secret) {
-        throw new LunoraPaymentError("CONFIG_INVALID", "webhook secret not configured");
-    }
-
-    const toleranceSeconds = input.toleranceSeconds ?? 300;
-    const nowMs = input.now ?? Date.now();
-    const { signatures, timestamp } = parseStripeSignatureHeader(input.signatureHeader);
-
-    if (!Number.isFinite(timestamp) || signatures.length === 0) {
-        throw new LunoraPaymentError("WEBHOOK_SIGNATURE_INVALID", "malformed signature header");
-    }
-
-    if (Math.abs(Math.floor(nowMs / 1000) - timestamp) > toleranceSeconds) {
-        throw new LunoraPaymentError("WEBHOOK_TIMESTAMP_INVALID", "signature timestamp outside tolerance");
-    }
-
-    const expected = await hmacSha256Hex(input.secret, `${String(timestamp)}.${input.payload}`);
-
-    if (!signatures.some((candidate) => constantTimeEqual(candidate, expected))) {
-        throw new LunoraPaymentError("WEBHOOK_SIGNATURE_INVALID", "no matching signature");
-    }
 };
 
 export interface VerifyStandardWebhookInput {
@@ -140,6 +74,7 @@ export interface VerifyStandardWebhookInput {
  * Verify a Standard Webhooks signature (the scheme Polar and svix use):
  * `base64(HMAC_SHA256(key, "{id}.{timestamp}.{payload}"))` compared against the header's `v1`
  * entries, with a replay-window check. Throws a {@link LunoraPaymentError} on any failure.
+ * @experimental
  */
 export const verifyStandardWebhook = async (input: VerifyStandardWebhookInput): Promise<void> => {
     // Fail closed on an empty/missing secret: a zero-length HMAC key is attacker-known and forgeable.
@@ -182,6 +117,38 @@ export const verifyStandardWebhook = async (input: VerifyStandardWebhookInput): 
         .filter(Boolean);
 
     if (!provided.some((candidate) => constantTimeEqual(candidate, expected))) {
+        throw new LunoraPaymentError("WEBHOOK_SIGNATURE_INVALID", "no matching signature");
+    }
+};
+
+export interface VerifyCreemSignatureInput {
+    /** Raw request body, exactly as received. */
+    readonly payload: string;
+    /** Creem webhook signing secret. */
+    readonly secret: string;
+    /** The `creem-signature` header value. */
+    readonly signature: string;
+}
+
+/**
+ * Verify a Creem webhook signature: `hex(HMAC_SHA256(secret, rawBody))` compared against the
+ * `creem-signature` header. Creem's scheme signs the raw body with no timestamp, so there is no
+ * replay-window check. Throws a {@link LunoraPaymentError} on any failure.
+ * @experimental
+ */
+export const verifyCreemSignature = async (input: VerifyCreemSignatureInput): Promise<void> => {
+    // Fail closed on an empty/missing secret: a zero-length HMAC key is attacker-known and forgeable.
+    if (!input.secret) {
+        throw new LunoraPaymentError("CONFIG_INVALID", "webhook secret not configured");
+    }
+
+    if (!input.signature) {
+        throw new LunoraPaymentError("WEBHOOK_SIGNATURE_INVALID", "missing creem-signature header");
+    }
+
+    const expected = await hmacSha256Hex(input.secret, input.payload);
+
+    if (!constantTimeEqual(input.signature, expected)) {
         throw new LunoraPaymentError("WEBHOOK_SIGNATURE_INVALID", "no matching signature");
     }
 };

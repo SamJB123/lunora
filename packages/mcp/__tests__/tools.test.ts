@@ -1,7 +1,7 @@
 import type { FunctionDescriptor, LunoraClient } from "@lunora/client";
 import { describe, expect, it, vi } from "vitest";
 
-import { callTool, TOOL_DEFINITIONS } from "../src/tools";
+import { callTool, READ_ONLY_TOOL_DEFINITIONS, toolDefinitions, WRITE_TOOL_DEFINITIONS } from "../src/tools";
 
 const MOCK_FUNCTIONS: FunctionDescriptor[] = [
     {
@@ -19,6 +19,11 @@ const MOCK_FUNCTIONS: FunctionDescriptor[] = [
         ],
         kind: "mutation",
         path: "messages:send",
+    },
+    {
+        args: [],
+        kind: "action",
+        path: "sync:stripe",
     },
 ];
 
@@ -48,11 +53,20 @@ const mockClient = (): {
     return { action, asClient: client, listFunctions, listGlobalTables, mutation, query };
 };
 
-describe("tOOL_DEFINITIONS", () => {
-    it("exposes the six expected tools, each with an object input schema", () => {
+describe("toolDefinitions", () => {
+    it("exposes only the four read-only tools by default (writes disabled)", () => {
         expect.assertions(2);
 
-        const names = TOOL_DEFINITIONS.map((tool) => tool.name);
+        const names = toolDefinitions(false).map((tool) => tool.name);
+
+        expect(names).toStrictEqual(["lunora_list_functions", "lunora_list_tables", "lunora_get_function_schema", "lunora_run_query"]);
+        expect(toolDefinitions(false).every((tool) => tool.inputSchema.type === "object")).toBe(true);
+    });
+
+    it("adds the mutation/action tools when writes are enabled", () => {
+        expect.assertions(2);
+
+        const names = toolDefinitions(true).map((tool) => tool.name);
 
         expect(names).toStrictEqual([
             "lunora_list_functions",
@@ -62,7 +76,7 @@ describe("tOOL_DEFINITIONS", () => {
             "lunora_run_mutation",
             "lunora_run_action",
         ]);
-        expect(TOOL_DEFINITIONS.every((tool) => tool.inputSchema.type === "object")).toBe(true);
+        expect(names).toHaveLength(READ_ONLY_TOOL_DEFINITIONS.length + WRITE_TOOL_DEFINITIONS.length);
     });
 });
 
@@ -145,7 +159,7 @@ describe("callTool", () => {
 
         const mock = mockClient();
 
-        await callTool(mock.asClient, "lunora_run_mutation", { functionPath: "messages:send" });
+        await callTool(mock.asClient, "lunora_run_mutation", { functionPath: "messages:send" }, true);
 
         expect(mock.mutation).toHaveBeenCalledWith({ __lunoraRef: "messages:send" }, {}, { shardKey: undefined });
     });
@@ -160,14 +174,36 @@ describe("callTool", () => {
         expect(mock.query).toHaveBeenCalledWith({ __lunoraRef: "messages:list" }, {}, { shardKey: undefined });
     });
 
-    it("coerces a non-object args payload (e.g. an array) to an empty bag", async () => {
+    it("rejects a non-object args payload (e.g. an array) with an error result instead of coercing to {}", async () => {
+        expect.assertions(3);
+
+        const mock = mockClient();
+        const result = await callTool(mock.asClient, "lunora_run_query", { args: [1, 2, 3], functionPath: "messages:list" });
+
+        expect(result.isError).toBe(true);
+        expect(result.content[0]!.text).toContain("args");
+        expect(mock.query).not.toHaveBeenCalled();
+    });
+
+    it("parses a JSON-stringified args object (as LLMs commonly emit) and forwards it", async () => {
         expect.assertions(1);
 
         const mock = mockClient();
 
-        await callTool(mock.asClient, "lunora_run_query", { args: [1, 2, 3], functionPath: "messages:list" });
+        await callTool(mock.asClient, "lunora_run_query", { args: '{"limit":5}', functionPath: "messages:list" });
 
-        expect(mock.query).toHaveBeenCalledWith({ __lunoraRef: "messages:list" }, {}, { shardKey: undefined });
+        expect(mock.query).toHaveBeenCalledWith({ __lunoraRef: "messages:list" }, { limit: 5 }, { shardKey: undefined });
+    });
+
+    it("rejects an args string that is not valid JSON with an error result", async () => {
+        expect.assertions(3);
+
+        const mock = mockClient();
+        const result = await callTool(mock.asClient, "lunora_run_query", { args: "not json", functionPath: "messages:list" });
+
+        expect(result.isError).toBe(true);
+        expect(result.content[0]!.text).toContain("args");
+        expect(mock.query).not.toHaveBeenCalled();
     });
 
     it("returns an error result when functionPath is missing", async () => {
@@ -197,7 +233,7 @@ describe("callTool", () => {
         // A mutation/action that returns nothing resolves to `undefined`.
         mock.mutation.mockResolvedValueOnce(undefined);
 
-        const result = await callTool(mock.asClient, "lunora_run_mutation", { functionPath: "messages:send" });
+        const result = await callTool(mock.asClient, "lunora_run_mutation", { functionPath: "messages:send" }, true);
 
         expect(result.isError).toBeUndefined();
         // `text` must always be a string per the MCP TextContent contract;
@@ -213,9 +249,118 @@ describe("callTool", () => {
 
         mock.action.mockRejectedValueOnce(new Error("boom"));
 
-        const result = await callTool(mock.asClient, "lunora_run_action", { functionPath: "x:y" });
+        const result = await callTool(mock.asClient, "lunora_run_action", { functionPath: "sync:stripe" }, true);
 
         expect(result.isError).toBe(true);
         expect(result.content[0]!.text).toContain("boom");
+    });
+
+    it("refuses a write tool when writes are disabled (read-only default), without touching the client", async () => {
+        expect.assertions(3);
+
+        const mock = mockClient();
+        const result = await callTool(mock.asClient, "lunora_run_mutation", { functionPath: "messages:send" });
+
+        expect(result.isError).toBe(true);
+        expect(result.content[0]!.text).toContain("read-only");
+        expect(mock.mutation).not.toHaveBeenCalled();
+    });
+
+    it("rejects a run whose functionPath is not a discovered public function", async () => {
+        expect.assertions(2);
+
+        const mock = mockClient();
+        const result = await callTool(mock.asClient, "lunora_run_query", { functionPath: "internal:secret" });
+
+        expect(result.isError).toBe(true);
+        expect(mock.query).not.toHaveBeenCalled();
+    });
+
+    it("rejects running a mutation through the query tool (kind mismatch)", async () => {
+        expect.assertions(2);
+
+        const mock = mockClient();
+        const result = await callTool(mock.asClient, "lunora_run_query", { functionPath: "messages:send" });
+
+        expect(result.isError).toBe(true);
+        expect(mock.query).not.toHaveBeenCalled();
+    });
+
+    it("serializes a bigint result (v.int64) as a decimal string instead of throwing", async () => {
+        expect.assertions(3);
+
+        const mock = mockClient();
+
+        // `decodeWire` revives a `v.int64()` leaf as a real bigint; raw
+        // `JSON.stringify` would throw and mis-report the success as a tool error.
+        mock.query.mockResolvedValueOnce({ count: 7, id: 9_007_199_254_740_993n });
+
+        const result = await callTool(mock.asClient, "lunora_run_query", { functionPath: "messages:list" });
+
+        expect(result.isError).toBeUndefined();
+        expect(JSON.parse(result.content[0]!.text)).toStrictEqual({ count: 7, id: "9007199254740993" });
+        expect(result.content[0]!.text).not.toContain("BigInt");
+    });
+
+    it("serializes ArrayBuffer / typed-array (v.bytes) results as base64 instead of {} or an index-keyed object", async () => {
+        expect.assertions(3);
+
+        const mock = mockClient();
+
+        mock.query.mockResolvedValueOnce({ blob: new Uint8Array([1, 2, 3]).buffer, view: new Uint8Array([1, 2, 3]) });
+
+        const result = await callTool(mock.asClient, "lunora_run_query", { functionPath: "messages:list" });
+
+        expect(result.isError).toBeUndefined();
+        // btoa of bytes [1,2,3] is "AQID"; a raw stringify would yield {} for the
+        // ArrayBuffer and {"0":1,"1":2,"2":3} for the Uint8Array.
+        expect(JSON.parse(result.content[0]!.text)).toStrictEqual({ blob: "AQID", view: "AQID" });
+        expect(result.content[0]!.text).not.toContain('"0"');
+    });
+
+    it("caches listFunctions across run-tool calls on the same client (one fetch, not one per call)", async () => {
+        expect.assertions(3);
+
+        const mock = mockClient();
+
+        await callTool(mock.asClient, "lunora_run_query", { functionPath: "messages:list" });
+        await callTool(mock.asClient, "lunora_run_query", { functionPath: "messages:list" });
+        await callTool(mock.asClient, "lunora_get_function_schema", { functionPath: "messages:list" });
+
+        // Three tool calls that each need the registry share a single fetch.
+        expect(mock.listFunctions).toHaveBeenCalledTimes(1);
+        expect(mock.query).toHaveBeenCalledTimes(2);
+        expect(mock.query).toHaveBeenLastCalledWith({ __lunoraRef: "messages:list" }, {}, { shardKey: undefined });
+    });
+
+    it("shares one in-flight listFunctions fetch across concurrent run-tool calls", async () => {
+        expect.assertions(1);
+
+        const mock = mockClient();
+
+        await Promise.all([
+            callTool(mock.asClient, "lunora_run_query", { functionPath: "messages:list" }),
+            callTool(mock.asClient, "lunora_run_query", { functionPath: "messages:list" }),
+        ]);
+
+        expect(mock.listFunctions).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not cache a failed listFunctions fetch (a later call retries)", async () => {
+        expect.assertions(3);
+
+        const mock = mockClient();
+
+        mock.listFunctions.mockRejectedValueOnce(new Error("registry offline"));
+
+        const failed = await callTool(mock.asClient, "lunora_run_query", { functionPath: "messages:list" });
+
+        expect(failed.isError).toBe(true);
+
+        // The rejected fetch is evicted, so the next call refetches and succeeds.
+        const ok = await callTool(mock.asClient, "lunora_run_query", { functionPath: "messages:list" });
+
+        expect(ok.isError).toBeUndefined();
+        expect(mock.listFunctions).toHaveBeenCalledTimes(2);
     });
 });

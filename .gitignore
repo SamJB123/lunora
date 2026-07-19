@@ -96,6 +96,12 @@ dist/
 # Wrangler local state
 .wrangler/
 
+# Per-checkout Lunora dev state written by `lunora dev` / the Vite plugin in
+# workspace apps (dev.json lockfile, dev.log, binding-inference cache) —
+# machine-specific and secret-free; same convention as the init templates.
+.lunora/
+.lunora-cache
+
 # Local dev secrets (Cloudflare Workers) — never commit; keep the example.
 .dev.vars
 .dev.vars.*
@@ -108,6 +114,7 @@ playwright-report/
 # Claude
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
+.claude/projects
 
 .playwright-mcp
 
@@ -122,4 +129,4 @@ tests/e2e/debug-*.mjs
 tests/e2e/diag*.mjs
 tests/e2e/experiment.mjs
 tests/e2e/validate-studio.mjs
-.claude/projects/-Users-daniel-bannert-Projects-lunora/memory/
+.omo

@@ -43,6 +43,74 @@ describe("discoverSchema", () => {
         expect(schema.tables.find((table) => table.name === "messages")?.externallyManaged).toBe(false);
     });
 
+    it("captures `.source()` into the table IR (presence of functions only) and implies externallyManaged", () => {
+        expect.assertions(3);
+
+        // The fixture deliberately writes `mode: "incremental"` + `reconcileEveryMs`
+        // even though neither is on the typed `.source()` surface: discovery is
+        // AST-level and must capture what the source text says verbatim.
+
+        const { project, schemaPath } = projectWith(`
+            import { defineSchema, defineTable, v } from "@lunora/server";
+
+            export const schema = defineSchema({
+                documents: defineTable({ orgId: v.string(), title: v.string() })
+                    .shardBy("orgId")
+                    .source({
+                        binding: "HD",
+                        query: "select uuid, title, org_id from documents where org_id = $1",
+                        idColumn: "uuid",
+                        mode: "incremental",
+                        columns: ["title"],
+                        reconcileEveryMs: 60000,
+                        tenantBy: (key) => [key],
+                        map: (row) => ({ title: row.title }),
+                    }),
+                plain: defineTable({ title: v.string() }),
+            });
+        `);
+
+        const schema = discoverSchema(project, schemaPath);
+        const documents = schema.tables.find((table) => table.name === "documents");
+
+        expect(documents?.externalSource).toStrictEqual({
+            binding: "HD",
+            columns: ["title"],
+            hasReconcile: true,
+            hasSoftDelete: false,
+            hasTenantBy: true,
+            idColumn: "uuid",
+            mode: "incremental",
+            query: "select uuid, title, org_id from documents where org_id = $1",
+        });
+        // `.source()` implies `.externallyManaged()` (rows come from the ingest loop).
+        expect(documents?.externallyManaged).toBe(true);
+        expect(schema.tables.find((table) => table.name === "plain")?.externalSource).toBeUndefined();
+    });
+
+    it("records an `unanalyzable` sentinel when `.source()` is passed a non-literal config", () => {
+        expect.assertions(2);
+
+        const { project, schemaPath } = projectWith(`
+            import { defineSchema, defineTable, v } from "@lunora/server";
+
+            const buildConfig = () => ({ binding: "HD", query: "select 1", tenantBy: (key) => [key] });
+
+            export const schema = defineSchema({
+                documents: defineTable({ orgId: v.string(), title: v.string() })
+                    .shardBy("orgId")
+                    .source(buildConfig()),
+            });
+        `);
+
+        const documents = discoverSchema(project, schemaPath).tables.find((table) => table.name === "documents");
+
+        // The source exists but can't be read statically — a sentinel, NOT `undefined`,
+        // so `hasSourcedTables` and the `external_source_*` lints still see a source.
+        expect(documents?.externalSource).toStrictEqual({ binding: "", hasTenantBy: false, unanalyzable: true });
+        expect(documents?.externallyManaged).toBe(true);
+    });
+
     it("captures `.softDelete()`, injecting the marker column so Doc carries it", () => {
         expect.assertions(4);
 
@@ -1223,5 +1291,65 @@ describe("discoverSchema", () => {
         `);
 
         expect(() => discoverSchema(project, schemaPath)).toThrow(/unknown jurisdiction/);
+    });
+
+    it("captures `.public()` into the table IR; defaults to false", () => {
+        expect.assertions(2);
+
+        const { project, schemaPath } = projectWith(`
+            import { defineSchema, defineTable, v } from "@lunora/server";
+
+            export const schema = defineSchema({
+                emojis: defineTable({ glyph: v.string() }).public(),
+                messages: defineTable({ text: v.string() }),
+            });
+        `);
+
+        const schema = discoverSchema(project, schemaPath);
+
+        expect(schema.tables.find((table) => table.name === "emojis")?.isPublic).toBe(true);
+        expect(schema.tables.find((table) => table.name === "messages")?.isPublic).toBe(false);
+    });
+
+    it("defaults rlsMode to undefined when `.rls(...)` is not declared", () => {
+        expect.assertions(1);
+
+        const { project, schemaPath } = projectWith(`
+            import { defineSchema, defineTable, v } from "@lunora/server";
+
+            export const schema = defineSchema({
+                messages: defineTable({ text: v.string() }),
+            });
+        `);
+
+        expect(discoverSchema(project, schemaPath).rlsMode).toBeUndefined();
+    });
+
+    it('captures `.rls("required")` into the schema IR, regardless of position in the builder chain', () => {
+        expect.assertions(1);
+
+        const { project, schemaPath } = projectWith(`
+            import { defineSchema, defineTable, v } from "@lunora/server";
+
+            export const schema = defineSchema({
+                messages: defineTable({ text: v.string() }),
+            }).jurisdiction("eu").rls("required");
+        `);
+
+        expect(discoverSchema(project, schemaPath).rlsMode).toBe("required");
+    });
+
+    it("throws a diagnostic on an unknown `.rls(...)` mode literal", () => {
+        expect.assertions(1);
+
+        const { project, schemaPath } = projectWith(`
+            import { defineSchema, defineTable, v } from "@lunora/server";
+
+            export const schema = defineSchema({
+                messages: defineTable({ text: v.string() }),
+            }).rls("optional");
+        `);
+
+        expect(() => discoverSchema(project, schemaPath)).toThrow(/unknown rls mode/);
     });
 });

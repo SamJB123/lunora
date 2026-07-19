@@ -18,14 +18,16 @@
  * chain. A destructive request (rewriting an existing `when`) answers `409` and
  * writes nothing — it routes to the manual-edit/migration path.
  */
-import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, relative } from "node:path";
 
 import { CodegenDiagnosticError, runCodegen } from "@lunora/codegen";
+import { LunoraError } from "@lunora/errors";
 
 import join from "../path";
 import type { DestructivePolicyEdit, PolicyEdit, PolicyScaffoldFailureReason, ScaffoldPolicyEdit, WireRlsEdit } from "../schema-edit/policy-scaffold";
 import { classifyPolicyEdit, scaffoldPolicyFile, wireRlsIntoProcedure } from "../schema-edit/policy-scaffold";
+import writeFileAtomic from "./write-atomic";
 
 /**
  * Endpoint path both dev hosts mount the handler at. A sibling of the schema
@@ -74,14 +76,6 @@ const statusForFailure = (reason: PolicyScaffoldFailureReason): number => {
     // invalid-identifier / unsupported-procedure-shape / destructive: the
     // request shape is the problem, not server state.
     return reason === "destructive" ? 409 : 422;
-};
-
-/** Write source atomically (temp file + rename) so a crash can't leave a half-written file. */
-const writeAtomic = (path: string, text: string): void => {
-    const temporaryPath = `${path}.lunora-tmp`;
-
-    writeFileSync(temporaryPath, text, "utf8");
-    renameSync(temporaryPath, path);
 };
 
 /**
@@ -137,7 +131,7 @@ const handleScaffoldPolicy = (request: PolicyScaffoldRequest, edit: ScaffoldPoli
         return { body: { error: "file-exists", fileName: result.fileName, ok: false }, status: 409 };
     }
 
-    writeAtomic(targetPath, result.source);
+    writeFileAtomic(targetPath, result.source);
 
     return runCodegenForResponse(request, { fileName: result.fileName });
 };
@@ -176,7 +170,7 @@ const handleWireRls = (request: PolicyScaffoldRequest, edit: WirePolicyEdit): Po
         return { body: { error: wired.reason, ok: false }, status: statusForFailure(wired.reason) };
     }
 
-    writeAtomic(procedurePath, wired.text);
+    writeFileAtomic(procedurePath, wired.text);
 
     return runCodegenForResponse(request, { exportName: edit.exportName });
 };
@@ -193,7 +187,7 @@ const handlePolicyScaffoldRequest = (request: PolicyScaffoldRequest): PolicyScaf
 
     const { body } = request;
 
-    if (body === undefined || typeof body !== "object" || typeof (body as { kind?: unknown }).kind !== "string") {
+    if (body === undefined || body === null || typeof body !== "object" || typeof (body as { kind?: unknown }).kind !== "string") {
         return { body: { error: "invalid-edit", ok: false }, status: 400 };
     }
 
@@ -216,7 +210,7 @@ const handlePolicyScaffoldRequest = (request: PolicyScaffoldRequest): PolicyScaf
     // destructive branch above, leaving only the two additive kinds handled
     // here. Throw rather than guess so a future additive kind that forgets its
     // branch fails loudly instead of silently masquerading as destructive.
-    throw new Error(`unhandled additive policy edit kind: ${String((edit as { kind?: unknown }).kind)}`);
+    throw new LunoraError("INTERNAL", `unhandled additive policy edit kind: ${String((edit as { kind?: unknown }).kind)}`);
 };
 
 export type { PolicyScaffoldBody, PolicyScaffoldRequest, PolicyScaffoldResponse, WirePolicyEdit };

@@ -4,13 +4,16 @@ export type {
     AdminTableResolver,
     AuthAdmin,
     AuthCapabilities,
+    AuthConfigInfo,
     AuthImpersonation,
-    AuthIntrospector,
     AuthPage,
     AuthSession,
     AuthUser,
+    AuthUserFieldSpec,
     BackupManifest,
     BackupStore,
+    ComposeIdentityResolversErrorMode,
+    ComposeIdentityResolversOptions,
     CronHandler,
     CronJobDispatch,
     CronJobInfo,
@@ -29,7 +32,12 @@ export type {
     HttpActionContext,
     HttpActionLike,
     HttpRouterLike,
+    IdentityContractLike,
+    IdentityResolver,
+    IdentityValidation,
+    KvIntrospector,
     ListAuthUsersOptions,
+    LunoraHandlerOptions,
     LunoraWorker,
     Route,
     RpcContext,
@@ -43,7 +51,18 @@ export type {
     VectorQueryMatch,
     WorkerOptions,
 } from "./create-worker";
-export { composeWorker, createWorker, defineRpcEnvelope, withFrameworkWorker } from "./create-worker";
+export type { KvKeyEntry, KvKeyListResult, KvNamespaceSummary, KvValueResult } from "./create-worker";
+export {
+    composeIdentityResolvers,
+    composeWorker,
+    createLunoraHandler,
+    createWorker,
+    defineRpcEnvelope,
+    NOOP_EXECUTION_CONTEXT,
+    resolveLunoraOptions,
+    routeIdentityResolvers,
+    withFrameworkWorker,
+} from "./create-worker";
 export type { CrossShardCounter, CrossShardReader, CrossShardRelationCapabilities, CrossShardRelationOptions } from "./cross-shard-relations";
 export { createCrossShardRelationCapabilities } from "./cross-shard-relations";
 export type { DynamicShardRegistry, DynamicShardRegistryOptions } from "./dynamic-shard-registry";
@@ -56,10 +75,11 @@ export type {
     AnalyticsEngineDataPointLike,
     AnalyticsEngineDatasetLike,
     AnalyticsEngineSinkOptions,
+    OtlpSinkOptions,
     SentrySinkOptions,
     WebhookSinkOptions,
 } from "./observability-sinks";
-export { analyticsEngineSink, combineSinks, consoleSink, sentrySink, webhookSink } from "./observability-sinks";
+export { analyticsEngineSink, combineSinks, consoleSink, otlpSink, sentrySink, webhookSink } from "./observability-sinks";
 export type {
     ExportFanOutRequest,
     ExportFanOutResult,

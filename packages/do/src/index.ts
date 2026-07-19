@@ -92,6 +92,16 @@ export type { DependencyTracker } from "./dependency-tracker";
 export { createDependencyTracker, depKey, SCAN_DEP } from "./dependency-tracker";
 export type { RenderedSql, SqlEngine } from "./drizzle";
 export { renderSql } from "./drizzle";
+// `external-source-cursor` is an internal ingest detail (the durable watermark
+// codec + reserved-table helpers), consumed only by `external-source-pull` and its
+// own tests — not re-exported, mirroring `external-source-diff`'s module-private
+// `projectExternalSourceRow`.
+export type { ExternalSourceDiffResult } from "./external-source-diff";
+export { diffExternalSource } from "./external-source-diff";
+export type { IncrementalMaterializeResult, MaterializeResult } from "./external-source-materialize";
+export { materializeExternalRows, materializeExternalRowsIncremental, readExternalSourceBaseline, runExternalSourceTick } from "./external-source-materialize";
+export type { ExternalSourceLike, SourceClientLike, SourceCursorLike, SourceRefresh } from "./external-source-pull";
+export { isSoftDeleted, isSourceDue, liftSourceId, pullExternalSourceIncrementalTick, pullExternalSourceTick } from "./external-source-pull";
 export type { FunctionMetricBucket, FunctionMetricIndexHit, RecordFunctionMetricInput } from "./function-metrics";
 export {
     ensureFunctionMetricsTables,
@@ -115,6 +125,8 @@ export type {
     FacetColumnOptions,
     FacetColumnResult,
     FacetValue,
+    FlagEvaluation,
+    FlagsResult,
     FunctionCallStat,
     FunctionStatsResult,
     MaskColumnMetadata,
@@ -141,7 +153,16 @@ export type {
     WorkflowMetadata,
     WorkflowsResult,
 } from "./introspect";
-export { ADMIN_FUNCTION_PREFIX, ADMIN_FUNCTIONS, facetColumn, listTables, readTablePage, RELATION_FUNCTION_PREFIX, selectMatchingIds } from "./introspect";
+export {
+    ADMIN_FUNCTION_PREFIX,
+    ADMIN_FUNCTIONS,
+    facetColumn,
+    FLAGS_FUNCTION_PREFIX,
+    listTables,
+    readTablePage,
+    RELATION_FUNCTION_PREFIX,
+    selectMatchingIds,
+} from "./introspect";
 export type { LogEntry, LogLevel } from "./log-buffer";
 export { LogBuffer } from "./log-buffer";
 export type { CapturedMailRow, RecordMailInput } from "./mail-catcher";
@@ -165,18 +186,19 @@ export type {
 } from "./rank";
 export { encodePartitionKey, matchesRankStaticWhere, RANK_TIEBREAK, rankTableName, resolveRankPartition, sortColumnName } from "./rank";
 export type { CacheEntry, ReactiveCacheOptions } from "./reactive-cache";
-export { ReactiveCache, reactiveCacheKey, stableStringify } from "./reactive-cache";
+export { ReactiveCache, reactiveCacheKey, stableStringify, stableWireKey } from "./reactive-cache";
 export { serveRelationFanout } from "./relation-fanout";
 export type { ResolveRelationPredicatesOptions } from "./relation-predicates";
 export {
     assertFlatPredicate,
+    assertShapeShardable,
     containsRelationPredicate,
     DEFAULT_MAX_RELATION_KEYS,
     isRelationPredicate,
     resolveRelationPredicates,
 } from "./relation-predicates";
 export type { ApplyOnDeleteOptions, NestedWith, OnDeleteActionLike, RelationDefinitionLike, ResolveWithOptions, WithInput } from "./relations";
-export { applyOnDelete, resolveWith, runRowValidators } from "./relations";
+export { applyOnDelete, fanOutScalarCounts, resolveWith, runRowValidators } from "./relations";
 export type { LogEventInput } from "./request-log";
 export { guardWriter, RLS_UNWRAP_SYMBOL, RlsRequiredError } from "./rls-guard";
 export { buildFtsMatch, ftsTableName, scoreDocument, stringifySearchText, tokenizeSearch } from "./search-text";
@@ -221,6 +243,7 @@ export type { TransactionSqlLike } from "./transaction";
 export { ConflictError } from "./transaction";
 export type {
     RunTriggersOptions,
+    SchedulableWorkflowReferenceLike,
     SchedulerLike,
     TriggerContextLike,
     TriggerDefinitionLike,
@@ -229,7 +252,7 @@ export type {
     TriggerTimingLike,
 } from "./triggers";
 export { hasTrigger, runTriggers } from "./triggers";
-export type { MutationDelta, RpcRequest, SocketAttachment, SubscriptionEnvelope, SubscriptionQuery } from "./types";
+export type { MutationDelta, RpcRequest, ShapeSubscriptionQuery, SocketAttachment, SubscriptionEnvelope, SubscriptionQuery } from "./types";
 export type { WhereSqlStrategy } from "./where-sql";
 export { compileWhereSql } from "./where-sql";
 export type { FieldOperators, WhereInput } from "./where-types";

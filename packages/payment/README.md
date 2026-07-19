@@ -10,6 +10,8 @@
 
 <!-- END_PACKAGE_OG_IMAGE_PLACEHOLDER -->
 
+> **Experimental** — this package is outside the Lunora 1.0 stability promise: its API may change in any release, without a major version bump.
+
 <br />
 
 <div align="center">
@@ -46,14 +48,15 @@ Part of the [Lunora](https://github.com/anolilab/lunora) framework — a type-sa
 pnpm add @lunora/payment stripe
 ```
 
-`stripe` is an optional peer dependency — install only the provider SDK you use; the adapter takes the client by injection.
+`stripe` is an optional peer dependency — install only the provider SDK you use; the adapter takes the client by injection. The same holds for the other providers: `createPolarAdapter` (Polar), `createAutumnAdapter` ([Autumn](https://useautumn.com)), `createDodoPaymentsAdapter` ([Dodo Payments](https://dodopayments.com)), and `createCreemAdapter` ([Creem](https://creem.io)) take a structural client too, so no provider SDK is a hard dependency of this package. Additional providers plug in via `PaymentAdapter`.
 
 ## Usage
 
 Build a facade from an adapter and a store, then start a hosted checkout:
 
 ```ts
-import { createPayment, createStripeAdapter, MemoryPaymentStore } from "@lunora/payment";
+import { createPayment, MemoryPaymentStore } from "@lunora/payment";
+import { createStripeAdapter } from "@lunora/payment/stripe";
 import Stripe from "stripe";
 
 const payment = createPayment({

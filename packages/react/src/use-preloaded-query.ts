@@ -2,7 +2,7 @@
 
 import type { FunctionReference, Preloaded } from "@lunora/client";
 import { useQuery as useTanStackQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo } from "react";
+import { useEffect } from "react";
 
 import { getSubscriptionRegistry, lunoraQueryKey, serializeQueryKey } from "./cache";
 import { useLunora } from "./lunora-provider";
@@ -27,10 +27,12 @@ const usePreloadedQuery = function <T>(preloaded: Preloaded<T>): T {
     const queryClient = useQueryClient();
 
     const { args, functionPath, shardKey, value } = preloaded;
-    const functionRef = useMemo<FunctionReference>(() => {
-        return { __lunoraRef: functionPath };
-    }, [functionPath]);
-    const queryKey = useMemo(() => lunoraQueryKey(functionRef, args, shardKey), [functionRef.__lunoraRef, JSON.stringify(args), shardKey]);
+    // Both values are consumed structurally (TanStack hashes `queryKey`; the
+    // effect keys off `serializeQueryKey(queryKey)`, a content hash), so a fresh
+    // reference each render is fine — React Compiler auto-memoizes these
+    // derivations, so no manual `useMemo` is needed.
+    const functionRef: FunctionReference = { __lunoraRef: functionPath };
+    const queryKey = lunoraQueryKey(functionRef, args, shardKey);
 
     // eslint-disable-next-line @tanstack/query/exhaustive-deps -- client is provider-stable (it comes from LunoraContext; swapping it remounts the provider subtree) and is intentionally excluded from the cache key: a non-serializable client object would break cache identity and thrash the cache.
     const { data } = useTanStackQuery<T>({
@@ -47,14 +49,18 @@ const usePreloadedQuery = function <T>(preloaded: Preloaded<T>): T {
         const registry = getSubscriptionRegistry(client);
 
         return registry.attach(queryClient, queryKey, functionRef, args, shardKey);
+        // react-doctor-disable-next-line react-doctor/exhaustive-deps -- intentional: the WS subscription re-attaches only when the serialized query key (a stable content hash) or the client changes — not on every fresh `functionRef`/`args`/`shardKey` identity. `client` is provider-stable (swapping it remounts the provider subtree).
     }, [client, queryClient, serializeQueryKey(queryKey)]);
 
     // TanStack types `data` as `T | undefined` even with `initialData` because
-    // the option could be a falsy value. We always pass the preloaded `value`
-    // so the only way to land here with `undefined` is the consumer preloading
-    // an explicit `undefined` — preserve that semantic via `??` instead of
-    // forcing a cast that lies about possible runtime states.
-    return data ?? value;
+    // the option could be a falsy value. We always pass the preloaded `value`,
+    // so the only way `data` is genuinely absent from the cache is the consumer
+    // preloading an explicit `undefined` — fall back to `value` in exactly that
+    // case. A `??` here would also coalesce `null`, but `null` is a normal
+    // Lunora query result (document deleted, access revoked): a live push of
+    // `null` must pass through, not resurrect the stale preloaded value.
+    // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- intentional: a live null push must pass through, not fall back to the stale preloaded value
+    return data === undefined ? value : data;
 };
 
 /**
@@ -69,6 +75,7 @@ const usePreloadedQuery = function <T>(preloaded: Preloaded<T>): T {
  * call it like a hook — at the top level of a component, unconditionally.
  */
 const hydratePreloaded = function <T>(preloaded: Preloaded<T>): T {
+    // react-doctor-disable-next-line react-doctor/rules-of-hooks -- `hydratePreloaded` is a deliberate hook alias (documented above): it carries React's Rules-of-Hooks contract and must be called like a hook. The lowercase name is the framework-neutral public primitive every adapter exposes; renaming it to `use*` would break the cross-adapter API.
     return usePreloadedQuery(preloaded);
 };
 

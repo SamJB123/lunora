@@ -14,15 +14,24 @@
  * Non-JS containers can implement the same one-line contract directly.
  */
 
+import { LunoraError } from "@lunora/errors";
+
 /** The RPC path the Lunora Worker exposes. */
 const RPC_PATH = "/_lunora/rpc";
 
-/** A `fetch` implementation — defaults to the runtime global. */
+/**
+ * A `fetch` implementation — defaults to the runtime global.
+ * @experimental
+ */
 type FetchLike = (
     input: string,
     init: { body: string; headers: Record<string, string>; method: string },
 ) => Promise<{ json: () => Promise<unknown>; ok: boolean; status: number; statusText?: string }>;
 
+/**
+ * `ContainerBridgeOptions` is part of the experimental `@lunora/container` API and may change without a major version bump.
+ * @experimental
+ */
 interface ContainerBridgeOptions {
     /**
      * Base URL of the deployed Lunora Worker (no trailing `/_lunora/rpc`), e.g.
@@ -41,14 +50,13 @@ interface ContainerBridgeOptions {
     token?: string;
 }
 
-/** Thrown when a Lunora function returns an error envelope. Carries the wire `code`. */
-class ContainerBridgeError extends Error {
-    public readonly code: string;
-
+/**
+ * Thrown when a Lunora function returns an error envelope. A `LunoraError` subclass carrying the wire `code`.
+ * @experimental
+ */
+class ContainerBridgeError extends LunoraError {
     public constructor(code: string, message: string) {
-        super(message);
-        this.name = "ContainerBridgeError";
-        this.code = code;
+        super(code, message, { name: "ContainerBridgeError" });
     }
 }
 
@@ -58,6 +66,7 @@ class ContainerBridgeError extends Error {
  * imported) so the bridge stays dependency-free and its `.d.ts` is
  * self-contained; the `__lunoraPhantom` shape matches, so a real `api.x.y`
  * reference is assignable and its arg/return types are inferable.
+ * @experimental
  */
 interface BridgeFunctionReference<Args = unknown, Result = unknown> {
     readonly __lunoraPhantom?: { args: Args; returns: Result };
@@ -70,6 +79,10 @@ type ArgsOfReference<Reference> = Reference extends { __lunoraPhantom?: { args: 
 /** Infer the result type from a {@link BridgeFunctionReference} (or a `@lunora/client` reference). */
 type ResultOfReference<Reference> = Reference extends { __lunoraPhantom?: { returns: infer Result } } ? Result : never;
 
+/**
+ * `ContainerBridge` is part of the experimental `@lunora/container` API and may change without a major version bump.
+ * @experimental
+ */
 interface ContainerBridge {
     /** Call an `action` by `namespace:fn` path. Alias of {@link ContainerBridge.call} for intent. */
     action: <Result = unknown>(functionPath: string, args?: Record<string, unknown>, shardKey?: string) => Promise<Result>;
@@ -125,7 +138,10 @@ const parseResponseBody = async (response: BridgeResponse, functionPath: string)
             throw statusError(functionPath, response);
         }
 
-        throw new Error(`createContainerBridge: request to "${functionPath}" returned a non-JSON response (status ${String(response.status)})`);
+        throw new LunoraError(
+            "INTERNAL",
+            `createContainerBridge: request to "${functionPath}" returned a non-JSON response (status ${String(response.status)})`,
+        );
     }
 };
 
@@ -141,6 +157,7 @@ const parseResponseBody = async (response: BridgeResponse, functionPath: string)
  * `query`/`mutation`/`action` are intent-revealing aliases of one `call` — the
  * wire is identical and the server dispatches by the function's registered
  * kind, so a query path called via `.mutation(...)` still runs as a query.
+ * @experimental
  */
 const createContainerBridge = (options: ContainerBridgeOptions): ContainerBridge => {
     if (typeof options.baseUrl !== "string" || options.baseUrl.length === 0) {
@@ -190,7 +207,8 @@ const createContainerBridge = (options: ContainerBridgeOptions): ContainerBridge
                 detail = String(error);
             }
 
-            throw new Error(
+            throw new LunoraError(
+                "INTERNAL",
                 `createContainerBridge: request to "${functionPath}" returned a malformed error envelope (status ${String(response.status)}): ${detail}`,
             );
         }

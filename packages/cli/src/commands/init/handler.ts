@@ -1,4 +1,4 @@
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 
 import { BADGES, isInteractive } from "@lunora/config";
@@ -14,11 +14,11 @@ import { defineHandler } from "../../util/command";
 import type { DetectedFramework, FrameworkDetection } from "../../util/detect-framework";
 import { detectFramework } from "../../util/detect-framework";
 import type { PackageManager, PackageManagerProbe } from "../../util/detect-package-manager";
-import { detectInstalledManagers, installArgsFor } from "../../util/detect-package-manager";
+import { detectInstalledManagers, detectPackageManager, installArgsFor, runScriptCommand } from "../../util/detect-package-manager";
 import type { Logger } from "../../util/logger";
 import { patchViteConfig } from "../../util/patch-vite-config";
 import { PromptCancelledError } from "../../util/prompt-cancelled";
-import { resolveDistTag, resolveSourceRef, resolveTagVersions } from "../../util/source-ref";
+import { resolveDistTag, resolvePinnedSourceRef, resolveSourceRef, resolveTagVersions } from "../../util/source-ref";
 import type { Spawner } from "../../util/spawn";
 import { defaultSpawner } from "../../util/spawn";
 import type { NextStep } from "../../util/tui-prompts";
@@ -62,6 +62,8 @@ const COPY = {
 type Template =
     | "analog"
     | "astro"
+    | "expo"
+    | "next"
     | "nuxt"
     | "react-router"
     | "standalone"
@@ -74,8 +76,8 @@ type Template =
 interface InitCommandOptions {
     /**
      * Add features non-interactively after scaffolding (the `--add` flag): a
-     * comma-separated list of `auth | email | storage | ratelimit | crons |
-     * presence | backup`. Bypasses the interactive multi-select and sub-prompts —
+     * comma-separated list of `ai | auth | backup | browser | cloudflare-access | crons | email | flags | hyperdrive | payment | presence | queue | storage | workflow`.
+     * Bypasses the interactive multi-select and sub-prompts —
      * each named feature is applied with its shipped defaults.
      */
     add?: string;
@@ -334,12 +336,37 @@ const stampLunoraDeps = (packageJsonText: string, distTag: string, versions: Rea
 };
 
 /**
- * Native build scripts the scaffold's toolchain needs to run on install
- * (esbuild/sharp/workerd, pulled in by Vite + Wrangler). pnpm v10+ blocks
- * post-install build scripts by default; pre-approving them lets `pnpm install`
- * run exactly these without the interactive `pnpm approve-builds` step.
+ * Native build scripts the scaffold's toolchain needs to run on install, pulled
+ * in by Vite + Wrangler: `workerd`/`esbuild`/`@parcel/watcher`/`msgpackr-extract`
+ * (wrangler + miniflare), `unrs-resolver`/`rs-module-lexer` (Vite 8 / rolldown),
+ * and `sharp` (image handling). pnpm v10+ blocks post-install build scripts by
+ * default; pre-approving them lets `pnpm install` run exactly these without the
+ * interactive `pnpm approve-builds` step — otherwise the user's first install
+ * halts with `ERR_PNPM_IGNORED_BUILDS`. Kept in sync with the repo root's
+ * `allowBuilds` set and `scripts/template-build-smoke.sh`.
  */
-const PNPM_BUILT_DEPENDENCIES: ReadonlyArray<string> = ["esbuild", "sharp", "workerd"];
+const PNPM_BUILT_DEPENDENCIES: ReadonlyArray<string> = [
+    "@parcel/watcher",
+    "esbuild",
+    "lmdb",
+    "msgpackr-extract",
+    "rs-module-lexer",
+    "sharp",
+    "unrs-resolver",
+    "workerd",
+];
+
+/**
+ * Build scripts present in the dependency tree (via `wrangler`'s transitive deps)
+ * that we explicitly DENY rather than run: they're optional native
+ * optimizations, not needed by a scaffolded app, and building them would require
+ * a C/C++ toolchain a fresh clone may not have (`cpu-features` → node-gyp).
+ * `ssh2` falls back to pure JS without its optional `cpu-features`; `protobufjs`'s
+ * postinstall is a codegen the CLI paths don't need. They must still be LISTED —
+ * pnpm v11 errors on any unlisted build script when an `allowBuilds` map exists —
+ * so denying (`false`) keeps `pnpm install` non-interactive AND compiler-free.
+ */
+const PNPM_DENIED_BUILD_DEPENDENCIES: ReadonlyArray<string> = ["cpu-features", "protobufjs", "ssh2"];
 
 /** File pnpm reads its settings from. */
 const PNPM_WORKSPACE_FILENAME = "pnpm-workspace.yaml";
@@ -349,17 +376,21 @@ const PNPM_WORKSPACE_FILENAME = "pnpm-workspace.yaml";
  * toolchain's native deps without `pnpm approve-builds`. This is the new home for
  * the setting — pnpm v10.16+ NO LONGER reads the `package.json` `pnpm` field.
  *
- * Uses the `allowBuilds` map (`name: true`) — the key pnpm v11's `approve-builds`
- * writes and honours; the older `onlyBuiltDependencies` array is NOT honoured by
- * pnpm 11.x at install time. npm/yarn ignore the file.
+ * Uses the `allowBuilds` map (`name: true|false`) — the key pnpm v11's
+ * `approve-builds` writes and honours; the older `onlyBuiltDependencies` array is
+ * NOT honoured by pnpm 11.x at install time. Every build-script package in the
+ * tree must be listed (allowed or denied) or pnpm halts with
+ * `ERR_PNPM_IGNORED_BUILDS`. npm/yarn ignore the file.
  */
 const pnpmWorkspaceYaml = (): string =>
     [
         "# pnpm reads its settings from here (the package.json `pnpm` field is no longer read).",
         "# Pre-approve the toolchain's native build scripts so `pnpm install` runs them",
-        "# without the interactive `pnpm approve-builds` step.",
+        "# without the interactive `pnpm approve-builds` step; deny the optional native",
+        "# builds a scaffold doesn't need (so no C/C++ toolchain is required).",
         "allowBuilds:",
-        ...PNPM_BUILT_DEPENDENCIES.map((name) => `    ${name}: true`),
+        ...PNPM_BUILT_DEPENDENCIES.map((name) => `    '${name}': true`),
+        ...PNPM_DENIED_BUILD_DEPENDENCIES.map((name) => `    '${name}': false`),
         "",
     ].join("\n");
 
@@ -367,6 +398,14 @@ const collectFiles = (directory: string): ReadonlyArray<string> => {
     const out: string[] = [];
 
     for (const entry of walkSync(directory, { includeDirs: false, includeFiles: true })) {
+        // Skip symlinks: a hostile `--source`/`--from` template could ship a
+        // symlink to e.g. `~/.ssh/id_rsa`, and reading THROUGH it would copy the
+        // victim's private file into the scaffolded project. We only ever copy
+        // real regular files from a template.
+        if (lstatSync(entry.path).isSymbolicLink()) {
+            continue;
+        }
+
         out.push(entry.path);
     }
 
@@ -449,18 +488,12 @@ const logScaffoldSuccess = (logger: Logger, written: ReadonlyArray<string>, targ
     logger.success(`scaffolded ${String(written.length)} files into ${target}`);
 };
 
-/** The shell command that runs a project script with `manager` (`pnpm dev`, `npm run dev`, …). */
-const runScriptCommand = (manager: PackageManager, script: string): string => {
-    if (manager === "npm") {
-        return `npm run ${script}`;
-    }
+/** The shell command that adds dependencies with `manager` (`pnpm add …`, `npm install …`, …). */
+const installCommand = (manager: PackageManager, packages: ReadonlyArray<string>): string => {
+    // npm spells "add a dependency" as `install`; pnpm/yarn/bun use `add`.
+    const verb = manager === "npm" ? "install" : "add";
 
-    if (manager === "bun") {
-        return `bun run ${script}`;
-    }
-
-    // pnpm / yarn run scripts by bare name.
-    return `${manager} ${script}`;
+    return `${manager} ${verb} ${packages.join(" ")}`;
 };
 
 /**
@@ -557,13 +590,12 @@ const maybeOfferGit = async (options: InitCommandOptions, target: string): Promi
 /**
  * Print the post-scaffold "next steps". When deps were already installed (the
  * user accepted the install offer), the `install` line is dropped and the `dev`
- * line uses the chosen manager; otherwise it defaults to `pnpm`. Inside a
- * monorepo we point at the workspace root, since installing in the new package
- * before it's wired into the workspace won't work.
+ * line uses the chosen manager; otherwise the caller passes the detected manager
+ * (lock file / `packageManager` field / launching manager / first installed).
+ * Inside a monorepo we point at the workspace root, since installing in the new
+ * package before it's wired into the workspace won't work.
  */
-const printNextSteps = async (name: string, installed: PackageManager | undefined, insideMonorepo: boolean): Promise<void> => {
-    const manager: PackageManager = installed ?? "pnpm";
-
+const printNextSteps = async (name: string, installed: PackageManager | undefined, manager: PackageManager, insideMonorepo: boolean): Promise<void> => {
     const steps: NextStep[] = [{ code: `cd ./${name}`, lead: "Enter your project directory using" }];
 
     if (installed === undefined) {
@@ -725,7 +757,13 @@ const scaffoldFromRemote = async (options: {
     const stagingDirectory = join(stagingRoot, "template");
 
     try {
-        const remote = resolveTemplateSource(templateType, source, ref);
+        // Pin the moving release branch to the immutable commit it currently
+        // points at before giget fetches it (supply-chain hardening) — logs the
+        // SHA, or warns + falls back to the branch when the pin can't be resolved
+        // (offline / rate-limited). A custom `--source` isn't part of the pinnable
+        // `gh:anolilab/lunora` repo (and drops the ref entirely), so skip it.
+        const pinnedRef = source !== undefined && source.length > 0 ? ref : await resolvePinnedSourceRef(ref, logger);
+        const remote = resolveTemplateSource(templateType, source, pinnedRef);
 
         // Fetch + scaffold as a live checklist ("Project initialized!" with ✔ rows,
         // create-astro style; off a TTY the tasks run bare so CI/tests stay clean).
@@ -1000,13 +1038,13 @@ const scaffoldLunoraDirectory = (cwd: string, logger: Logger): ReadonlyArray<str
  * composition is printed for the user to wire because it is framework-specific
  * and lives in files the CLI does not own.
  */
-const printFrameworkNextSteps = (detection: FrameworkDetection, logger: Logger): void => {
+const printFrameworkNextSteps = (detection: FrameworkDetection, manager: PackageManager, logger: Logger): void => {
     const { adapter, class: frameworkClass, framework } = detection;
 
     logger.info("");
     logger.info(`detected framework: ${framework} (class ${frameworkClass})`);
     logger.info("next steps:");
-    logger.info(`  1. install the adapter:  pnpm add ${adapter} @lunora/client @lunora/runtime @lunora/server`);
+    logger.info(`  1. install the adapter:  ${installCommand(manager, [adapter, "@lunora/client", "@lunora/runtime", "@lunora/server"])}`);
     logger.info("  2. run codegen:          lunora codegen");
 
     if (frameworkClass === "A") {
@@ -1093,7 +1131,9 @@ const runInPlaceInit = (cwd: string, logger: Logger): InitCommandResult => {
 
     const scaffolded = scaffoldLunoraDirectory(cwd, logger);
 
-    printFrameworkNextSteps(detection, logger);
+    // The overlay path patches an existing project, so honour its package
+    // manager (packageManager field / lockfile) rather than assuming pnpm.
+    printFrameworkNextSteps(detection, detectPackageManager(cwd), logger);
 
     return { code: 0, files: [...viteResult.files, ...scaffolded], target: cwd };
 };
@@ -1236,6 +1276,7 @@ const FRAMEWORK_CHOICES: ReadonlyArray<{ description: string; label: string; val
     { description: "Vue SPA — create-vite base + Lunora", label: "Vue", value: "vue" },
     { description: "Solid SPA — create-vite base + Lunora", label: "Solid", value: "solid" },
     { description: "Svelte SPA — create-vite base + Lunora", label: "Svelte", value: "svelte" },
+    { description: "Next.js (App Router) — OpenNext on Cloudflare + a standalone Lunora worker", label: "Next.js", value: "next" },
     { description: "TanStack Start (React) — SSR with live-loader routes", label: "TanStack Start · React", value: "tanstack-start-react" },
     { description: "TanStack Start (Solid)", label: "TanStack Start · Solid", value: "tanstack-start-solid" },
     { description: "Next.js App Router on Vite (vinext) — composed into the Lunora worker (experimental)", label: "vinext · App Router", value: "vinext" },
@@ -1245,6 +1286,7 @@ const FRAMEWORK_CHOICES: ReadonlyArray<{ description: string; label: string; val
     { description: "AnalogJS (Angular) — single-worker, Lunora mounted in Nitro", label: "Analog", value: "analog" },
     { description: "Nuxt (Vue) — single-worker, Lunora mounted in Nitro", label: "Nuxt", value: "nuxt" },
     { description: "SvelteKit + a standalone Lunora worker", label: "SvelteKit", value: "sveltekit" },
+    { description: "React Native (Expo) — an iOS/Android/web app + a Lunora worker backend", label: "React Native · Expo", value: "expo" },
     { description: "Worker only — no frontend", label: "Standalone", value: "standalone" },
 ];
 
@@ -1385,8 +1427,21 @@ const scaffoldNewProject = async (
     // generated per run so an empty submit lands on something nicer than a static
     // placeholder (create-astro does the same).
     const suggestedName = generateProjectName();
-    const name = options.name ?? (await tuiText(COPY.name, { badge: BADGES.dir, default: suggestedName, placeholder: suggestedName }));
+    const rawName = options.name ?? (await tuiText(COPY.name, { badge: BADGES.dir, default: suggestedName, placeholder: suggestedName }));
     const choice = await resolveScaffoldChoice(options);
+
+    // Guard against an empty / whitespace-only name: `options.name ?? …` only
+    // falls back on null/undefined, so an explicit `--name ""` (or a
+    // whitespace-only name) passes straight through. `resolve(cwd, "")`
+    // resolves to cwd itself, and `resolve(cwd, "   ")` creates a confusing
+    // whitespace-named directory — reject both up front.
+    const name = rawName.trim();
+
+    if (name.length === 0) {
+        options.logger.error(`init: refusing an empty project name — pass a directory name (e.g. \`lunora init my-app\`).`);
+
+        return { code: 1, files: [], target: "" };
+    }
 
     // Guard the project name against path traversal: it becomes a directory
     // under cwd, so a name containing separators or `..` could scaffold outside
@@ -1500,8 +1555,13 @@ const runPostScaffold = async (options: InitCommandOptions, result: InitCommandR
     if (options.inPlace !== true) {
         await maybeOfferGit(options, result.target);
 
+        // The install may have been declined; fall back to the manager detected
+        // for the scaffolded project (lock file / `packageManager` field /
+        // launching manager / first installed) rather than assuming pnpm.
+        const manager = installedManager ?? detectPackageManager(result.target);
+
         // Closing flourish + next steps + Luna's send-off, after the install so it's truly last.
-        await printNextSteps(basename(result.target), installedManager, isInsideMonorepo(cwd));
+        await printNextSteps(basename(result.target), installedManager, manager, isInsideMonorepo(cwd));
         await emitMascot(options.logger);
     }
 };
@@ -1566,6 +1626,8 @@ const runInitCommand = async (options: InitCommandOptions): Promise<InitCommandR
 const isTemplate = (value: unknown): value is Template =>
     value === "analog" ||
     value === "astro" ||
+    value === "expo" ||
+    value === "next" ||
     value === "nuxt" ||
     value === "react-router" ||
     value === "standalone" ||

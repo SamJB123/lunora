@@ -1,6 +1,8 @@
 import { randomBytes } from "node:crypto";
-import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+
+import { LunoraError } from "@lunora/errors";
 
 import {
     DEV_VARS_EXAMPLE_FILE,
@@ -118,15 +120,6 @@ const isPlaceholder = (rawValue: string): boolean => isPlaceholderValue(unquoteD
 const defaultRandomHex = (bytes: number): string => randomBytes(bytes).toString("hex");
 
 /**
- * The fresh secret to substitute for an example `key=value` entry, or `undefined`
- * when the example value should be used as-is (non-secret key, or a value the
- * example already pins to something real). The single rule both the full-file
- * generate and the missing-key augment share.
- */
-const generatedSecretFor = (key: string, rawValue: string, randomHex: (bytes: number) => string): string | undefined =>
-    SECRET_KEY.test(key) && isPlaceholder(rawValue) ? randomHex(SECRET_BYTES) : undefined;
-
-/**
  * Provider-issued secret keys we CANNOT mint locally — you obtain them from a
  * third-party dashboard (Resend, Stripe, Polar, …). Derived from the registry:
  * a secret-keyed entry whose placeholder is an angle-bracket `&lt;your-…>` marker
@@ -146,6 +139,22 @@ const PROVIDER_SECRET_KEYS: ReadonlySet<string> = new Set(
  * ({@link PROVIDER_SECRET_KEYS}) and any non-secret key.
  */
 const isMintableSecretKey = (key: string): boolean => SECRET_KEY.test(key) && !PROVIDER_SECRET_KEYS.has(key);
+
+/**
+ * The fresh secret to substitute for an example `key=value` entry, or `undefined`
+ * when the example value should be used as-is (non-secret key, a provider-issued
+ * key we cannot mint locally, or a value the example already pins to something
+ * real). The single rule both the full-file generate and the missing-key augment
+ * share.
+ *
+ * Only {@link isMintableSecretKey mintable} secret keys are regenerated:
+ * provider-issued placeholders (e.g. `RESEND_API_KEY`, `STRIPE_SECRET_KEY`) are
+ * left verbatim so they stay detectable as unfilled by `lunora env doctor` —
+ * minting a random value for one would be actively wrong (the provider would
+ * reject it) and would hide the misconfiguration.
+ */
+const generatedSecretFor = (key: string, rawValue: string, randomHex: (bytes: number) => string): string | undefined =>
+    isMintableSecretKey(key) && isPlaceholder(rawValue) ? randomHex(SECRET_BYTES) : undefined;
 
 /** Mint a fresh strong secret value — 64 hex chars (32 bytes), like `openssl rand -hex 32`. */
 const generateSecretValue = (randomHex: (bytes: number) => string = defaultRandomHex): string => randomHex(SECRET_BYTES);
@@ -302,31 +311,99 @@ const atomicCreateDevVariables = (path: string, content: string): void => {
     }
 };
 
-/**
- * Append lines to an existing `.dev.vars`, atomically and owner-only.
- *
- * Mirrors {@link atomicCreateDevVariables}: build the full new content, write it
- * to a sibling temp file (`mode: 0o600`), then `rename` over the target. The
- * read happens immediately before the write so a concurrent peer's appends are
- * picked up rather than clobbered — a plain read-modify-write would race two
- * `lunora dev` / Vite processes into last-writer-wins (the exact scenario the
- * create path defends against). A trailing newline is inserted only if needed.
- */
-const appendDevVariables = (path: string, additions: string[]): void => {
-    const existing = readFileSync(path, "utf8");
-    const separator = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
-    const content = `${existing}${separator}${additions.join("\n")}\n`;
+/** Retry budget for {@link appendDevVariables}'s compare-and-swap loop. */
+const APPEND_MAX_ATTEMPTS = 5;
 
-    const temporaryPath = `${path}.tmp-${String(process.pid)}`;
+/** The bits of file identity we compare before trusting our read was still current at rename time. */
+interface FileFingerprint {
+    mtimeMs: number;
+    size: number;
+}
 
+/** `undefined` when the path doesn't exist (e.g. it was deleted between attempts). */
+const fingerprintOf = (path: string): FileFingerprint | undefined => {
     try {
-        writeFileSync(temporaryPath, content, { encoding: "utf8", mode: 0o600 });
-        renameSync(temporaryPath, path);
-    } catch (error) {
-        rmSync(temporaryPath, { force: true });
+        const stats = statSync(path);
 
-        throw error;
+        return { mtimeMs: stats.mtimeMs, size: stats.size };
+    } catch {
+        return undefined;
     }
+};
+
+const sameFingerprint = (a: FileFingerprint | undefined, b: FileFingerprint | undefined): boolean => {
+    if (a === undefined || b === undefined) {
+        return false;
+    }
+
+    return a.mtimeMs === b.mtimeMs && a.size === b.size;
+};
+
+/**
+ * Append lines to an existing `.dev.vars`, atomically and owner-only, via a
+ * compare-and-swap retry loop.
+ *
+ * Mirrors {@link atomicCreateDevVariables} in shape (sibling temp file, `mode:
+ * 0o600`, atomic `rename`), but a plain read-modify-write is not enough here:
+ * two concurrent `lunora dev` / Vite processes could both read the same old
+ * content, each append their own additions, and the second `rename` would
+ * silently discard the first writer's lines. To close that window:
+ *
+ * 1. Each attempt reads the file and fingerprints it (`mtimeMs` + `size`).
+ * 2. `buildAdditions(existing)` re-derives the lines to append from that fresh
+ * read (the caller re-runs its planner, e.g. {@link planDevVariablesAugment},
+ * so a peer's already-landed keys are recognised as present and skipped).
+ * 3. The new content is written to an attempt-unique temp file (pid + random
+ * suffix, so two processes never collide on the temp path itself).
+ * 4. The target is re-fingerprinted immediately before the rename. If it
+ * changed since step 1, a peer won the race — discard the temp file and
+ * retry from a fresh read/merge instead of clobbering their append.
+ *
+ * Returns the additions actually written (from the attempt that won), or `[]`
+ * if a fresh read showed nothing left to add (a peer already added everything
+ * this call wanted). Throws after {@link APPEND_MAX_ATTEMPTS} losing attempts;
+ * the error names only the path, never file content or additions.
+ */
+const appendDevVariables = (path: string, buildAdditions: (existing: string) => string[]): string[] => {
+    for (let attempt = 0; attempt < APPEND_MAX_ATTEMPTS; attempt += 1) {
+        const beforeFingerprint = fingerprintOf(path);
+        const existing = readFileSync(path, "utf8");
+        const additions = buildAdditions(existing);
+
+        if (additions.length === 0) {
+            return [];
+        }
+
+        const separator = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
+        const content = `${existing}${separator}${additions.join("\n")}\n`;
+
+        const temporaryPath = `${path}.tmp-${String(process.pid)}-${randomBytes(6).toString("hex")}`;
+
+        try {
+            writeFileSync(temporaryPath, content, { encoding: "utf8", mode: 0o600 });
+
+            // Re-check the target's identity right before the swap: if it moved
+            // since our read, another writer won the race — discard our temp file
+            // and retry from a fresh read/merge instead of clobbering their append.
+            const beforeRenameFingerprint = fingerprintOf(path);
+
+            if (!sameFingerprint(beforeFingerprint, beforeRenameFingerprint)) {
+                rmSync(temporaryPath, { force: true });
+
+                continue;
+            }
+
+            renameSync(temporaryPath, path);
+
+            return additions;
+        } catch (error) {
+            rmSync(temporaryPath, { force: true });
+
+            throw error;
+        }
+    }
+
+    throw new LunoraError("INTERNAL", `Failed to append to ${path} after ${String(APPEND_MAX_ATTEMPTS)} attempts — a concurrent writer kept winning the race.`);
 };
 
 /**
@@ -399,10 +476,29 @@ const ensureDevVariables = async (deps: EnsureDevVariablesDeps): Promise<EnsureD
         return { addedKeys: [], generatedKeys: [], status: "declined" };
     }
 
-    appendDevVariables(devVariablesPath, augment.additions);
-    deps.info(`Updated ${DEV_VARS_FILE} — added ${list}${generatedSuffix(augment.generatedKeys)}.`);
+    // Re-plan from whatever `.dev.vars` looks like on each attempt: a concurrent
+    // writer may have already landed some (or all) of these keys between our
+    // initial read above and the rename, and re-running the (pure) planner
+    // against the fresh content naturally treats those keys as already-present
+    // and skips them, instead of clobbering the peer's append.
+    const written = appendDevVariables(
+        devVariablesPath,
+        (currentContent) => planDevVariablesAugment({ existingContent: currentContent, exampleContent, randomHex: deps.randomHex }).additions,
+    );
+    const writtenKeys = written.map((line) => splitDevVariableLine(line)?.key).filter((key): key is string => key !== undefined);
 
-    return { addedKeys: augment.missingKeys, generatedKeys: augment.generatedKeys, status: "augmented" };
+    // A concurrent writer may have landed every missing key between our plan and
+    // the CAS append, leaving nothing for us to write. Report that as an
+    // unchanged file rather than logging a dangling "added ." line.
+    if (writtenKeys.length === 0) {
+        return { addedKeys: [], generatedKeys: [], status: "exists" };
+    }
+
+    const writtenGeneratedKeys = augment.generatedKeys.filter((key) => writtenKeys.includes(key));
+
+    deps.info(`Updated ${DEV_VARS_FILE} — added ${writtenKeys.join(", ")}${generatedSuffix(writtenGeneratedKeys)}.`);
+
+    return { addedKeys: writtenKeys, generatedKeys: writtenGeneratedKeys, status: "augmented" };
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

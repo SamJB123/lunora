@@ -5,6 +5,7 @@ import { emitApp } from "../src/emit-app";
 
 /** Minimal `EmitAppOptions` with every capability off; tests flip one flag at a time. */
 const baseOptions = {
+    hasAccess: false,
     hasAi: false,
     hasAnalytics: false,
     hasAuth: false,
@@ -22,6 +23,7 @@ const baseOptions = {
     hasStorage: false,
     hasVectors: false,
     hasWorkflow: false,
+    hasX402: false,
     useUmbrella: false,
     wantsOpenApi: false,
     wantsOpenRpc: false,

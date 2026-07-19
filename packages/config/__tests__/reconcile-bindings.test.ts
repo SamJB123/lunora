@@ -14,6 +14,7 @@ const SESSION: DurableObjectSpec = { binding: "SESSION", className: "SessionDO" 
 
 const baseInferred = (overrides: Partial<InferredBindings> = {}): InferredBindings => {
     return {
+        agents: [],
         containers: [],
         durableObjects: [SHARD],
         needsD1: false,
@@ -24,6 +25,7 @@ const baseInferred = (overrides: Partial<InferredBindings> = {}): InferredBindin
         usesAuth: false,
         usesBrowser: false,
         usesHyperdrive: false,
+        usesFlags: false,
         usesImages: false,
         usesKv: false,
         usesMail: false,
@@ -31,6 +33,8 @@ const baseInferred = (overrides: Partial<InferredBindings> = {}): InferredBindin
         usesPipelines: false,
         usesScheduler: false,
         usesStorage: false,
+        usesX402Charge: false,
+        usesX402Pay: false,
         workflows: [],
         ...overrides,
     };
@@ -206,6 +210,45 @@ describe("reconcileWranglerBindings", () => {
         expect(readConfig().r2_buckets).toBeUndefined();
     });
 
+    it("warns when Flagship binding mode is used but no flagship binding exists, without writing one", () => {
+        expect.assertions(2);
+
+        const result = reconcileWranglerBindings(root, baseInferred({ flagshipBinding: "FLAGS", usesFlags: true }));
+
+        expect(result.warnings.join(" ")).toMatch(/flagship binding "FLAGS".*app_id/u);
+        // The app_id is un-mintable, so nothing is auto-written.
+        expect(readConfig().flagship).toBeUndefined();
+    });
+
+    it("does not warn about flagship when a matching flagship binding already exists", () => {
+        expect.assertions(1);
+
+        writeFileSync(
+            join(root, "wrangler.jsonc"),
+            `{
+    "name": "lunora-app",
+    "compatibility_date": "2026-04-07",
+    "durable_objects": { "bindings": [{ "name": "SHARD", "class_name": "ShardDO" }] },
+    "migrations": [{ "tag": "v1", "new_sqlite_classes": ["ShardDO"] }],
+    "flagship": [{ "binding": "FLAGS", "app_id": "app-abc" }],
+}
+`,
+            "utf8",
+        );
+
+        const result = reconcileWranglerBindings(root, baseInferred({ flagshipBinding: "FLAGS", usesFlags: true }));
+
+        expect(result.warnings.join(" ")).not.toMatch(/flagship binding/u);
+    });
+
+    it("does not warn about flagship for an HTTP-mode provider (no binding implied)", () => {
+        expect.assertions(1);
+
+        const result = reconcileWranglerBindings(root, baseInferred({ usesFlags: true }));
+
+        expect(result.warnings.join(" ")).not.toMatch(/flagship binding/u);
+    });
+
     it("warns to set the provider secrets when @lunora/payment is used, without adding any binding", () => {
         expect.assertions(3);
 
@@ -215,6 +258,28 @@ describe("reconcileWranglerBindings", () => {
         // Payment rides the existing ShardDO via ctx.db — no new binding written.
         expect(result.changed).toBe(false);
         expect(readConfig().durable_objects.bindings.map((binding: { name: string }) => binding.name)).toEqual(["SHARD"]);
+    });
+
+    it("reminds to add a recipient [vars] entry when @lunora/x402/charge is used, without writing a binding", () => {
+        expect.assertions(2);
+
+        const result = reconcileWranglerBindings(root, baseInferred({ usesX402Charge: true }));
+
+        expect(result.warnings.join(" ")).toMatch(/x402\/charge.*recipient wallet address.*\[vars\]/u);
+        // The recipient var name is user-chosen — nothing is auto-written.
+        expect(result.changed).toBe(false);
+    });
+
+    it("reminds to add a Secrets Store binding + spend policy when @lunora/x402/pay is used, without writing a binding", () => {
+        expect.assertions(3);
+
+        const result = reconcileWranglerBindings(root, baseInferred({ usesX402Pay: true }));
+
+        expect(result.warnings.join(" ")).toMatch(/x402\/pay.*secrets_store_secrets\[\].*spend policy/u);
+        // ctx.secrets is a Secrets Store binding (created out-of-band), not a
+        // .dev.vars value, so the pay wallet key is a hint — never auto-written.
+        expect(result.warnings.join(" ")).toMatch(/Secrets Store binding, not \.dev\.vars/u);
+        expect(result.changed).toBe(false);
     });
 
     it("warns when auth is used but no SessionDO is exported, without binding SESSION", () => {
@@ -366,6 +431,56 @@ describe("reconcileWranglerBindings", () => {
         expect(result.warnings.join(" ")).not.toMatch(/hyperdrive is used/u);
     });
 
+    describe("voice agents", () => {
+        // A voice-enabled agent: its durable loop still rides `workflows[]`, but
+        // the real-time session is a Durable Object, so it ALSO needs a
+        // `durable_objects` binding + `new_sqlite_classes` migration.
+        const VOICE_SUPPORT = {
+            bindingName: "AGENT_SUPPORT",
+            className: "SupportAgentWorkflow",
+            exported: true,
+            exportName: "support",
+            name: "agent-support",
+            voice: true,
+            voiceBindingName: "VOICE_SUPPORT",
+            voiceClassName: "SupportVoiceDO",
+        };
+
+        it("provisions the voice DO binding + migration class for an exported voice agent", () => {
+            expect.assertions(4);
+
+            const result = reconcileWranglerBindings(root, baseInferred({ agents: [VOICE_SUPPORT] }));
+
+            expect(result.changed).toBe(true);
+            expect(result.added).toContain(`${VOICE_SUPPORT.voiceBindingName}/${VOICE_SUPPORT.voiceClassName}`);
+
+            const config = readConfig();
+
+            expect(config.durable_objects.bindings).toContainEqual({ class_name: "SupportVoiceDO", name: "VOICE_SUPPORT" });
+            expect(config.migrations.flatMap((migration: { new_sqlite_classes?: string[] }) => migration.new_sqlite_classes ?? [])).toContain("SupportVoiceDO");
+        });
+
+        it("is idempotent — a second run is a no-op", () => {
+            expect.assertions(1);
+
+            reconcileWranglerBindings(root, baseInferred({ agents: [VOICE_SUPPORT] }));
+
+            expect(reconcileWranglerBindings(root, baseInferred({ agents: [VOICE_SUPPORT] })).changed).toBe(false);
+        });
+
+        it("adds no voice DO for a non-voice agent (workflow-only path never touches durable_objects)", () => {
+            expect.assertions(1);
+
+            const result = reconcileWranglerBindings(
+                root,
+                baseInferred({ agents: [{ ...VOICE_SUPPORT, voice: false, voiceBindingName: undefined, voiceClassName: undefined }] }),
+            );
+
+            // The agent still reconciles into workflows[], but never a voice DO.
+            expect(result.added.join(" ")).not.toContain("VoiceDO");
+        });
+    });
+
     describe("containers", () => {
         const TRANSCODER = {
             bindingName: "CONTAINER_TRANSCODER",
@@ -510,6 +625,7 @@ describe("reconcileWranglerBindings", () => {
             exported: true,
             exportName: "orderPipeline",
             name: "order-pipeline",
+            steps: [],
         };
 
         it("provisions only the workflows[] entry — no DO binding, no migration class", () => {
@@ -565,12 +681,90 @@ describe("reconcileWranglerBindings", () => {
                 exported: true,
                 exportName: "sendReceipt",
                 name: "send-receipt",
+                steps: [],
             };
 
             const result = reconcileWranglerBindings(root, baseInferred({ workflows: [ORDER_PIPELINE, SECOND] }));
 
             expect(result.added).toEqual(["workflows/SendReceiptWorkflow"]);
             expect(readConfig().workflows.map((entry: { class_name: string }) => entry.class_name)).toEqual(["OrderPipelineWorkflow", "SendReceiptWorkflow"]);
+        });
+    });
+
+    describe("agents", () => {
+        const SUPPORT = {
+            bindingName: "AGENT_SUPPORT",
+            className: "SupportAgentWorkflow",
+            exported: true,
+            exportName: "support",
+            name: "agent-support",
+        };
+
+        it("provisions the agent as a workflows[] entry — an agent compiles onto a Workflow", () => {
+            expect.assertions(5);
+
+            const result = reconcileWranglerBindings(root, baseInferred({ agents: [SUPPORT] }));
+
+            expect(result.changed).toBe(true);
+            expect(result.added).toContain("workflows/SupportAgentWorkflow");
+
+            const config = readConfig();
+
+            expect(config.workflows).toEqual([{ binding: "AGENT_SUPPORT", class_name: "SupportAgentWorkflow", name: "agent-support" }]);
+            // Agents are not Durable Objects: never bound, never migrated.
+            expect(config.durable_objects.bindings.map((binding: { name: string }) => binding.name)).not.toContain("AGENT_SUPPORT");
+            expect(config.migrations.flatMap((migration: { new_sqlite_classes?: string[] }) => migration.new_sqlite_classes ?? [])).not.toContain(
+                "SupportAgentWorkflow",
+            );
+        });
+
+        it("is idempotent — a second run is a no-op", () => {
+            expect.assertions(1);
+
+            reconcileWranglerBindings(root, baseInferred({ agents: [SUPPORT] }));
+
+            const second = reconcileWranglerBindings(root, baseInferred({ agents: [SUPPORT] }));
+
+            expect(second.changed).toBe(false);
+        });
+
+        it("skips an unexported agent and warns instead, with an agent-kind export gap", () => {
+            expect.assertions(4);
+
+            const result = reconcileWranglerBindings(root, baseInferred({ agents: [{ ...SUPPORT, exported: false }] }));
+
+            expect(result.changed).toBe(false);
+            expect(result.warnings.join(" ")).toContain("not exported by the worker entry");
+            expect(readConfig().workflows).toBeUndefined();
+            expect(result.exportGaps).toStrictEqual([{ className: "SupportAgentWorkflow", exportName: "support", kind: "agent", module: "agents" }]);
+        });
+
+        it("writes an agent alongside a workflow into the SAME workflows[] array without clobbering", () => {
+            expect.assertions(2);
+
+            const ORDER_PIPELINE = {
+                bindingName: "WORKFLOW_ORDER_PIPELINE",
+                className: "OrderPipelineWorkflow",
+                exported: true,
+                exportName: "orderPipeline",
+                name: "order-pipeline",
+                steps: [],
+            };
+
+            const result = reconcileWranglerBindings(root, baseInferred({ agents: [SUPPORT], workflows: [ORDER_PIPELINE] }));
+
+            expect(result.added).toEqual(["workflows/OrderPipelineWorkflow", "workflows/SupportAgentWorkflow"]);
+            expect(readConfig().workflows.map((entry: { class_name: string }) => entry.class_name)).toEqual(["OrderPipelineWorkflow", "SupportAgentWorkflow"]);
+        });
+
+        it("does not duplicate an agent already present in workflows[] (matched by class_name)", () => {
+            expect.assertions(1);
+
+            reconcileWranglerBindings(root, baseInferred({ agents: [SUPPORT] }));
+
+            const second = reconcileWranglerBindings(root, baseInferred({ agents: [SUPPORT] }));
+
+            expect(second.added).toEqual([]);
         });
     });
 });

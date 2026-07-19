@@ -1,0 +1,325 @@
+/* eslint-disable no-underscore-dangle -- `_id` is the Lunora document-id field this binding keys rows by */
+import type { FunctionReference, LunoraClient, SubscriptionError } from "@lunora/client";
+import { LunoraError } from "@lunora/errors";
+import type { CollectionConfig } from "@tanstack/db";
+import { BTreeIndex } from "@tanstack/db";
+
+import type { Row } from "./internals";
+import { makeDiffEmit, toMap } from "./internals";
+
+/**
+ * A monotonic watermark gate. `await(threshold)` resolves once `advance` has been
+ * called with a value `>= threshold`; a threshold already passed resolves
+ * immediately. Used to hold a TanStack optimistic overlay until the server
+ * confirms the write's checkpoint / mutation id.
+ */
+interface Gate {
+    advance: (value: number) => void;
+    await: (threshold: number) => Promise<void>;
+}
+
+const createGate = (): Gate => {
+    let highest = Number.NEGATIVE_INFINITY;
+    const waiters: { resolve: () => void; threshold: number }[] = [];
+
+    return {
+        advance: (value) => {
+            if (value <= highest) {
+                return;
+            }
+
+            highest = value;
+
+            for (let index = waiters.length - 1; index >= 0; index -= 1) {
+                const waiter = waiters[index];
+
+                if (waiter && waiter.threshold <= highest) {
+                    waiter.resolve();
+                    waiters.splice(index, 1);
+                }
+            }
+        },
+        await: (threshold) => {
+            if (threshold <= highest) {
+                return Promise.resolve();
+            }
+
+            return new Promise<void>((resolve) => {
+                waiters.push({ resolve, threshold });
+            });
+        },
+    };
+};
+
+/**
+ * Resolves the TanStack optimistic-overlay drop against the server's confirmed
+ * watermarks. A mutator's optimistic transaction returns `awaitMutationId(id)`
+ * (or `awaitCheckpoint(cursor)`); TanStack keeps the overlay until that promise
+ * settles, so the row de-duplicates exactly as the synced server value lands — no
+ * flash of the optimistic row disappearing then reappearing.
+ *
+ * `resolve` is called by whoever owns the watermark stream — a `data`/`delta`
+ * frame's `lastMutationId`, or a shape poke's `checkpoint` — to advance the gates.
+ */
+export interface CheckpointRegistry {
+    /** Resolve once the server has acknowledged the op-log `cursor`. */
+    awaitCheckpoint: (cursor: number) => Promise<void>;
+    /** Resolve once the server has echoed a `lastMutationId >= id` for this client. */
+    awaitMutationId: (id: number) => Promise<void>;
+    /** Advance the gates from a frame's watermark; later callers past the mark settle immediately. */
+    resolve: (watermark: { checkpoint?: number; mutationId?: number }) => void;
+}
+
+/** A standalone checkpoint/mutation-id registry (also embedded in {@link lunoraCollectionOptions}). */
+export const createCheckpointRegistry = (): CheckpointRegistry => {
+    const checkpointGate = createGate();
+    const mutationGate = createGate();
+
+    return {
+        awaitCheckpoint: (cursor) => checkpointGate.await(cursor),
+        awaitMutationId: (id) => mutationGate.await(id),
+        resolve: ({ checkpoint, mutationId }) => {
+            if (checkpoint !== undefined) {
+                checkpointGate.advance(checkpoint);
+            }
+
+            if (mutationId !== undefined) {
+                mutationGate.advance(mutationId);
+            }
+        },
+    };
+};
+
+/**
+ * A replication-shape sync source (the local-first partial-replication path).
+ * Mutually exclusive with {@link LunoraCollectionConfig.list}: the collection
+ * live-syncs the named shape's rowset via the client's poke protocol
+ * (`subscribeShape`) instead of a full-table `list` query subscription.
+ */
+export interface ShapeSource {
+    /** Validated shape parameters (the partition selector — e.g. `{ channelId }`). */
+    args?: Record<string, unknown>;
+    /** The `defineShape` export name registered in `LUNORA_SHAPES`. */
+    name: string;
+    /** Routes the subscription to a specific shard's DO when the table is sharded. */
+    shardKey?: string;
+}
+
+/** Declarative inputs for {@link lunoraCollectionOptions}. */
+export interface LunoraCollectionConfig<TRow extends Row> {
+    /** The Lunora client to subscribe through. */
+    client: LunoraClient;
+    /** Row key extractor — defaults to `row._id`. */
+    getKey?: (row: TRow) => string;
+    /** Collection id (TanStack identity) — defaults to the `list` function path (or `shape:` + the shape name). */
+    id?: string;
+    /** The Lunora query that lists the rows (the full-table sync source). Mutually exclusive with {@link LunoraCollectionConfig.shape}. */
+    list?: FunctionReference;
+
+    /**
+     * When the collection starts syncing. `"lazy"` (default) starts on the first
+     * `useLiveQuery` subscriber; `"eager"` starts at creation (TanStack's
+     * `startSync`) — for small "instant" reference data you want warm at boot.
+     * No effect on a `scopeBy` collection, which has nothing to sync until scoped.
+     * (Even eager, TanStack pauses sync while there are no subscribers, per its
+     * `gcTime` lifecycle — "warm while referenced", not pinned forever.)
+     */
+    load?: "eager" | "lazy";
+    /** Notified when the underlying subscription errors; the collection always leaves `loading` regardless. */
+    onError?: (error: SubscriptionError) => void;
+    /** When set, the collection stays empty until {@link LunoraCollectionOptions.scope} points it at args (sharded). */
+    scopeBy?: string;
+
+    /** A replication shape as the sync source (partial replication). Mutually exclusive with {@link LunoraCollectionConfig.list}. */
+    shape?: ShapeSource;
+
+    /**
+     * Routes the `list` subscription — and the confirmed-mutation watermark its
+     * data/`settled` frames advance the checkpoint gate from — to a specific
+     * shard's DO. Applies to the `list` source; a `shape` carries its own
+     * {@link ShapeSource.shardKey}. Without it the list path falls back to the
+     * default ("") watermark bucket, which must not be compared against a
+     * per-shard mutator's sequence line (it would drop a sharded overlay early or
+     * hang it forever).
+     */
+    shardKey?: string;
+}
+
+/** The result of {@link lunoraCollectionOptions}: a TanStack collection config plus its sync controls. */
+export interface LunoraCollectionOptions<TRow extends Row> {
+    /** Resolves optimistic-overlay drops against the server's confirmed watermarks. */
+    checkpoints: CheckpointRegistry;
+    /** Pass to TanStack's `createCollection`. */
+    config: CollectionConfig<TRow, string>;
+    /** Re-point a `scopeBy` collection's subscription (omit `args` to detach). No-op for unscoped collections. */
+    scope: (args?: Record<string, unknown>) => void;
+}
+
+/**
+ * Build a TanStack DB collection config (+ sync controls) that live-syncs a
+ * Lunora `list` query through the client. This is the reusable core lifted out of
+ * {@link import("./define-collections").defineCollections}: the same `makeDiffEmit`
+ * diff-into-channel, `autoIndex:"eager"` + B-tree indexes, scoped-resubscribe, and
+ * fail-safe `markReady`-on-error behavior, exposed as a standalone
+ * collection-options creator so apps (and codegen) can compose it directly.
+ *
+ * The returned `checkpoints` registry lets a mutator runtime resolve optimistic
+ * overlays against confirmed server watermarks (see {@link CheckpointRegistry}).
+ */
+export const lunoraCollectionOptions = <TRow extends Row>(options: LunoraCollectionConfig<TRow>): LunoraCollectionOptions<TRow> => {
+    if ((options.list === undefined) === (options.shape === undefined)) {
+        throw new LunoraError("INTERNAL", "lunoraCollectionOptions: pass exactly one of `list` or `shape`");
+    }
+
+    const getKey = options.getKey ?? ((row: TRow) => row._id);
+    const checkpoints = createCheckpointRegistry();
+    // JSON-serialized form of each last-synced row, keyed by row id — the
+    // `makeDiffEmit` base for one sync session. Owned outside `sync.sync` only so
+    // `scope(...)` can reach the live `emit`; it is CLEARED in the sync cleanup
+    // (below), because TanStack drops its own synced store on gc cleanup, so a
+    // sync restart begins from an empty store and must re-insert the full
+    // snapshot. A stale cache here would diff the re-delivered snapshot down to
+    // zero writes and leave the collection permanently empty.
+    const syncedJson = new Map<string, string>();
+
+    // Mutable sync handles, populated when TanStack calls the `sync` closure and
+    // driven by `scope(...)` from outside it.
+    let emit: ((next: Map<string, TRow>) => void) | undefined;
+    let unsubscribe: (() => void) | undefined;
+    let onErrorHandler: ((error: SubscriptionError) => void) | undefined;
+    // The last scope args a `scopeBy` collection was pointed at. Remembered here
+    // (outside `sync.sync`) so a sync restart after gc cleanup re-opens the same
+    // scope instead of remounting empty, and so a `scope(...)` issued before sync
+    // starts (while `emit` is undefined) is applied once sync begins.
+    let scopedArgs: Record<string, unknown> | undefined;
+
+    // Open the underlying sync source — a full-table `list` query subscription or
+    // a replication-`shape` poke subscription — with one uniform callback shape.
+    // `onReady` is invoked on the first rowset so the collection leaves `loading`.
+    const openSubscription = (args: Record<string, unknown>, onReady: (() => void) | undefined): (() => void) => {
+        // Typed `unknown` so the one callback satisfies both sync sources: a `list`
+        // query's `(data: ReturnOf<F>)` and a shape's `(rows: Record<string, unknown>[])`.
+        const onRows = (data: unknown): void => {
+            emit?.(toMap(data as TRow[], getKey));
+            onReady?.();
+
+            // The shape path resolves the registry from the poke `checkpoint`,
+            // and the list path resolves it from the `onCheckpoint` watermark a
+            // `settled` frame forwards (both wired below). A `list` *data* frame
+            // carries no per-frame watermark, so advance from the client's
+            // server-confirmed custom-mutator watermark (the push-ack stream) as
+            // synced rows land — a `bindMutators` optimistic overlay then drops
+            // exactly when the server rows arrive instead of `awaitMutationId`
+            // hanging forever after the write is accepted.
+            if (options.shape === undefined) {
+                checkpoints.resolve({ mutationId: options.client.confirmedMutationWatermark(options.shardKey) });
+            }
+        };
+        const onError = (error: SubscriptionError): void => onErrorHandler?.(error);
+
+        // Advance the registry as the source syncs, so a mutator runtime can drop
+        // optimistic overlays once the server's rows (or a `settled` no-change
+        // acknowledgement) have landed. Both paths forward the same watermark
+        // shape, so the handler is identical.
+        const onCheckpoint = (watermark: { checkpoint?: number; mutationId?: number }): void => {
+            checkpoints.resolve(watermark);
+        };
+
+        if (options.shape !== undefined) {
+            return options.client.subscribeShape({ args, name: options.shape.name }, onRows, {
+                onCheckpoint,
+                onError,
+                shardKey: options.shape.shardKey,
+            });
+        }
+
+        return options.client.subscribe(options.list as FunctionReference, args, onRows, { onCheckpoint, onError, shardKey: options.shardKey });
+    };
+
+    const config: CollectionConfig<TRow, string> = {
+        // Auto-build ordered (B-tree) indexes for whatever the app's live queries
+        // join / filter / sort on, so they stay fast as the dataset grows.
+        autoIndex: "eager",
+        defaultIndexType: BTreeIndex,
+        getKey,
+        id: options.id ?? options.list?.__lunoraRef ?? `shape:${options.shape?.name ?? ""}`,
+        // `"eager"` syncs at creation; omitted otherwise so the wire stays
+        // byte-identical to the lazy default (sync on first subscriber).
+        ...(options.load === "eager" ? { startSync: true } : {}),
+        sync: {
+            sync: (writer) => {
+                emit = makeDiffEmit<TRow>(syncedJson, writer);
+
+                // Surface a subscription error and move the collection out of
+                // `loading`, so a rejected subscription never hangs it forever.
+                const onError = (error: SubscriptionError): void => {
+                    writer.markReady();
+                    options.onError?.(error);
+                };
+
+                onErrorHandler = onError;
+
+                if (options.scopeBy === undefined) {
+                    // A shape's own `args` select its partition up front; a `list`
+                    // syncs the whole table (empty args).
+                    unsubscribe = openSubscription(options.shape?.args ?? {}, () => {
+                        writer.markReady();
+                    });
+                } else {
+                    // Scoped collection: empty until `scope(args)` points it.
+                    writer.markReady();
+
+                    // Re-open the last scope on a sync (re)start — e.g. after gc
+                    // cleanup tore the previous session down, or when `scope(...)`
+                    // ran before sync first started. `emit` was assigned just
+                    // above, so the source's initial frame syncs in instead of
+                    // being dropped; without this a gc'd scoped collection would
+                    // remount permanently empty.
+                    if (scopedArgs !== undefined) {
+                        unsubscribe = openSubscription(scopedArgs, undefined);
+                    }
+                }
+
+                return () => {
+                    emit = undefined;
+                    onErrorHandler = undefined;
+                    unsubscribe?.();
+                    unsubscribe = undefined;
+                    // Reset the diff base: TanStack drops its synced store on gc
+                    // cleanup, so the next sync restart must re-insert the full
+                    // snapshot rather than diff it against a stale cache (which
+                    // would leave the restarted collection empty).
+                    syncedJson.clear();
+                };
+            },
+        },
+    };
+
+    const scope = (args?: Record<string, unknown>): void => {
+        if (options.scopeBy === undefined) {
+            return;
+        }
+
+        // Remember the target so a later sync (re)start re-opens it.
+        scopedArgs = args;
+
+        unsubscribe?.();
+        unsubscribe = undefined;
+        // Clear the previous scope's rows from the synced view.
+        emit?.(new Map());
+
+        if (args === undefined) {
+            return;
+        }
+
+        // Only open now if sync is live (`emit` assigned). When `scope(...)` runs
+        // before TanStack first invokes `sync.sync` — or after a gc cleanup — the
+        // subscription is deferred to the sync (re)start, where `emit` exists, so
+        // the source's initial frame is emitted instead of dropped by `emit?.()`.
+        if (emit !== undefined) {
+            unsubscribe = openSubscription(args, undefined);
+        }
+    };
+
+    return { checkpoints, config, scope };
+};

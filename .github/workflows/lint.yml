@@ -23,6 +23,7 @@
         "runs-on": "ubuntu-latest"
         "timeout-minutes": 5
         "outputs":
+            "api_surface": "${{ steps.changes.outputs.api_surface }}"
             "frontend_lintable": "${{ steps.changes.outputs.frontend_lintable }}"
             "package_json_lintable": "${{ steps.changes.outputs.package_json_lintable }}"
             "yaml_lintable": "${{ steps.changes.outputs.yaml_lintable }}"
@@ -85,13 +86,15 @@
 
     # tsc over the affected graph plus the registry typecheck, split from eslint
     # into its own required check. registry/ isn't a vis project; it imports
-    # @lunora/* and is typechecked against the full built dist. Both tsc
-    # invocations read the built dist without mutating it, so they run
-    # concurrently via the `parallel:` step group.
+    # @lunora/* and is typechecked against the full built dist.
     #
-    # NOTE: lint:affected:types is a `vis affected` invocation; lint:types:registry
-    # is a plain tsc. If the .vis/ cache lock ever surfaces as flaky errors, make
-    # these sequential steps instead of a parallel group.
+    # These run SEQUENTIALLY, not in a parallel group: `lint:types:registry`
+    # begins with `build:packages` (a full `vis run build`), which packem starts
+    # by *cleaning* each package's `dist/`. Run concurrently with `lint:affected:types`,
+    # that clean window races the affected typecheck's tsc as it reads a dependency's
+    # dist — intermittently dropping a freshly-removed declaration (e.g.
+    # `@lunora/auth/dist/plugins-client.d.ts`) and failing with TS2307 on an
+    # affected example. Serializing removes the concurrent reader during the rebuild.
     "types":
         "name": "Lint (types)"
         "if": "needs.files-changed.outputs.frontend_lintable == 'true'"
@@ -123,12 +126,13 @@
             - "name": "Build affected packages"
               "run": "pnpm run build:affected:packages"
 
-            - "parallel":
-                  - "name": "Typecheck"
-                    "run": "pnpm run lint:affected:types"
+            - "name": "Typecheck"
+              "run": "pnpm run lint:affected:types"
 
-                  - "name": "Typecheck registry items"
-                    "run": "pnpm run lint:types:registry"
+            # Sequential (not parallel) with the step above: its `build:packages`
+            # rebuild cleans each package's dist, which races a concurrent tsc read.
+            - "name": "Typecheck registry items"
+              "run": "pnpm run lint:types:registry"
 
     # fallow codebase-intelligence over the affected graph. `health` is a report
     # (prints each project's score, exits 0) — it surfaces dead code / dupes /
@@ -170,6 +174,43 @@
             - "name": "Run fallow health"
               "continue-on-error": true
               "run": "pnpm run fallow:affected:health"
+
+    # Public-API snapshot guard: rebuild every package's dist and re-extract the
+    # covered public API surface, failing on any drift from the committed
+    # api-snapshots/*.api.md. A breaking change to a covered package's exports
+    # must land with an explicit snapshot update (`pnpm run api:update`). Builds
+    # all packages (not affected-only) so the check runs deterministically.
+    "api-surface":
+        "name": "Lint (api surface)"
+        "if": "needs.files-changed.outputs.api_surface == 'true'"
+        "needs": "files-changed"
+        "runs-on": "ubuntu-latest"
+        "timeout-minutes": 30
+        "steps":
+            - "name": "Harden Runner"
+              "uses": "step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411" # v2.19.4
+              "with":
+                  "egress-policy": "audit"
+
+            - "name": "Git checkout"
+              "uses": "anolilab/workflows/step/checkout-with-retry@6c16895f4c3b5273b373656988505d1a8264e78b" # main
+
+            - "name": "Setup resources and environment"
+              "uses": "anolilab/workflows/step/node@acba5fb15ac98ad23dec1ad233e40e1bb79c1dae" # v19.0.4
+              "with":
+                  "node-version": "22.15"
+                  "cache-prefix": "lint"
+                  "install-node-gyp": "true"
+                  "skip-playwright": "true"
+                  "enable-nx-cache": "false"
+                  "run-npm-audit": "false"
+                  "run-signatures-audit": "false"
+
+            - "name": "Build packages"
+              "run": "pnpm run build:packages"
+
+            - "name": "Check public API snapshots"
+              "run": "pnpm run api:check"
 
     "prettier":
         "name": "Lint (prettier)"
@@ -285,7 +326,7 @@
     # Single required check for the Lint workflow.
     "lint-required-check":
         "name": "Check Lint Run"
-        "needs": ["files-changed", "eslint", "types", "fallow", "prettier", "package-json-sort", "secrets", "yaml-lint"]
+        "needs": ["files-changed", "eslint", "types", "fallow", "api-surface", "prettier", "package-json-sort", "secrets", "yaml-lint"]
         "if": "always()"
         "runs-on": "ubuntu-latest"
         "timeout-minutes": 5

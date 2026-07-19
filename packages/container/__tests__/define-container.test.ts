@@ -87,10 +87,56 @@ describe(defineContainer, () => {
         expect(() => defineContainer({ env: { API_KEY: "fallback" }, image: "./app", secrets: ["API_KEY"] })).toThrow("both `env` and `secrets`");
     });
 
+    it("accepts a secretsStore env → binding map", () => {
+        expect.assertions(1);
+
+        const definition = defineContainer({ image: "./app", secretsStore: { STRIPE_KEY: "STRIPE_SECRET" } });
+
+        expect(definition.secretsStore).toStrictEqual({ STRIPE_KEY: "STRIPE_SECRET" });
+    });
+
+    it("rejects an invalid secretsStore env name", () => {
+        expect.assertions(1);
+
+        expect(() => defineContainer({ image: "./app", secretsStore: { "NOT-VALID": "STRIPE_SECRET" } })).toThrow("not a valid environment variable name");
+    });
+
+    it("rejects an empty secretsStore binding name", () => {
+        expect.assertions(1);
+
+        expect(() => defineContainer({ image: "./app", secretsStore: { STRIPE_KEY: "  " } })).toThrow("non-empty Secrets Store binding name");
+    });
+
+    it("rejects a name declared in both secretsStore and env/secrets", () => {
+        expect.assertions(2);
+
+        expect(() => defineContainer({ env: { API_KEY: "x" }, image: "./app", secretsStore: { API_KEY: "API_SECRET" } })).toThrow(
+            "both `secretsStore` and `env`/`secrets`",
+        );
+        expect(() => defineContainer({ image: "./app", secrets: ["API_KEY"], secretsStore: { API_KEY: "API_SECRET" } })).toThrow(
+            "both `secretsStore` and `env`/`secrets`",
+        );
+    });
+
     it("rejects an invalid sleepAfter string", () => {
         expect.assertions(1);
 
         expect(() => defineContainer({ image: "./app", sleepAfter: "5 minutes" })).toThrow("`sleepAfter`");
+    });
+
+    it("rejects a non-positive, fractional, or NaN numeric sleepAfter", () => {
+        expect.assertions(4);
+
+        expect(() => defineContainer({ image: "./app", sleepAfter: 0 })).toThrow("`sleepAfter` must be a positive integer");
+        expect(() => defineContainer({ image: "./app", sleepAfter: -30 })).toThrow("`sleepAfter` must be a positive integer");
+        expect(() => defineContainer({ image: "./app", sleepAfter: 1.5 })).toThrow("`sleepAfter` must be a positive integer");
+        expect(() => defineContainer({ image: "./app", sleepAfter: Number.NaN })).toThrow("`sleepAfter` must be a positive integer");
+    });
+
+    it("accepts a positive integer sleepAfter", () => {
+        expect.assertions(1);
+
+        expect(defineContainer({ image: "./app", sleepAfter: 30 }).sleepAfter).toBe(30);
     });
 
     it("accepts a Railpack { build } image source", () => {

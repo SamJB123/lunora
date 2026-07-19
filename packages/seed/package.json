@@ -1,6 +1,6 @@
 {
     "name": "@lunora/seed",
-    "version": "1.0.0-alpha.5",
+    "version": "1.0.0-alpha.26",
     "description": "Schema-driven, deterministic database seeding for Lunora: realistic fake data from defineSchema",
     "keywords": [
         "cloudflare",
@@ -51,8 +51,8 @@
         "build:prod": "pnpm exec packem build --production",
         "lint:eslint": "eslint .",
         "lint:eslint:fix": "eslint . --fix",
-        "lint:prettier": "prettier --check .",
-        "lint:prettier:fix": "prettier --write .",
+        "lint:prettier": "prettier --check . --ignore-path ../../.prettierignore",
+        "lint:prettier:fix": "prettier --write . --ignore-path ../../.prettierignore",
         "lint:types": "tsc --noEmit",
         "test": "vitest run",
         "test:coverage": "vitest run --coverage",
@@ -61,12 +61,13 @@
         "fallow:health": "fallow health --score"
     },
     "dependencies": {
-        "@faker-js/faker": "catalog:data"
+        "@faker-js/faker": "catalog:data",
+        "@lunora/errors": "1.0.0-alpha.5"
     },
     "devDependencies": {
-        "@lunora/server": "1.0.0-alpha.5",
-        "@lunora/testing": "1.0.0-alpha.8",
-        "@lunora/values": "1.0.0-alpha.3",
+        "@lunora/server": "1.0.0-alpha.27",
+        "@lunora/testing": "1.0.0-alpha.45",
+        "@lunora/values": "1.0.0-alpha.8",
         "@types/node": "catalog:types",
         "@visulima/packem": "catalog:build",
         "@vitest/coverage-v8": "catalog:test",
@@ -76,8 +77,8 @@
         "vitest": "catalog:test"
     },
     "peerDependencies": {
-        "@lunora/server": "1.0.0-alpha.5",
-        "@lunora/values": "1.0.0-alpha.3"
+        "@lunora/server": ">=1.0.0-alpha.24 <2.0.0-0",
+        "@lunora/values": ">=1.0.0-alpha.7 <2.0.0-0"
     },
     "engines": {
         "node": "^22.15.0 || >=24.11.0"

@@ -1,3 +1,4 @@
+import { toErrorBody } from "@lunora/errors";
 import type { Infer, Validator, ValidatorKind } from "@lunora/values";
 import { ValidationError } from "@lunora/values";
 import type { Context } from "hono";
@@ -19,7 +20,7 @@ type HttpMethod = "DELETE" | "GET" | "HEAD" | "OPTIONS" | "PATCH" | "POST" | "PU
  * `runAction`, which forward to the owning shard.
  */
 // eslint-disable-next-line unicorn/prevent-abbreviations -- public API name re-exported by src/index.ts; renaming would break consumers
-type HttpActionCtx = Pick<ActionContext, "auth" | "fetch" | "runAction" | "runMutation" | "runQuery">;
+type HttpActionCtx = Pick<ActionContext, "auth" | "cache" | "fetch" | "runAction" | "runMutation" | "runQuery">;
 
 /** A raw handler wrapped by {@link httpAction}. Receives the raw request, returns the raw response. */
 type HttpActionHandler = (context: HttpActionCtx, request: Request) => Promise<Response> | Response;
@@ -105,6 +106,7 @@ interface HttpRouteHandlerOptions<SearchParams extends ArgsValidator, Body exten
  * handler receives. There is no parsed `body` — streams are typically GET, and
  * the raw `request` is exposed if a handler needs to read the body itself.
  * `signal` is tripped when the client disconnects.
+ * @experimental Part of the HTTP-SSE stream surface; reconnect/POST-body design questions are still open.
  */
 interface HttpStreamHandlerOptions<SearchParams extends ArgsValidator, Params extends ArgsValidator> {
     ctx: HttpActionCtx;
@@ -130,6 +132,18 @@ interface HttpStreamHandlerOptions<SearchParams extends ArgsValidator, Params ex
  */
 interface HttpRouteBuilder<SearchParams extends ArgsValidator, Body extends ArgsValidator, Params extends ArgsValidator, Output = undefined> {
     body: <B extends ArgsValidator>(validators: B) => HttpRouteBuilder<SearchParams, B & Body, Params, Output>;
+
+    /**
+     * Attach a `Cache-Control` header to the response. Only meaningful when
+     * Workers Cache is enabled in `wrangler.jsonc` (`"cache": { "enabled": true }`).
+     */
+    cacheControl: (value: string) => HttpRouteBuilder<SearchParams, Body, Params, Output>;
+
+    /**
+     * Attach a `Cache-Tag` header to the response for tag-based purging via
+     * `ctx.cache.purge({ tags: [...] })`.
+     */
+    cacheTag: (value: string) => HttpRouteBuilder<SearchParams, Body, Params, Output>;
     handler: [Output] extends [undefined]
         ? <R>(handler: (options: HttpRouteHandlerOptions<SearchParams, Body, Params>) => Promise<R> | R) => LunoraRouteHandler
         : (handler: (options: HttpRouteHandlerOptions<SearchParams, Body, Params>) => Output | Promise<Output>) => LunoraRouteHandler;
@@ -145,8 +159,15 @@ interface HttpRouteBuilder<SearchParams extends ArgsValidator, Body extends Args
      * throw, an `event: error` frame is written with `{code, message}` before
      * the stream closes. The chunks are JSON-encoded; `R` is inferred from the
      * handler's yielded type.
+     * @experimental Reconnect/POST-body/wire-fidelity design questions are still open, so the shape may change.
      */
     stream: <R>(handler: (options: HttpStreamHandlerOptions<SearchParams, Params>) => AsyncGenerator<R, void, void> | AsyncIterable<R>) => LunoraRouteHandler;
+
+    /**
+     * Attach a `Vary` header to the response so Cloudflare stores separate
+     * cached variants per distinct value of the listed request headers.
+     */
+    vary: (value: string) => HttpRouteBuilder<SearchParams, Body, Params, Output>;
 }
 
 /** Opens a fresh {@link HttpRouteBuilder}. The `path` documents intent; hono owns the actual routing at mount. */
@@ -166,11 +187,14 @@ interface HttpRoute {
 /** Accumulated route state threaded through the chain. */
 interface RouteState {
     body: ArgsValidator;
+    cacheControl?: string;
+    cacheTag?: string;
     method: HttpMethod;
     output?: Validator;
     params: ArgsValidator;
     path: string;
     searchParams: ArgsValidator;
+    vary?: string;
 }
 
 /** Internal view exposing `_meta.inner` so search-param coercion can read the wrapped validator. */
@@ -330,7 +354,14 @@ const errorResponse = (error: unknown): Response => {
     }
 
     if (error instanceof LunoraError) {
-        return Response.json({ code: error.code, error: error.message }, { status: error.status });
+        const { body, redacted, status } = toErrorBody(error, { fallbackCode: "INTERNAL_SERVER_ERROR", redactedMessage: "Internal error" });
+
+        if (redacted) {
+            // eslint-disable-next-line no-console -- log internal errors server-side; never echo raw details to the client
+            console.error("[lunora] http action error (redacted on the wire):", error);
+        }
+
+        return Response.json({ code: body.code, error: body.message }, { status });
     }
 
     throw error;
@@ -353,8 +384,28 @@ const buildRouteHandler =
             const result = await userHandler({ body, ctx: context, params, searchParams });
             const payload = state.output ? applyOutput(state.output, result) : result;
 
-            // eslint-disable-next-line unicorn/no-null -- Response body must be `null` for an empty 204 (the Fetch API rejects `undefined`)
-            return payload === undefined ? new Response(null, { status: 204 }) : Response.json(payload);
+            const headers: Record<string, string> = {};
+
+            if (state.cacheControl) {
+                headers["cache-control"] = state.cacheControl;
+            }
+
+            if (state.cacheTag) {
+                headers["cache-tag"] = state.cacheTag;
+            }
+
+            if (state.vary) {
+                headers.vary = state.vary;
+            }
+
+            const hasCacheHeaders = Object.keys(headers).length > 0;
+
+            if (payload === undefined) {
+                // eslint-disable-next-line unicorn/no-null -- Response body must be `null` for an empty 204 (the Fetch API rejects `undefined`)
+                return new Response(null, { headers: hasCacheHeaders ? headers : undefined, status: 204 });
+            }
+
+            return Response.json(payload, { headers: hasCacheHeaders ? headers : undefined });
         } catch (error: unknown) {
             return errorResponse(error);
         }
@@ -367,24 +418,6 @@ type LooseStreamHandler = (options: {
     searchParams: Record<string, unknown>;
     signal: AbortSignal;
 }) => AsyncGenerator<unknown, void, void> | AsyncIterable<unknown>;
-
-/**
- * Structural match for a {@link LunoraError} that survives cross-package class
- * identity. A handler may throw a `LunoraError` minted by a different copy of
- * `@lunora/server` (duplicated in the dep graph), so `instanceof` is unreliable
- * — key off the public shape (`name === "LunoraError"` + string `code`) the way
- * `@lunora/runtime`'s `toErrorResponse` does. Only such known-safe errors get
- * their `code`/`message` echoed to the client.
- */
-const isLunoraErrorLike = (error: unknown): error is { code: string; message: string } => {
-    if (!error || typeof error !== "object") {
-        return false;
-    }
-
-    const candidate = error as { code?: unknown; message?: unknown; name?: unknown };
-
-    return candidate.name === "LunoraError" && typeof candidate.code === "string" && typeof candidate.message === "string";
-};
 
 /**
  * Format one SSE frame. Each frame ends with `\n\n`, the spec-required
@@ -473,22 +506,20 @@ const buildStreamHandler =
 
                     controller.enqueue(encoder.encode(sseFrame({}, "complete")));
                 } catch (error: unknown) {
-                    // Mirror `@lunora/runtime`'s `toErrorResponse` policy: only a
-                    // known-safe LunoraError-shaped value gets its `code`/`message`
-                    // echoed to the client. Everything else (which may carry stack
-                    // traces, file paths, or internal identifiers in `.message`) is
-                    // logged server-side and replaced with a generic frame.
-                    let payload: { code: string; message: string };
+                    // Mirror the shared `toErrorBody` redaction policy: only a
+                    // non-internal LunoraError-shaped value gets its `code`/`message`
+                    // echoed to the client. An internal-coded or unrecognized throw
+                    // (which may carry stack traces, file paths, or internal
+                    // identifiers in `.message`) is logged server-side and replaced
+                    // with a generic frame.
+                    const { body, redacted } = toErrorBody(error, { fallbackCode: "INTERNAL_SERVER_ERROR", redactedMessage: "Internal error" });
 
-                    if (isLunoraErrorLike(error)) {
-                        payload = { code: error.code, message: error.message };
-                    } else {
+                    if (redacted) {
                         // eslint-disable-next-line no-console -- log internal errors server-side; never echo raw details to the client
                         console.error("[lunora] unhandled stream handler error:", error);
-                        payload = { code: "INTERNAL_SERVER_ERROR", message: "Internal error" };
                     }
 
-                    controller.enqueue(encoder.encode(sseFrame(payload, "error")));
+                    controller.enqueue(encoder.encode(sseFrame({ code: body.code, message: body.message }, "error")));
                 } finally {
                     request.signal.removeEventListener("abort", onAbort);
                     controller.close();
@@ -496,25 +527,32 @@ const buildStreamHandler =
             },
         });
 
-        return new Response(stream, {
-            headers: {
-                "cache-control": "no-cache, no-transform",
-                "content-type": "text/event-stream; charset=utf-8",
-                // Hint to proxies (including Cloudflare's own buffering layer)
-                // that this response must not be coalesced.
-                "x-accel-buffering": "no",
-            },
-        });
+        const headers: Record<string, string> = {
+            // SSE responses must stay uncacheable so proxies don't buffer or
+            // coalesce live frames. `cacheControl()` is intentionally ignored
+            // for stream() routes; `cacheTag`/`vary` are also omitted because
+            // they only make sense alongside a cacheable response.
+            "cache-control": "no-cache, no-transform",
+            "content-type": "text/event-stream; charset=utf-8",
+            // Hint to proxies (including Cloudflare's own buffering layer)
+            // that this response must not be coalesced.
+            "x-accel-buffering": "no",
+        };
+
+        return new Response(stream, { headers });
     };
 
 const makeRouteBuilder = (state: RouteState): Record<string, unknown> => {
     return {
         body: (validators: ArgsValidator) => makeRouteBuilder({ ...state, body: { ...state.body, ...validators } }),
+        cacheControl: (value: string) => makeRouteBuilder({ ...state, cacheControl: value }),
+        cacheTag: (value: string) => makeRouteBuilder({ ...state, cacheTag: value }),
         handler: (userHandler: LooseHandler): LunoraRouteHandler => buildRouteHandler(state, userHandler),
         output: (validator: Validator) => makeRouteBuilder({ ...state, output: validator }),
         params: (validators: ArgsValidator) => makeRouteBuilder({ ...state, params: { ...state.params, ...validators } }),
         searchParams: (validators: ArgsValidator) => makeRouteBuilder({ ...state, searchParams: { ...state.searchParams, ...validators } }),
         stream: (userHandler: LooseStreamHandler): LunoraRouteHandler => buildStreamHandler(state, userHandler),
+        vary: (value: string) => makeRouteBuilder({ ...state, vary: value }),
     };
 };
 
@@ -611,7 +649,9 @@ const toHttpEtag = (etag: string): string => {
  * True when `value` is safe to use as an HTTP header field-value: no CR, LF, or
  * NUL. Guards against response-header injection / `Headers`-construction throws
  * when reflecting attacker-influenced object metadata (e.g. a stored
- * `Content-Type`).
+ * `Content-Type`). Exported (see the `export {}` at the file end) so an `httpAction`
+ * handler can guard a request-derived header value before writing it — the fix the
+ * `http_action_response_header_injection` advisor lint points to.
  */
 const isSafeHeaderValue = (value: string): boolean => {
     for (let index = 0; index < value.length; index += 1) {
@@ -776,7 +816,7 @@ const serveStorageObject = async (context: ContextWithStorage, key: string, requ
     });
 };
 
-export { httpAction, httpRoute, httpRouter, serveStorageObject };
+export { httpAction, httpRoute, httpRouter, isSafeHeaderValue, serveStorageObject };
 
 export type {
     HttpActionCtx,

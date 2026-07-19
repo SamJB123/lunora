@@ -9,6 +9,8 @@
  * Import from `@lunora/mail/testing` (a dev/test-only entry — it pulls in
  * nothing from the runtime bundle, just `fetch`).
  */
+import { LunoraError } from "@lunora/errors";
+
 import type { CapturedMail } from "./capture-transport";
 
 /** Reserved admin RPC path that reads the captured-mail inbox from the root shard. */
@@ -67,7 +69,7 @@ const listCapturedMail = async (options: InboxOptions): Promise<CapturedMail[]> 
     });
 
     if (!response.ok) {
-        throw new Error(`@lunora/mail/testing: getCapturedMail failed (HTTP ${String(response.status)})`);
+        throw new LunoraError("INTERNAL", `@lunora/mail/testing: getCapturedMail failed (HTTP ${String(response.status)})`);
     }
 
     const body = (await response.json()) as { result?: { entries?: CapturedMail[] } };
@@ -97,7 +99,8 @@ const waitForMail = async (options: WaitForMailOptions): Promise<CapturedMail> =
         }
 
         if (Date.now() >= deadline) {
-            throw new Error(
+            throw new LunoraError(
+                "INTERNAL",
                 `@lunora/mail/testing: no mail to "${options.to}"${options.subjectMatch === undefined ? "" : ` matching "${options.subjectMatch}"`} within ${String(timeoutMs)}ms`,
             );
         }
@@ -109,6 +112,18 @@ const waitForMail = async (options: WaitForMailOptions): Promise<CapturedMail> =
 
 // http(s) URL up to the first whitespace, quote, or angle bracket.
 const URL_PATTERN = /https?:\/\/[^\s"'<>)]+/g;
+
+/** Ampersand entity (named + numeric decimal/hex forms) an HTML renderer escapes `&amp;` to. */
+const AMPERSAND_ENTITY = /&(?:amp|#0*38|#x0*26);/giu;
+
+/**
+ * Decode the ampersand entity in an extracted URL. `@react-email/render` (the
+ * package's own render path) escapes `&amp;` as `&amp;` inside `href` attributes, so
+ * a multi-query-param link (`?uid=1&amp;token=abc`) is captured as
+ * `?uid=1&amp;token=abc` — following it would send a param literally named
+ * `amp;token`. Text bodies are not entity-escaped, so this only affects html.
+ */
+const decodeUrlEntities = (url: string): string => url.replaceAll(AMPERSAND_ENTITY, "&");
 
 /**
  * Pull the first link out of a captured message — html first, then text. Pass
@@ -125,11 +140,14 @@ const extractLink = (mail: CapturedMail, options: { match?: string } = {}): stri
         const link = matches.find((candidate) => options.match === undefined || candidate.includes(options.match));
 
         if (link !== undefined) {
-            return link;
+            return decodeUrlEntities(link);
         }
     }
 
-    throw new Error(`@lunora/mail/testing: no link${options.match === undefined ? "" : ` containing "${options.match}"`} found in the captured message`);
+    throw new LunoraError(
+        "INTERNAL",
+        `@lunora/mail/testing: no link${options.match === undefined ? "" : ` containing "${options.match}"`} found in the captured message`,
+    );
 };
 
 export { extractLink, listCapturedMail, waitForMail };

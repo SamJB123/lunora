@@ -75,6 +75,99 @@ describe("lunora env", () => {
             expect(listed).not.toContain("supersecret-value");
         });
 
+        it("set preserves comments, blank lines, and untouched entries verbatim", async () => {
+            expect.assertions(5);
+
+            const original = ["# Auth secrets", 'AUTH_SECRET="scaffolded"', "", "# provider key (from dashboard)", "RESEND_API_KEY=re_123", ""].join("\n");
+
+            writeFileSync(join(workdir, ".dev.vars"), original, "utf8");
+
+            const { logger } = recordingLogger();
+
+            await runEnvCommand({ cwd: workdir, key: "AUTH_SECRET", logger, subcommand: "set", value: "updated" });
+
+            const file = readFileSync(join(workdir, ".dev.vars"), "utf8");
+
+            // Comments and blank lines survive.
+            expect(file).toContain("# Auth secrets");
+            expect(file).toContain("# provider key (from dashboard)");
+            // The targeted key is updated in place.
+            expect(file).toContain('AUTH_SECRET="updated"');
+            // Untouched entries keep their exact original (unquoted) text.
+            expect(file).toContain("RESEND_API_KEY=re_123");
+            expect(file).not.toContain('AUTH_SECRET="scaffolded"');
+        });
+
+        it("set appends a new key without disturbing existing comments", async () => {
+            expect.assertions(3);
+
+            writeFileSync(join(workdir, ".dev.vars"), "# heading\nEXISTING=1\n", "utf8");
+
+            const { logger } = recordingLogger();
+
+            await runEnvCommand({ cwd: workdir, key: "NEW_KEY", logger, subcommand: "set", value: "v" });
+
+            const file = readFileSync(join(workdir, ".dev.vars"), "utf8");
+
+            expect(file).toContain("# heading");
+            expect(file).toContain("EXISTING=1");
+            expect(file).toContain('NEW_KEY="v"');
+        });
+
+        it("set collapses duplicate KEY= lines to one, agreeing with the last-wins read", async () => {
+            expect.assertions(3);
+
+            // Two lines defining the same key — `parseDevVariableEntries` (the
+            // shared read path `env get`/`env list` build on) is last-wins, so
+            // before this fix a `set` that only rewrote the FIRST duplicate
+            // left the untouched second line still winning at read time: a
+            // `set` that silently didn't take effect.
+            writeFileSync(join(workdir, ".dev.vars"), 'DUPLICATE_KEY="first"\nOTHER=1\nDUPLICATE_KEY="second"\n', "utf8");
+
+            const { logger } = recordingLogger();
+
+            await runEnvCommand({ cwd: workdir, key: "DUPLICATE_KEY", logger, subcommand: "set", value: "updated" });
+
+            const file = readFileSync(join(workdir, ".dev.vars"), "utf8");
+            const matchingLines = file.split("\n").filter((line) => line.startsWith("DUPLICATE_KEY="));
+
+            // Exactly one line now defines the key, at its FIRST original position.
+            expect(matchingLines).toStrictEqual(['DUPLICATE_KEY="updated"']);
+            expect(file).toContain("OTHER=1");
+
+            // The read path agrees with what was just set.
+            const written: string[] = [];
+            const spy = vi.spyOn(process.stdout, "write").mockImplementation((chunk: unknown) => {
+                written.push(typeof chunk === "string" ? chunk : String(chunk));
+
+                return true;
+            });
+
+            try {
+                await runEnvCommand({ cwd: workdir, key: "DUPLICATE_KEY", logger, subcommand: "get" });
+
+                expect(written.join("")).toContain("updated");
+            } finally {
+                spy.mockRestore();
+            }
+        });
+
+        it("unset removes only the target line, preserving comments and other entries", async () => {
+            expect.assertions(3);
+
+            writeFileSync(join(workdir, ".dev.vars"), "# keep me\nA=1\nB=2\n", "utf8");
+
+            const { logger } = recordingLogger();
+
+            await runEnvCommand({ cwd: workdir, key: "A", logger, subcommand: "unset" });
+
+            const file = readFileSync(join(workdir, ".dev.vars"), "utf8");
+
+            expect(file).toContain("# keep me");
+            expect(file).not.toMatch(/^A=/mu);
+            expect(file).toContain("B=2");
+        });
+
         it("get prints the full value to stdout", async () => {
             expect.assertions(2);
 
@@ -230,6 +323,26 @@ describe("lunora env", () => {
             expect(calls[1]?.descriptor.input).toBe("two");
             // Sanity: no env leak.
             expect(calls[0]?.descriptor.env).toBeUndefined();
+        });
+
+        it("launches wrangler through npx when the project declares npm (secret stays on stdin)", async () => {
+            expect.assertions(4);
+
+            const { logger } = recordingLogger();
+
+            writeFileSync(join(workdir, ".dev.vars"), "FIRST=one\n", "utf8");
+            // `detectPackageManager` reads the nearest package.json's `packageManager`.
+            writeFileSync(join(workdir, "package.json"), `{ "packageManager": "npm@10.9.0" }\n`, "utf8");
+
+            const { calls, spawner } = createRecordingSpawner();
+
+            await runEnvCommand({ cwd: workdir, logger, spawner, subcommand: "push", yes: true });
+
+            expect(calls[0]?.descriptor.command).toBe("npx");
+            expect(calls[0]?.descriptor.args).toStrictEqual(["--", "wrangler", "secret", "put", "FIRST"]);
+            // The value still travels over stdin, never on argv.
+            expect(calls[0]?.descriptor.input).toBe("one");
+            expect(calls[0]?.descriptor.args).not.toContain("one");
         });
 
         it("push --prod adds --env production", async () => {

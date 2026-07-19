@@ -1,8 +1,97 @@
+## @lunora/server [1.0.0-alpha.27](https://github.com/anolilab/lunora/compare/%40lunora%2Fserver%401.0.0-alpha.26...%40lunora%2Fserver%401.0.0-alpha.27) (2026-07-19)
+
+## @lunora/server [1.0.0-alpha.26](https://github.com/anolilab/lunora/compare/%40lunora%2Fserver%401.0.0-alpha.25...%40lunora%2Fserver%401.0.0-alpha.26) (2026-07-18)
+
+## @lunora/server [1.0.0-alpha.25](https://github.com/anolilab/lunora/compare/%40lunora%2Fserver%401.0.0-alpha.24...%40lunora%2Fserver%401.0.0-alpha.25) (2026-07-17)
+
+
+### Dependencies
+
+* **@lunora/errors:** upgraded to 1.0.0-alpha.5
+* **@lunora/scheduler:** upgraded to 1.0.0-alpha.10
+* **@lunora/values:** upgraded to 1.0.0-alpha.8
+
+## @lunora/server [1.0.0-alpha.24](https://github.com/anolilab/lunora/compare/%40lunora%2Fserver%401.0.0-alpha.23...%40lunora%2Fserver%401.0.0-alpha.24) (2026-07-13)
+
+
+### Dependencies
+
+* **@lunora/scheduler:** upgraded to 1.0.0-alpha.9
+
+## @lunora/server [1.0.0-alpha.23](https://github.com/anolilab/lunora/compare/%40lunora%2Fserver%401.0.0-alpha.22...%40lunora%2Fserver%401.0.0-alpha.23) (2026-07-11)
+
+
+### Dependencies
+
+* **@lunora/errors:** upgraded to 1.0.0-alpha.4
+* **@lunora/scheduler:** upgraded to 1.0.0-alpha.8
+* **@lunora/values:** upgraded to 1.0.0-alpha.7
+
+## @lunora/server [1.0.0-alpha.22](https://github.com/anolilab/lunora/compare/%40lunora%2Fserver%401.0.0-alpha.21...%40lunora%2Fserver%401.0.0-alpha.22) (2026-07-10)
+
+## @lunora/server [1.0.0-alpha.21](https://github.com/anolilab/lunora/compare/%40lunora%2Fserver%401.0.0-alpha.20...%40lunora%2Fserver%401.0.0-alpha.21) (2026-07-08)
+
+
+### Dependencies
+
+* **@lunora/errors:** upgraded to 1.0.0-alpha.3
+* **@lunora/scheduler:** upgraded to 1.0.0-alpha.7
+* **@lunora/values:** upgraded to 1.0.0-alpha.6
+
+## @lunora/server [1.0.0-alpha.20](https://github.com/anolilab/lunora/compare/%40lunora%2Fserver%401.0.0-alpha.19...%40lunora%2Fserver%401.0.0-alpha.20) (2026-07-08)
+
+## @lunora/server [1.0.0-alpha.19](https://github.com/anolilab/lunora/compare/%40lunora%2Fserver%401.0.0-alpha.18...%40lunora%2Fserver%401.0.0-alpha.19) (2026-07-07)
+
+## @lunora/server [1.0.0-alpha.18](https://github.com/anolilab/lunora/compare/%40lunora%2Fserver%401.0.0-alpha.17...%40lunora%2Fserver%401.0.0-alpha.18) (2026-07-07)
+
+## @lunora/server [1.0.0-alpha.17](https://github.com/anolilab/lunora/compare/%40lunora%2Fserver%401.0.0-alpha.16...%40lunora%2Fserver%401.0.0-alpha.17) (2026-07-04)
+
+
+### Dependencies
+
+* **@lunora/errors:** upgraded to 1.0.0-alpha.2
+* **@lunora/scheduler:** upgraded to 1.0.0-alpha.6
+* **@lunora/values:** upgraded to 1.0.0-alpha.5
+
+## @lunora/server [1.0.0-alpha.16](https://github.com/anolilab/lunora/compare/%40lunora%2Fserver%401.0.0-alpha.15...%40lunora%2Fserver%401.0.0-alpha.16) (2026-07-04)
+
+## @lunora/server [1.0.0-alpha.15](https://github.com/anolilab/lunora/compare/%40lunora%2Fserver%401.0.0-alpha.14...%40lunora%2Fserver%401.0.0-alpha.15) (2026-07-03)
+
+## @lunora/server [1.0.0-alpha.14](https://github.com/anolilab/lunora/compare/%40lunora%2Fserver%401.0.0-alpha.13...%40lunora%2Fserver%401.0.0-alpha.14) (2026-07-03)
+
+
+### Dependencies
+
+* **@lunora/errors:** upgraded to 1.0.0-alpha.1
+* **@lunora/scheduler:** upgraded to 1.0.0-alpha.5
+* **@lunora/values:** upgraded to 1.0.0-alpha.4
+
+## @lunora/server [1.0.0-alpha.13](https://github.com/anolilab/lunora/compare/%40lunora%2Fserver%401.0.0-alpha.12...%40lunora%2Fserver%401.0.0-alpha.13) (2026-07-03)
+
+## @lunora/server [1.0.0-alpha.12](https://github.com/anolilab/lunora/compare/%40lunora%2Fserver%401.0.0-alpha.11...%40lunora%2Fserver%401.0.0-alpha.12) (2026-07-02)
+
+## @lunora/server [1.0.0-alpha.11](https://github.com/anolilab/lunora/compare/%40lunora%2Fserver%401.0.0-alpha.10...%40lunora%2Fserver%401.0.0-alpha.11) (2026-07-02)
+
+## @lunora/server [1.0.0-alpha.10](https://github.com/anolilab/lunora/compare/%40lunora%2Fserver%401.0.0-alpha.9...%40lunora%2Fserver%401.0.0-alpha.10) (2026-07-02)
+
+
+### Dependencies
+
+* **@lunora/scheduler:** upgraded to 1.0.0-alpha.4
+
+## @lunora/server [1.0.0-alpha.9](https://github.com/anolilab/lunora/compare/%40lunora%2Fserver%401.0.0-alpha.8...%40lunora%2Fserver%401.0.0-alpha.9) (2026-07-02)
+
+## @lunora/server [1.0.0-alpha.8](https://github.com/anolilab/lunora/compare/%40lunora%2Fserver%401.0.0-alpha.7...%40lunora%2Fserver%401.0.0-alpha.8) (2026-07-01)
+
+## @lunora/server [1.0.0-alpha.7](https://github.com/anolilab/lunora/compare/%40lunora%2Fserver%401.0.0-alpha.6...%40lunora%2Fserver%401.0.0-alpha.7) (2026-06-30)
+
+## @lunora/server [1.0.0-alpha.6](https://github.com/anolilab/lunora/compare/%40lunora%2Fserver%401.0.0-alpha.5...%40lunora%2Fserver%401.0.0-alpha.6) (2026-06-29)
+
 ## @lunora/server [1.0.0-alpha.5](https://github.com/anolilab/lunora/compare/@lunora/server@1.0.0-alpha.4...@lunora/server@1.0.0-alpha.5) (2026-06-27)
 
 ### Features
 
-* **queue:** add queues, pipelines, secrets bindings + studio queues page ([#30](https://github.com/anolilab/lunora/issues/30)) ([131460c](https://github.com/anolilab/lunora/commit/131460c5826f2ef600fa0ef81248ede91835dd0c)), closes [#29](https://github.com/anolilab/lunora/issues/29) [#31](https://github.com/anolilab/lunora/issues/31) [visulima#714](https://github.com/anolilab/visulima/issues/714)
+* **queue:** add queues, pipelines, secrets bindings + studio queues page ([#30](https://github.com/anolilab/lunora/issues/30)) ([131460c](https://github.com/anolilab/lunora/commit/131460c5826f2ef600fa0ef81248ede91835dd0c)), closes [#29](https://github.com/anolilab/lunora/issues/29) [#31](https://github.com/anolilab/lunora/issues/31) [visulima#714](https://github.com/visulima/visulima/issues/714)
 
 
 ### Dependencies

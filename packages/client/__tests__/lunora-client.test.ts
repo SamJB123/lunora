@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { decodeWire } from "../../../shared/wire-codec";
 import { isConflictError } from "../src/errors";
 import type { OptimisticUpdate } from "../src/local-store";
 import { LunoraClient } from "../src/lunora-client";
@@ -325,6 +326,97 @@ describe("lunoraClient", () => {
         });
     });
 
+    // --- Custom-mutator watermark ----------------------------------------------
+
+    describe("lunoraClient — callMutator watermark", () => {
+        it("sends the client id + seq and reports applied when the DO runs the push as next", async () => {
+            expect.assertions(4);
+
+            const fetchMock = vi.fn<typeof fetch>(async () => jsonResponse({ lastMutationId: 1, result: "ok" }));
+
+            const client = new LunoraClient({
+                clientId: "client-A",
+                fetch: fetchMock,
+                url: "https://app.example",
+                WebSocket: createMockWebSocket(),
+            });
+
+            const ack = await client.callMutator("messages:send", { text: "hi" }, { clientSeq: 1, shardKey: "room-1" });
+
+            expect(ack).toStrictEqual({ applied: true, result: "ok" });
+            expect(client.confirmedMutationWatermark("room-1")).toBe(1);
+
+            const headers = (fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].headers as Record<string, string>;
+
+            expect(headers["x-lunora-client-id"]).toBe("client-A");
+            expect(headers["x-lunora-client-seq"]).toBe("1");
+        });
+
+        it("reports applied=false and surfaces the echoed watermark when the DO swallows a stale push as a replay", async () => {
+            expect.assertions(2);
+
+            // The server's replay ack echoes its (higher) stored watermark with a
+            // null result — clientSeq 1 was already applied in a prior session.
+            const fetchMock = vi.fn<typeof fetch>(async () => jsonResponse({ lastMutationId: 5, result: null }));
+
+            const client = new LunoraClient({
+                clientId: "client-A",
+                fetch: fetchMock,
+                url: "https://app.example",
+                WebSocket: createMockWebSocket(),
+            });
+
+            const ack = await client.callMutator("messages:send", { text: "hi" }, { clientSeq: 1, shardKey: "room-1" });
+
+            expect(ack).toStrictEqual({ applied: false, result: null });
+            // The client now knows the real watermark, so the next seq can clear it.
+            expect(client.confirmedMutationWatermark("room-1")).toBe(5);
+        });
+
+        it("omits the seq header when no clientSeq is given so the push rides the idempotency path", async () => {
+            expect.assertions(3);
+
+            // No `lastMutationId` echo — a non-watermarked call the DO ran once.
+            const fetchMock = vi.fn<typeof fetch>(async () => jsonResponse({ result: "ok" }));
+
+            const client = new LunoraClient({
+                clientId: "client-A",
+                fetch: fetchMock,
+                url: "https://app.example",
+                WebSocket: createMockWebSocket(),
+            });
+
+            // No `clientSeq` — must NOT default to 0 (a seq of 0 is `<=` the initial
+            // watermark, which the DO would swallow as a replay without running it).
+            const ack = await client.callMutator("messages:send", { text: "hi" });
+
+            expect(ack).toStrictEqual({ applied: true, result: "ok" });
+
+            const headers = (fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1].headers as Record<string, string>;
+
+            expect(headers["x-lunora-client-id"]).toBe("client-A");
+            expect(headers["x-lunora-client-seq"]).toBeUndefined();
+        });
+
+        it("tracks the watermark per shard bucket", async () => {
+            expect.assertions(2);
+
+            const fetchMock = vi.fn<typeof fetch>(async () => jsonResponse({ lastMutationId: 3, result: null }));
+
+            const client = new LunoraClient({
+                fetch: fetchMock,
+                url: "https://app.example",
+                WebSocket: createMockWebSocket(),
+            });
+
+            await client.callMutator("messages:send", {}, { clientSeq: 3, shardKey: "room-1" });
+
+            expect(client.confirmedMutationWatermark("room-1")).toBe(3);
+            // A different shard keeps its own watermark (untouched).
+            expect(client.confirmedMutationWatermark("room-2")).toBe(0);
+        });
+    });
+
     // --- Subscriptions ----------------------------------------------------------
 
     describe("lunoraClient — subscriptions", () => {
@@ -365,8 +457,8 @@ describe("lunoraClient", () => {
             expect(last).toEqual({ id: sub.id, type: "unsubscribe" });
         });
 
-        it("announces every socket with a context-less connect envelope before resubscribing", () => {
-            expect.assertions(3);
+        it("wire-encodes bigint/Date subscription args on the subscribe frame (and dedups/distinguishes by value)", async () => {
+            expect.assertions(6);
 
             const client = new LunoraClient({
                 fetch: vi.fn<typeof fetch>(),
@@ -374,9 +466,196 @@ describe("lunoraClient", () => {
                 WebSocket: createMockWebSocket(),
             });
 
+            // Pre-change this threw at the registry key; now it must key, send,
+            // and JSON-serialize cleanly (the raw frame stringify would throw on
+            // a real bigint).
+            client.subscribe(fnRef("messages:list"), { at: new Date(5000), since: 123n }, () => {});
+
+            const socket = latestSocket();
+
+            socket.open();
+
+            expect(wireFrames(socket)).toHaveLength(1);
+
+            const sub = firstSub(socket);
+
+            expect(sub.type).toBe("subscribe");
+            // The frame carries the TAGGED wire form; the shard's decode-at-entry
+            // revives the real values before storing/executing.
+            expect(decodeWire(sub.query.args)).toStrictEqual({ at: new Date(5000), since: 123n });
+
+            socket.receive({ id: sub.id, type: "ack" });
+
+            // Same wire-typed args → deduped onto the existing (acked) registration…
+            client.subscribe(fnRef("messages:list"), { at: new Date(5000), since: 123n }, () => {});
+
+            expect(wireFrames(socket)).toHaveLength(1);
+
+            // …while args differing ONLY by the bigint open a distinct subscription.
+            client.subscribe(fnRef("messages:list"), { at: new Date(5000), since: 124n }, () => {});
+
+            expect(wireFrames(socket)).toHaveLength(2);
+            expect(wireFrames(socket)[1].id).not.toBe(sub.id);
+
+            client.close();
+        });
+
+        it("keeps pure-JSON subscribe frames byte-identical (no wire tags)", () => {
+            expect.assertions(1);
+
+            const client = new LunoraClient({
+                fetch: vi.fn<typeof fetch>(),
+                url: "https://app.example",
+                WebSocket: createMockWebSocket(),
+            });
+
+            client.subscribe(fnRef("messages:list"), { channel: "general", limit: 10 }, () => {});
+
+            const socket = latestSocket();
+
+            socket.open();
+
+            expect(firstSub(socket).query.args).toStrictEqual({ channel: "general", limit: 10 });
+
+            client.close();
+        });
+
+        it("rejects a subscription arg the wire refuses with a TypeError at the call site", () => {
+            expect.assertions(1);
+
+            const client = new LunoraClient({
+                fetch: vi.fn<typeof fetch>(),
+                url: "https://app.example",
+                WebSocket: createMockWebSocket(),
+            });
+
+            expect(() => client.subscribe(fnRef("messages:list"), { pattern: /abc/ }, () => {})).toThrow(TypeError);
+
+            client.close();
+        });
+
+        it("forwards a settled frame's watermark to onCheckpoint without firing the data callback", () => {
+            expect.assertions(3);
+
+            const client = new LunoraClient({
+                clientId: "client-A",
+                fetch: vi.fn<typeof fetch>(),
+                url: "https://app.example",
+                WebSocket: createMockWebSocket(),
+            });
+
+            const received: unknown[] = [];
+            const checkpoints: { checkpoint?: number; mutationId?: number }[] = [];
+
+            client.subscribe(fnRef("messages:list"), {}, (d) => received.push(d), {
+                onCheckpoint: (watermark) => checkpoints.push(watermark),
+            });
+
+            const socket = latestSocket();
+
+            socket.open();
+
+            const sub = firstSub(socket);
+
+            socket.receive({ id: sub.id, type: "ack" });
+            // A write touched the read tables but the result was byte-identical, so
+            // the server sent a `settled` frame instead of a data frame.
+            socket.receive({ cursor: 12, epoch: "e1", id: sub.id, lastMutationId: 5, type: "settled" });
+
+            // No value changed — the data callback must not fire...
+            expect(received).toEqual([]);
+            // ...but the echoed watermark + advanced cursor reach onCheckpoint so a
+            // @lunora/db list overlay can drop.
+            expect(checkpoints).toEqual([{ checkpoint: 12, mutationId: 5 }]);
+
+            // An older client (or one with no settled support) safely ignores an
+            // unknown frame — the default switch arm is a no-op.
+            expect(() => {
+                socket.receive({ id: sub.id, type: "totally-unknown-frame" });
+            }).not.toThrow();
+
+            client.close();
+        });
+
+        it("ignores a settled frame for an unknown subscription id", () => {
+            expect.assertions(1);
+
+            const client = new LunoraClient({
+                clientId: "client-A",
+                fetch: vi.fn<typeof fetch>(),
+                url: "https://app.example",
+                WebSocket: createMockWebSocket(),
+            });
+
+            client.subscribe(fnRef("messages:list"), {}, () => undefined);
+
+            const socket = latestSocket();
+
+            socket.open();
+
+            expect(() => {
+                socket.receive({ cursor: 1, id: "sub_does_not_exist", type: "settled" });
+            }).not.toThrow();
+
+            client.close();
+        });
+
+        it("fans a settled frame out to every subscriber sharing the same subscription state", () => {
+            // Regression: SubscriptionState is shared across subscribers to the same
+            // (fn, args, shardKey). A second subscriber (e.g. a @lunora/db collection)
+            // that joins AFTER a plain useQuery must still receive `settled` fan-out —
+            // a single onCheckpoint slot would only ever notify the state's creator.
+            expect.assertions(2);
+
+            const client = new LunoraClient({
+                clientId: "client-A",
+                fetch: vi.fn<typeof fetch>(),
+                url: "https://app.example",
+                WebSocket: createMockWebSocket(),
+            });
+
+            const first: { checkpoint?: number; mutationId?: number }[] = [];
+            const second: { checkpoint?: number; mutationId?: number }[] = [];
+
+            // First subscriber CREATES the shared state...
+            client.subscribe(fnRef("messages:list"), {}, () => undefined, {
+                onCheckpoint: (watermark) => first.push(watermark),
+            });
+            // ...second subscriber JOINS the existing state (same fn + args).
+            client.subscribe(fnRef("messages:list"), {}, () => undefined, {
+                onCheckpoint: (watermark) => second.push(watermark),
+            });
+
+            const socket = latestSocket();
+
+            socket.open();
+
+            const sub = firstSub(socket);
+
+            socket.receive({ id: sub.id, type: "ack" });
+            socket.receive({ cursor: 7, epoch: "e1", id: sub.id, lastMutationId: 3, type: "settled" });
+
+            // BOTH checkpoint callbacks fire, not just the creator's.
+            expect(first).toEqual([{ checkpoint: 7, mutationId: 3 }]);
+            expect(second).toEqual([{ checkpoint: 7, mutationId: 3 }]);
+
+            client.close();
+        });
+
+        it("announces every socket with a context-less connect envelope before resubscribing", () => {
+            expect.assertions(3);
+
+            const client = new LunoraClient({
+                clientId: "client-A",
+                fetch: vi.fn<typeof fetch>(),
+                url: "https://app.example",
+                WebSocket: createMockWebSocket(),
+            });
+
             // No connection context registered: the socket must still announce
             // itself so the server's `onConnect` hooks fire symmetrically with
-            // `onDisconnect`. The envelope simply carries no `context`.
+            // `onDisconnect`. The envelope carries the `clientId` (so pokes can
+            // echo this client's `lastMutationId`) but no `context`.
             client.subscribe(fnRef("messages:list"), {}, () => undefined);
 
             const socket = latestSocket();
@@ -385,7 +664,7 @@ describe("lunoraClient", () => {
 
             const connect = JSON.parse(socket.sent[0]!);
 
-            expect(connect).toEqual({ id: "connect", type: "connect" });
+            expect(connect).toEqual({ clientId: "client-A", id: "connect", type: "connect" });
             // The connect frame leads, then the subscribe — order matters so the
             // hook runs with any context in place before subscriptions replay.
             expect(JSON.parse(socket.sent[1]!).type).toBe("subscribe");
@@ -398,6 +677,7 @@ describe("lunoraClient", () => {
             expect.assertions(1);
 
             const client = new LunoraClient({
+                clientId: "client-A",
                 connectionContext: { roomId: "room-1" },
                 fetch: vi.fn<typeof fetch>(),
                 url: "https://app.example",
@@ -410,7 +690,7 @@ describe("lunoraClient", () => {
 
             socket.open();
 
-            expect(JSON.parse(socket.sent[0]!)).toEqual({ context: { roomId: "room-1" }, id: "connect", type: "connect" });
+            expect(JSON.parse(socket.sent[0]!)).toEqual({ clientId: "client-A", context: { roomId: "room-1" }, id: "connect", type: "connect" });
 
             client.close();
         });
@@ -522,6 +802,114 @@ describe("lunoraClient", () => {
             vi.advanceTimersByTime(60_000);
 
             expect(socket.sent).not.toContain("lunora-ping");
+
+            client.close();
+        });
+
+        it("force-closes a stuck-connecting socket after the connect timeout and goes offline", () => {
+            expect.assertions(4);
+
+            vi.useFakeTimers();
+
+            const client = new LunoraClient({
+                connectTimeoutMs: 5000,
+                fetch: vi.fn<typeof fetch>(),
+                url: "https://app.example",
+                WebSocket: createMockWebSocket(),
+            });
+
+            client.subscribe(fnRef("messages:list"), {}, () => undefined);
+
+            const socket = latestSocket();
+
+            // Handshake hangs: the socket never fires `open`, so it sits connecting.
+            expect(client.connectionStatus()).toBe("connecting");
+
+            // Just before the timeout, nothing has changed.
+            vi.advanceTimersByTime(4999);
+
+            expect(socket.readyState).not.toBe(3);
+
+            // At the timeout, the client force-closes the stuck socket and falls
+            // back to its reconnect path (status `offline`), instead of hanging on
+            // the browser's much longer default.
+            vi.advanceTimersByTime(1);
+
+            expect(socket.readyState).toBe(3);
+            expect(client.connectionStatus()).toBe("offline");
+
+            client.close();
+        });
+
+        it("clears the connect timeout once the socket opens (no spurious close)", () => {
+            expect.assertions(2);
+
+            vi.useFakeTimers();
+
+            const client = new LunoraClient({
+                connectTimeoutMs: 5000,
+                fetch: vi.fn<typeof fetch>(),
+                url: "https://app.example",
+                WebSocket: createMockWebSocket(),
+            });
+
+            client.subscribe(fnRef("messages:list"), {}, () => undefined);
+
+            const socket = latestSocket();
+
+            socket.open();
+
+            expect(client.connectionStatus()).toBe("connected");
+
+            // Well past the timeout window: an open socket must not be force-closed.
+            vi.advanceTimersByTime(10_000);
+
+            expect(socket.readyState).toBe(1);
+
+            client.close();
+        });
+
+        it("ignores a late close from a socket the connection already replaced", () => {
+            expect.assertions(4);
+
+            vi.useFakeTimers();
+
+            const client = new LunoraClient({
+                fetch: vi.fn<typeof fetch>(),
+                // Fixed, jitter-free backoff so a single timer advance fires exactly
+                // one reconnect; no connect timeout so `fresh` arms no competing timer.
+                reconnect: { initialDelayMs: 1000, jitter: false },
+                url: "https://app.example",
+                WebSocket: createMockWebSocket(),
+            });
+
+            client.subscribe(fnRef("messages:list"), {}, () => undefined);
+
+            const stale = latestSocket();
+
+            stale.open();
+
+            expect(client.connectionStatus()).toBe("connected");
+
+            // The socket drops; the client arms its reconnect and, on the timer,
+            // builds a fresh socket that's now the connection's current one.
+            stale.triggerClose();
+            vi.advanceTimersByTime(1000);
+
+            const fresh = latestSocket();
+
+            expect(fresh).not.toBe(stale);
+
+            // A late, duplicate close from the dead socket must NOT tear down the
+            // newer one (the close handler is guarded by `conn.socket === socket`):
+            // the connection stays `connecting` on `fresh`, then opens normally.
+            stale.triggerClose();
+
+            expect(client.connectionStatus()).toBe("connecting");
+
+            fresh.open();
+
+            expect(client.connectionStatus()).toBe("connected");
 
             client.close();
         });
@@ -1082,30 +1470,35 @@ describe("lunoraClient", () => {
             client.close();
         });
 
-        it("re-gates the remaining queued items when the identity rotates mid-flush", async () => {
+        it("replays a coalesced multi-write flush atomically under the queued identity", async () => {
             expect.assertions(4);
 
-            // Two writes queue under identity A. The flush replays them
-            // sequentially; while the FIRST replay's RPC is in flight we rotate
-            // the auth token (identity B). Because the per-item identity guard is
-            // re-read at the point of sending (not captured once at flush start),
-            // the SECOND item must be re-gated against the new identity and
-            // rejected rather than replaying as user B.
+            // Two writes queue under identity A. On reconnect they coalesce into
+            // ONE rpc-batch replay (plan 088 follow-on). A token rotation to
+            // identity B that races the in-flight batch must NOT split it or leak a
+            // write under B: the batch carries A's auth header (captured before the
+            // rotation), so both writes replay under the identity they were queued
+            // with — a write stamped under one identity never goes out under another.
             vi.useFakeTimers();
 
-            const seen: string[] = [];
+            const authSeen: (string | undefined)[] = [];
             let rotate: (() => void) | undefined;
 
             const fetchMock = vi.fn<typeof fetch>(async (_url, init) => {
-                const body = JSON.parse((init as RequestInit).body as string) as { args: { title: string } };
+                const headers = ((init as RequestInit).headers ?? {}) as Record<string, string>;
 
-                seen.push(body.args.title);
+                authSeen.push(headers["authorization"]);
 
-                // On the first replay, swap identity before the next item sends.
+                // Race a rotation to identity B against the in-flight batch.
                 rotate?.();
                 rotate = undefined;
 
-                return jsonResponse({ result: { ok: true } });
+                return jsonResponse({
+                    results: [
+                        { body: { result: { ok: true } }, id: 0 },
+                        { body: { result: { ok: true } }, id: 1 },
+                    ],
+                });
             });
 
             const client = new LunoraClient({
@@ -1127,10 +1520,7 @@ describe("lunoraClient", () => {
             const first = client.mutation(fnRef("posts:create"), { title: "first" });
             const second = client.mutation(fnRef("posts:create"), { title: "second" });
 
-            // Suppress unhandled-rejection noise; we assert on `second` below.
-            second.catch(() => undefined);
-
-            // Rotate identity once the first replay is in flight.
+            // Rotate identity once the batch replay is in flight.
             rotate = () => {
                 client.setAuthToken("user-b-token");
             };
@@ -1140,14 +1530,190 @@ describe("lunoraClient", () => {
             latestSocket().open();
             await vi.runAllTimersAsync();
 
-            // First write replayed under identity A; second was re-gated and
-            // rejected because the identity changed mid-flush.
+            // Both writes replayed — in ONE batch, under identity A's auth header
+            // (never user-b, even though the token rotated mid-flight).
             await expect(first).resolves.toEqual({ ok: true });
-            await expect(second).rejects.toMatchObject({ code: "OFFLINE_IDENTITY_CHANGED" });
-            expect(seen).toEqual(["first"]);
+            await expect(second).resolves.toEqual({ ok: true });
+            expect(fetchMock).toHaveBeenCalledTimes(1);
+            expect(authSeen).toEqual(["Bearer user-a-token"]);
+
+            client.close();
+        });
+
+        it("a same-subject token refresh during the offline window keeps the queued writes", async () => {
+            expect.assertions(2);
+
+            vi.useFakeTimers();
+
+            const fetchMock = vi.fn<typeof fetch>(async () => jsonResponse({ result: { ok: true } }));
+            const client = new LunoraClient({
+                fetch: fetchMock,
+                heartbeatIntervalMs: 0,
+                reconnect: { initialDelayMs: 10, jitter: false, maxDelayMs: 10 },
+                url: "https://app.example",
+                WebSocket: createMockWebSocket(),
+            });
+
+            // Same user (subject "user-1"), initial access token.
+            client.setAuthToken("token-v1", "user-1");
+
+            client.subscribe(fnRef("posts:list"), {}, () => undefined);
+            latestSocket().open();
+            latestSocket().triggerClose();
+
+            const pending = client.mutation(fnRef("posts:create"), { title: "queued" });
+
+            // The access token is refreshed (new JWT) for the SAME user before flush.
+            client.setAuthToken("token-v2", "user-1");
+
+            // Reconnect and flush.
+            await vi.advanceTimersByTimeAsync(20);
+            latestSocket().open();
+            await vi.runAllTimersAsync();
+
+            // The write survives the refresh (identity keyed on subject, not token).
+            await expect(pending).resolves.toEqual({ ok: true });
             expect(fetchMock).toHaveBeenCalledTimes(1);
 
             client.close();
+            vi.useRealTimers();
+        });
+
+        it("re-stamps queued writes when the subject is established later on the same token (no drop)", async () => {
+            expect.assertions(2);
+
+            vi.useFakeTimers();
+
+            const fetchMock = vi.fn<typeof fetch>(async () => jsonResponse({ result: { ok: true } }));
+            const client = new LunoraClient({
+                fetch: fetchMock,
+                heartbeatIntervalMs: 0,
+                reconnect: { initialDelayMs: 10, jitter: false, maxDelayMs: 10 },
+                url: "https://app.example",
+                WebSocket: createMockWebSocket(),
+            });
+
+            // The common React pattern: token set before the user id is known
+            // (`user?.id` is transiently undefined), so identity is the token hash.
+            client.setAuthToken("token-1");
+
+            client.subscribe(fnRef("posts:list"), {}, () => undefined);
+            latestSocket().open();
+            latestSocket().triggerClose();
+
+            const pending = client.mutation(fnRef("posts:create"), { title: "queued" });
+
+            // The user id resolves a tick later — SAME token, just a stabler label.
+            // The in-flight write must be re-stamped, not dropped.
+            client.setAuthToken("token-1", "user-1");
+
+            await vi.advanceTimersByTimeAsync(20);
+            latestSocket().open();
+            await vi.runAllTimersAsync();
+
+            await expect(pending).resolves.toEqual({ ok: true });
+            expect(fetchMock).toHaveBeenCalledTimes(1);
+
+            client.close();
+            vi.useRealTimers();
+        });
+
+        it("a hydrated write stamped under a token replays after the subject is established on that same token", async () => {
+            expect.assertions(2);
+
+            const fetchMock = vi.fn<typeof fetch>(async () => jsonResponse({ result: { ok: true } }));
+            const persistence = createInMemoryPersistence();
+
+            // Compute the token-hash "token-1" fingerprints to — the stamp a write
+            // queued before the subject resolved would carry.
+            const probe = new LunoraClient({ url: "https://app.example", WebSocket: createMockWebSocket() });
+
+            probe.setAuthToken("token-1");
+            const tokenHash = probe.currentIdentity();
+
+            probe.close();
+
+            // A durable write persisted under the token hash (subject not yet known).
+            await persistence.append({ args: { title: "queued" }, functionPath: "posts:create", id: "m1", identity: tokenHash });
+
+            const client = new LunoraClient({
+                fetch: fetchMock,
+                persistence,
+                url: "https://app.example",
+                WebSocket: createMockWebSocket(),
+            });
+
+            // On reload the app re-sets the SAME token and now knows the user id, so
+            // the live identity is `subj:user-1`. The hydrated write still carries
+            // the token hash; it must replay (the credential never changed) rather
+            // than be dropped as an identity mismatch.
+            client.setAuthToken("token-1", "user-1");
+
+            await flushMicrotasks();
+            latestSocket().open();
+            await flushMicrotasks();
+
+            expect(fetchMock).toHaveBeenCalledTimes(1);
+            await expect(persistence.load()).resolves.toEqual([]);
+
+            client.close();
+        });
+
+        it("pendingCount and onPendingChange track queued writes draining on reconnect", async () => {
+            expect.assertions(4);
+
+            vi.useFakeTimers();
+
+            // Two same-shard writes coalesce into one rpc-batch on flush; the mock
+            // answers the batch endpoint with a per-slot result envelope.
+            const fetchMock = vi.fn<typeof fetch>(async (input) => {
+                if ((input as string).endsWith("/_lunora/rpc-batch")) {
+                    return jsonResponse({
+                        results: [
+                            { body: { result: { ok: true } }, id: 0 },
+                            { body: { result: { ok: true } }, id: 1 },
+                        ],
+                    });
+                }
+
+                return jsonResponse({ result: { ok: true } });
+            });
+            const client = new LunoraClient({
+                fetch: fetchMock,
+                heartbeatIntervalMs: 0,
+                reconnect: { initialDelayMs: 10, jitter: false, maxDelayMs: 10 },
+                url: "https://app.example",
+                WebSocket: createMockWebSocket(),
+            });
+
+            const counts: number[] = [];
+
+            client.onPendingChange((n) => counts.push(n));
+
+            // Fires immediately with the current (0) count.
+            expect(client.pendingCount()).toBe(0);
+
+            client.subscribe(fnRef("posts:list"), {}, () => undefined);
+            latestSocket().open();
+            latestSocket().triggerClose();
+
+            // Two writes queue offline → pending count climbs.
+            client.mutation(fnRef("posts:create"), { title: "a" }).catch(() => undefined);
+            client.mutation(fnRef("posts:create"), { title: "b" }).catch(() => undefined);
+
+            expect(client.pendingCount()).toBe(2);
+
+            // Reconnect → flush drains the queue.
+            await vi.advanceTimersByTimeAsync(20);
+            latestSocket().open();
+            await vi.runAllTimersAsync();
+
+            expect(client.pendingCount()).toBe(0);
+            // The observer saw the climb to 2 and the drain back to 0.
+            expect(counts).toEqual(expect.arrayContaining([0, 1, 2, 0]));
+
+            client.close();
+            vi.useRealTimers();
         });
     });
 
@@ -1215,12 +1781,14 @@ describe("lunoraClient", () => {
             expect(received).toEqual([0, 9]);
         });
 
-        it("stacked optimistic mutations: older failing first does not clobber newer pending value", async () => {
+        it("stacked optimistic mutations: an older failure rebases the newer pending write onto the base", async () => {
             expect.assertions(2);
 
             // Two outstanding RPCs on the same (fn, args, shard) subscription. The
-            // older one (A) rejects first; its rollback must NOT restore the value
-            // from before B applied, because B's optimistic value is still pending.
+            // older one (A) rejects first; its rollback drops only A's layer and
+            // re-folds the still-pending B onto the authoritative base — so B's
+            // displayed value drops from 2 to 1 (only B's increment on base 0),
+            // rather than leaving a stale 2 that double-counts the rejected A.
             const deferreds: { reject: (error: unknown) => void; resolve: (value: Response) => void }[] = [];
             const fetchMock = vi.fn<typeof fetch>(
                 async () =>
@@ -1250,17 +1818,150 @@ describe("lunoraClient", () => {
 
             expect(received).toEqual([0, 1, 2]);
 
-            // A fails first. Its rollback must leave B's pending value (2) intact.
+            // A fails first → drop A's layer, re-fold B onto base 0 → 1.
             deferreds[0]!.reject(new Error("A failed"));
             await promiseA.catch(() => undefined);
 
-            // Settle B so the test doesn't leak a pending promise.
+            // Settle B (success). The response carries no commitCursor, so B's layer
+            // is dropped silently (no further notify).
             deferreds[1]!.resolve(jsonResponse({ result: { ok: true } }));
             await promiseB;
 
-            // The fixed rollback only restores when its own value is still live;
-            // B's value (2) survived A's failure.
-            expect(received).toEqual([0, 1, 2]);
+            // B was rebased onto the base when A was rejected — its increment now
+            // reflects only itself (1), not the double-counted 2.
+            expect(received).toEqual([0, 1, 2, 1]);
+        });
+
+        it("drops a confirmed optimistic layer once a frame reaches its commit cursor (no double-count)", async () => {
+            expect.assertions(1);
+
+            // The mutation response echoes the CDC cursor the write committed at.
+            const fetchMock = vi.fn<typeof fetch>(async () => jsonResponse({ commitCursor: 10, result: { ok: true } }));
+            const client = new LunoraClient({ fetch: fetchMock, url: "https://app.example", WebSocket: createMockWebSocket() });
+
+            const received: unknown[] = [];
+
+            client.subscribe(fnRef("counter:get"), {}, (d) => received.push(d));
+            const socket = latestSocket();
+
+            socket.open();
+            const subId = firstSub(socket).id as string;
+
+            socket.receive({ cursor: 5, data: 5, id: subId, type: "data" });
+            // Optimistic +1 → 6; response confirms commit at cursor 10 (not yet reached).
+            await client.mutation(fnRef("counter:get"), {}, { optimistic: (c) => (typeof c === "number" ? c + 1 : 1) });
+
+            // The confirming frame lands at cursor 10 carrying the authoritative 6.
+            // The layer (commit cursor 10) drops; the value is already 6, so no
+            // spurious re-notify fires — and crucially it is NOT 7 (which a
+            // still-applied layer would fold on top).
+            socket.receive({ cursor: 10, data: 6, id: subId, type: "data" });
+
+            expect(received).toEqual([5, 6]);
+        });
+
+        it("self-heals the H1 race when the confirming frame beats the RPC response", async () => {
+            expect.assertions(2);
+
+            const deferreds: { reject: (error: unknown) => void; resolve: (value: Response) => void }[] = [];
+            const fetchMock = vi.fn<typeof fetch>(
+                async () =>
+                    new Promise<Response>((resolve, reject) => {
+                        deferreds.push({ reject, resolve });
+                    }),
+            );
+            const client = new LunoraClient({ fetch: fetchMock, url: "https://app.example", WebSocket: createMockWebSocket() });
+
+            const received: unknown[] = [];
+
+            client.subscribe(fnRef("counter:get"), {}, (d) => received.push(d));
+            const socket = latestSocket();
+
+            socket.open();
+            const subId = firstSub(socket).id as string;
+
+            socket.receive({ cursor: 5, data: 5, id: subId, type: "data" });
+            const pending = client.mutation(fnRef("counter:get"), {}, { optimistic: (c) => (typeof c === "number" ? c + 1 : 1) });
+
+            // The confirming frame (cursor 10, authoritative 6) arrives BEFORE the
+            // RPC response. The layer's commit cursor is unknown, so it's still
+            // folded → a transient 7 (this is the race the reverted version left
+            // permanent).
+            socket.receive({ cursor: 10, data: 6, id: subId, type: "data" });
+
+            expect(received).toEqual([5, 6, 7]);
+
+            // The response lands with commitCursor 10; the layer is now confirmed at
+            // an already-reached cursor → dropped + re-folded → corrects to 6.
+            deferreds[0]!.resolve(jsonResponse({ commitCursor: 10, result: { ok: true } }));
+            await pending;
+
+            // No permanent double-count: it self-heals to the authoritative value.
+            expect(received).toEqual([5, 6, 7, 6]);
+        });
+
+        it("rebases a pending optimistic value onto an unrelated incoming delta (not clobbered)", async () => {
+            expect.assertions(2);
+
+            const deferreds: { reject: (error: unknown) => void; resolve: (value: Response) => void }[] = [];
+            const fetchMock = vi.fn<typeof fetch>(
+                async () =>
+                    new Promise<Response>((resolve, reject) => {
+                        deferreds.push({ reject, resolve });
+                    }),
+            );
+            const client = new LunoraClient({ fetch: fetchMock, url: "https://app.example", WebSocket: createMockWebSocket() });
+
+            const received: unknown[] = [];
+
+            client.subscribe(fnRef("counter:get"), {}, (d) => received.push(d));
+            const socket = latestSocket();
+
+            socket.open();
+            const subId = firstSub(socket).id as string;
+
+            socket.receive({ cursor: 5, data: 5, id: subId, type: "data" });
+            // Optimistic +1 → 6; the RPC stays in flight (commit cursor unknown).
+            const pending = client.mutation(fnRef("counter:get"), {}, { optimistic: (c) => (typeof c === "number" ? c + 1 : 1) });
+
+            expect(received).toEqual([5, 6]);
+
+            // An UNRELATED server delta moves the base to 10 (e.g. another client).
+            // The still-pending layer is REBASED onto 10 → 11, not clobbered to 10.
+            socket.receive({ cursor: 8, data: 10, id: subId, type: "data" });
+
+            expect(received).toEqual([5, 6, 11]);
+
+            deferreds[0]!.reject(new Error("done"));
+            await pending.catch(() => undefined);
+        });
+
+        it("drops a confirmed optimistic layer on a byte-identical settled frame (no stuck overlay)", async () => {
+            expect.assertions(2);
+
+            const fetchMock = vi.fn<typeof fetch>(async () => jsonResponse({ commitCursor: 10, result: { ok: true } }));
+            const client = new LunoraClient({ fetch: fetchMock, url: "https://app.example", WebSocket: createMockWebSocket() });
+
+            const received: unknown[] = [];
+
+            client.subscribe(fnRef("counter:get"), {}, (d) => received.push(d));
+            const socket = latestSocket();
+
+            socket.open();
+            const subId = firstSub(socket).id as string;
+
+            socket.receive({ cursor: 5, data: 5, id: subId, type: "data" });
+            // Optimistic +1 → 6; commit cursor 10 (not yet reached → layer kept).
+            await client.mutation(fnRef("counter:get"), {}, { optimistic: (c) => (typeof c === "number" ? c + 1 : 1) });
+
+            expect(received).toEqual([5, 6]);
+
+            // The write committed at cursor 10 but the query result is byte-identical,
+            // so the server sends a `settled` frame (no data). The layer is confirmed
+            // at 10 ≤ 10 → dropped → reverts to the authoritative base 5 (no stuck +1).
+            socket.receive({ cursor: 10, id: subId, type: "settled" });
+
+            expect(received).toEqual([5, 6, 5]);
         });
 
         it("optimisticUpdate patches two different subscribed queries and rolls both back on error", async () => {
@@ -1335,6 +2036,53 @@ describe("lunoraClient", () => {
             );
 
             expect(received).toEqual([0, 42]);
+        });
+
+        it("optimisticUpdate rebases onto an unrelated delta instead of being clobbered", async () => {
+            expect.assertions(2);
+
+            // Unification win: the multi-query optimisticUpdate path now rides the
+            // same rebaseable layer engine as per-call `optimistic`, so its value
+            // survives an unrelated server delta on the same query (it used to be
+            // clobbered one-shot).
+            const deferreds: { reject: (error: unknown) => void; resolve: (value: Response) => void }[] = [];
+            const fetchMock = vi.fn<typeof fetch>(
+                async () =>
+                    new Promise<Response>((resolve, reject) => {
+                        deferreds.push({ reject, resolve });
+                    }),
+            );
+            const client = new LunoraClient({ fetch: fetchMock, url: "https://app.example", WebSocket: createMockWebSocket() });
+
+            const received: unknown[] = [];
+
+            client.subscribe(fnRef("q:list"), {}, (d) => received.push(d));
+            const socket = latestSocket();
+
+            socket.open();
+            const subId = firstSub(socket).id as string;
+
+            socket.receive({ cursor: 5, data: 5, id: subId, type: "data" });
+            // optimisticUpdate sets the query to 42; the RPC stays in flight.
+            const pending = client.mutation(
+                fnRef("m:set"),
+                {},
+                {
+                    optimisticUpdate: (store) => {
+                        store.setQuery(fnRef("q:list"), {}, 42);
+                    },
+                },
+            );
+
+            // An unrelated server delta moves the base to 10. The optimistic 42
+            // survives (rebased), rather than being clobbered to 10.
+            socket.receive({ cursor: 8, data: 10, id: subId, type: "data" });
+
+            expect(received.at(-1)).toBe(42);
+            expect(received).not.toContain(10);
+
+            deferreds[0]!.reject(new Error("done"));
+            await pending.catch(() => undefined);
         });
 
         it("stacked optimisticUpdate mutations compose without clobbering each other", async () => {
@@ -1413,6 +2161,77 @@ describe("lunoraClient", () => {
 
             expect(received).toEqual([0]);
             expect(result).toEqual({ ok: true });
+        });
+
+        it("optimisticUpdate lands when the subscription's undefined shardKey and the mutation's empty-string shardKey normalize equal", async () => {
+            expect.assertions(1);
+
+            const fetchMock = vi.fn<typeof fetch>(async () => jsonResponse({ result: { ok: true } }));
+            const client = new LunoraClient({
+                fetch: fetchMock,
+                url: "https://app.example",
+                WebSocket: createMockWebSocket(),
+            });
+
+            const received: unknown[] = [];
+
+            // Subscription registered WITHOUT a shardKey (state.shardKey === undefined).
+            client.subscribe(fnRef("q:list"), {}, (d) => received.push(d));
+            latestSocket().open();
+            const subId = firstSub(latestSocket()).id as string;
+
+            latestSocket().receive({ delta: 0, id: subId, type: "delta" });
+
+            // Mutation issued with an EMPTY-STRING shardKey. Both sides normalize to
+            // "" in the registry key, so the optimistic patch must land — a strict
+            // `undefined === ""` compare in the old findState would silently no-op it.
+            await client.mutation(
+                fnRef("m:set"),
+                {},
+                {
+                    optimisticUpdate: (store) => {
+                        store.setQuery(fnRef("q:list"), {}, 42);
+                    },
+                    shardKey: "",
+                },
+            );
+
+            expect(received).toEqual([0, 42]);
+        });
+
+        it("optimistic update is scoped to the matching (fn, args) pair and does not touch subscriptions with different args", async () => {
+            // This test locks in the keyed-lookup invariant: an optimistic transform
+            // applied to (fn, { room: "a" }) must NOT bleed into the subscription
+            // for (fn, { room: "b" }) even though both watch the same function.
+            expect.assertions(2);
+
+            const fetchMock = vi.fn<typeof fetch>(async () => jsonResponse({ result: { ok: true } }));
+            const client = new LunoraClient({
+                fetch: fetchMock,
+                url: "https://app.example",
+                WebSocket: createMockWebSocket(),
+            });
+
+            const aReceived: unknown[] = [];
+            const bReceived: unknown[] = [];
+
+            client.subscribe(fnRef("c:get"), { room: "a" }, (d) => aReceived.push(d));
+            client.subscribe(fnRef("c:get"), { room: "b" }, (d) => bReceived.push(d));
+            const socket = latestSocket();
+
+            socket.open();
+
+            const aId = firstSub(socket).id as string;
+            const bId = wireFrames(socket)[1].id as string;
+
+            socket.receive({ delta: 10, id: aId, type: "delta" });
+            socket.receive({ delta: 20, id: bId, type: "delta" });
+
+            // Mutation targets { room: "a" } only — subscription B must be unchanged.
+            await client.mutation(fnRef("c:get"), { room: "a" }, { optimistic: (c) => (typeof c === "number" ? c + 1 : 1) });
+
+            expect(aReceived).toEqual([10, 11]);
+            expect(bReceived).toEqual([20]);
         });
     });
 
@@ -2107,6 +2926,182 @@ describe("lunoraClient", () => {
             expect(second.url).toContain("/_lunora/admin/scheduled/ws");
 
             unsubscribe();
+            vi.useRealTimers();
+        });
+
+        it("resolves a wsToken provider per connect, re-minting on reconnect", async () => {
+            expect.assertions(3);
+
+            vi.useFakeTimers();
+
+            let mints = 0;
+            const client = new LunoraClient({
+                fetch: async () => jsonResponse({ result: null }),
+                reconnect: { initialDelayMs: 10, jitter: false, maxDelayMs: 10 },
+                url: "https://app.example",
+                WebSocket: createMockWebSocket(),
+                wsToken: async () => {
+                    mints += 1;
+
+                    return `eph-${String(mints)}`;
+                },
+            });
+
+            const unsubscribe = client.subscribeScheduledJobs(() => undefined);
+
+            // The scheduled socket is built only AFTER the async provider
+            // resolves (a few microtask hops). Drain until the socket carrying
+            // the minted token appears, and pick it by path + token — reading
+            // `latestSocket()` could otherwise grab a stray socket (e.g. a prior
+            // test's pending reconnect) that raced in during the advance.
+            const findScheduled = (needle: string): MockSocket | undefined =>
+                sockets.find((socket) => socket.url.includes("/_lunora/admin/scheduled/ws") && socket.url.includes(needle));
+
+            let first: MockSocket | undefined;
+
+            for (let attempt = 0; attempt < 30 && first === undefined; attempt += 1) {
+                // eslint-disable-next-line no-await-in-loop -- sequential drain until the minted socket appears
+                await vi.advanceTimersByTimeAsync(0);
+                first = findScheduled("token=eph-1");
+            }
+
+            expect(first?.url).toContain("token=eph-1");
+
+            first?.open();
+            first?.triggerClose();
+
+            // The reconnect (10ms) re-resolves the provider — a fresh short-lived
+            // token per attempt, never a reused stale one. Drain until it lands.
+            let second: MockSocket | undefined;
+
+            for (let attempt = 0; attempt < 30 && second === undefined; attempt += 1) {
+                // eslint-disable-next-line no-await-in-loop -- sequential drain: fire the 10ms reconnect timer then flush the re-mint hops
+                await vi.advanceTimersByTimeAsync(10);
+                second = findScheduled("token=eph-2");
+            }
+
+            expect(second).not.toBe(first);
+            expect(second?.url).toContain("token=eph-2");
+
+            unsubscribe();
+            vi.useRealTimers();
+        });
+    });
+
+    describe("lunoraClient — wsToken provider (ephemeral admin token)", () => {
+        it("resolves the provider before the shard socket connects and appends the minted token", async () => {
+            expect.assertions(3);
+
+            const provider = vi.fn<() => Promise<string>>(async () => "eph-token");
+            const client = new LunoraClient({
+                fetch: vi.fn<typeof fetch>(),
+                url: "https://app.example",
+                WebSocket: createMockWebSocket(),
+                wsToken: provider,
+            });
+
+            client.subscribe(fnRef("__lunora_admin__:getMetrics"), {}, () => undefined);
+
+            // No socket yet — the provider's Promise must resolve first.
+            expect(sockets).toHaveLength(0);
+
+            await flushMicrotasks();
+
+            // Select the token-bearing socket rather than `latestSocket()`: under
+            // full-suite load a stray reconnect socket from an earlier test can be
+            // the newest entry, so `.at(-1)` is not reliably the minted one.
+            let tokened = sockets.find((socket) => socket.url.includes("token=eph-token"));
+
+            for (let attempt = 0; attempt < 30 && tokened === undefined; attempt += 1) {
+                // eslint-disable-next-line no-await-in-loop -- drain macrotasks until the provider-minted socket opens
+                await flushMicrotasks();
+                tokened = sockets.find((socket) => socket.url.includes("token=eph-token"));
+            }
+
+            expect(tokened?.url).toContain("token=eph-token");
+            expect(provider).toHaveBeenCalledTimes(1);
+        });
+
+        it("re-invokes the provider on the reconnect after a token-expired (4001) drop", async () => {
+            expect.assertions(2);
+
+            vi.useFakeTimers();
+
+            let mints = 0;
+            const client = new LunoraClient({
+                fetch: async () => jsonResponse({ result: null }),
+                reconnect: { initialDelayMs: 10, jitter: false, maxDelayMs: 10 },
+                url: "https://app.example",
+                WebSocket: createMockWebSocket(),
+                wsToken: async () => {
+                    mints += 1;
+
+                    return `eph-${String(mints)}`;
+                },
+            });
+
+            client.subscribe(fnRef("__lunora_admin__:getMetrics"), {}, () => undefined);
+
+            await vi.advanceTimersByTimeAsync(0);
+
+            const first = latestSocket();
+
+            first.open();
+            first.triggerClose();
+
+            // The reconnect re-invokes the async provider (minting eph-2) before
+            // opening the new socket. `latestSocket()` is unreliable here — under
+            // full-suite load a stray reconnect socket can be the newest entry (see
+            // the sibling test above) — so drain the reconnect backoff + async mint
+            // and select the token-bearing reconnect socket explicitly.
+            let second = sockets.find((socket) => socket !== first && socket.url.includes("token=eph-2"));
+
+            for (let attempt = 0; attempt < 30 && second === undefined; attempt += 1) {
+                // eslint-disable-next-line no-await-in-loop -- drain fake timers + microtasks until the minted reconnect socket opens
+                await vi.advanceTimersByTimeAsync(15);
+                second = sockets.find((socket) => socket !== first && socket.url.includes("token=eph-2"));
+            }
+
+            expect(second).not.toBe(first);
+            expect(second?.url).toContain("token=eph-2");
+
+            vi.useRealTimers();
+        });
+
+        it("arms the reconnect backoff when the provider rejects, then connects once it recovers", async () => {
+            expect.assertions(2);
+
+            vi.useFakeTimers();
+
+            let attempts = 0;
+            const client = new LunoraClient({
+                fetch: async () => jsonResponse({ result: null }),
+                reconnect: { initialDelayMs: 10, jitter: false, maxDelayMs: 10 },
+                url: "https://app.example",
+                WebSocket: createMockWebSocket(),
+                wsToken: async () => {
+                    attempts += 1;
+
+                    if (attempts === 1) {
+                        throw new Error("mint endpoint unreachable");
+                    }
+
+                    return "eph-recovered";
+                },
+            });
+
+            client.subscribe(fnRef("__lunora_admin__:getMetrics"), {}, () => undefined);
+
+            // First attempt: the provider rejects, so no socket is built.
+            await vi.advanceTimersByTimeAsync(0);
+
+            expect(sockets).toHaveLength(0);
+
+            // The failure armed the normal reconnect backoff; the retry mints.
+            await vi.advanceTimersByTimeAsync(15);
+
+            expect(latestSocket().url).toContain("token=eph-recovered");
+
             vi.useRealTimers();
         });
     });

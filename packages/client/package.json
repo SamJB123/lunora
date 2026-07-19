@@ -1,6 +1,6 @@
 {
     "name": "@lunora/client",
-    "version": "1.0.0-alpha.3",
+    "version": "1.0.0-alpha.24",
     "description": "Lunora browser SDK: WebSocket transport, optimistic updates, and an offline mutation queue",
     "keywords": [
         "cloudflare",
@@ -67,8 +67,8 @@
         "build:prod": "pnpm exec packem build --production",
         "lint:eslint": "eslint .",
         "lint:eslint:fix": "eslint . --fix",
-        "lint:prettier": "prettier --check .",
-        "lint:prettier:fix": "prettier --write .",
+        "lint:prettier": "prettier --check . --ignore-path ../../.prettierignore",
+        "lint:prettier:fix": "prettier --write . --ignore-path ../../.prettierignore",
         "lint:types": "tsc --noEmit",
         "test": "vitest run",
         "test:coverage": "vitest run --coverage",
@@ -76,12 +76,15 @@
         "fallow:dead-code": "fallow dead-code",
         "fallow:health": "fallow health --score"
     },
+    "dependencies": {
+        "@lunora/errors": "1.0.0-alpha.5"
+    },
     "devDependencies": {
         "@cloudflare/vitest-pool-workers": "catalog:cloudflare",
         "@cloudflare/workers-types": "catalog:cloudflare",
         "@codspeed/vitest-plugin": "catalog:test",
-        "@lunora/do": "1.0.0-alpha.6",
-        "@lunora/runtime": "1.0.0-alpha.5",
+        "@lunora/do": "1.0.0-alpha.33",
+        "@lunora/runtime": "1.0.0-alpha.28",
         "@types/node": "catalog:types",
         "@visulima/packem": "catalog:build",
         "@vitest/coverage-v8": "catalog:test",

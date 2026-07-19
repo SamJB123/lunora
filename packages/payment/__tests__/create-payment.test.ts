@@ -74,9 +74,45 @@ describe("createPayment", () => {
             successUrl: "https://x/ok",
         });
 
-        // The derived key spans every request-shaping field (quantity / urls / metadata), not just
-        // (reference, price, mode), so a re-checkout with changed params gets a distinct key.
-        expect(result.url).toBe("https://pay.test/checkout:stripe:user_1:price_1:subscription:1:https://x/ok:https://x/cancel:");
+        // The derived key is a hash of the request-shaping fields: a fixed-length `checkout:<provider>:<sha256>`
+        // that stays well under Stripe's 255-char idempotency-key limit no matter how long the URLs/metadata are.
+        expect(result.url).toMatch(/^https:\/\/pay\.test\/checkout:stripe:[0-9a-f]{64}$/);
+    });
+
+    it("derives a fixed-length checkout key that avoids length overflow and delimiter collisions", async () => {
+        expect.assertions(4);
+
+        const keyFor = async (successUrl: string, cancelUrl: string): Promise<string> => {
+            let forwarded = "";
+            const adapter = fakeAdapter({
+                createCheckout: async (input) => {
+                    forwarded = input.idempotencyKey ?? "";
+
+                    return { id: "cs_1", provider: "stripe", url: "https://pay.test/ok" };
+                },
+            });
+            const payment = createPayment({ adapter, store: new MemoryPaymentStore() });
+
+            await payment.createCheckout({ cancelUrl, mode: "payment", priceId: "price_1", referenceId: "user_1", successUrl });
+
+            return forwarded;
+        };
+
+        // Two full URLs plus a long query string used to blow past Stripe's 255-char key limit; the hash keeps it fixed.
+        const longUrl = `https://example.com/return?token=${"a".repeat(400)}`;
+        const longKey = await keyFor(longUrl, longUrl);
+
+        expect(longKey.length).toBeLessThanOrEqual(255);
+        expect(longKey).toMatch(/^checkout:stripe:[0-9a-f]{64}$/);
+
+        // Unescaped ':' joining would make these two distinct (successUrl, cancelUrl) pairs collide onto the
+        // same key; hashing a JSON-encoded parts array keeps them distinct.
+        const collideA = await keyFor("https://a/x:y", "z");
+        const collideB = await keyFor("https://a/x", "y:z");
+
+        expect(collideA).not.toBe(collideB);
+        // Same inputs are still deterministic (a genuine retry dedupes).
+        await expect(keyFor("https://a/x:y", "z")).resolves.toBe(collideA);
     });
 
     it("enforces authorization on the referenceId", async () => {
@@ -97,6 +133,66 @@ describe("createPayment", () => {
                 successUrl: "https://x/ok",
             }),
         ).rejects.toMatchObject({ code: "FORBIDDEN" });
+    });
+
+    it("ignores a caller-supplied customerId, forwarding the store's customer for the reference", async () => {
+        expect.assertions(2);
+
+        // Capture whatever `customerId` the facade actually hands the provider.
+        let forwarded: string | undefined = "unset";
+        const adapter = fakeAdapter({
+            createCheckout: async (input) => {
+                forwarded = input.customerId;
+
+                return { id: "cs_1", provider: "stripe", url: "https://pay.test/ok" };
+            },
+        });
+        const store = new MemoryPaymentStore();
+
+        // The reference already has a legitimate stored customer.
+        await store.upsertCustomer({ createdAt: 0, id: "cus_legit", provider: "stripe", referenceId: "user_1" });
+
+        const payment = createPayment({ adapter, authorize: (referenceId) => referenceId === "user_1", store });
+
+        await payment.createCheckout({
+            cancelUrl: "https://x/cancel",
+            // Attacker-chosen victim customer — must be dropped in favor of the store-derived one.
+            customerId: "cus_victim",
+            mode: "payment",
+            priceId: "price_1",
+            referenceId: "user_1",
+            successUrl: "https://x/ok",
+        });
+
+        expect(forwarded).toBe("cus_legit");
+        expect(forwarded).not.toBe("cus_victim");
+    });
+
+    it("ignores a caller-supplied customerId on an empty store, minting a fresh customer instead", async () => {
+        expect.assertions(2);
+
+        let forwarded: string | undefined = "unset";
+        const adapter = fakeAdapter({
+            createCheckout: async (input) => {
+                forwarded = input.customerId;
+
+                return { id: "cs_1", provider: "stripe", url: "https://pay.test/ok" };
+            },
+        });
+        // No stored customer for the reference — the facade mints one via getOrCreateCustomer ("cus_1").
+        const payment = createPayment({ adapter, authorize: (referenceId) => referenceId === "user_1", store: new MemoryPaymentStore() });
+
+        await payment.createCheckout({
+            cancelUrl: "https://x/cancel",
+            customerId: "cus_victim",
+            mode: "payment",
+            priceId: "price_1",
+            referenceId: "user_1",
+            successUrl: "https://x/ok",
+        });
+
+        expect(forwarded).toBe("cus_1");
+        expect(forwarded).not.toBe("cus_victim");
     });
 
     it("rejects cancelling another caller's subscription as NOT_FOUND (no existence oracle)", async () => {
@@ -158,7 +254,7 @@ describe("createPayment", () => {
     });
 
     it("returns the error status when webhook verification fails", async () => {
-        expect.assertions(1);
+        expect.assertions(2);
 
         const adapter = fakeAdapter({
             parseWebhook: async () => {
@@ -172,6 +268,49 @@ describe("createPayment", () => {
         const response = await payment.handleWebhook(new Request("https://app.test/payment/webhook", { body: "{}", method: "POST" }));
 
         expect(response.status).toBe(400);
+        // Plan 118: the `LunoraPaymentError` branch now goes through `toErrorBody`
+        // rather than reading `.message` directly — pin that a recognized payment
+        // error still echoes its own message verbatim (no `PaymentErrorCode` is
+        // catalog-marked internal, so this branch never redacts).
+        await expect(response.json()).resolves.toEqual({ error: "bad signature" });
+    });
+
+    it("preserves a LunoraPaymentError's own status (not hardcoded) through the webhook catch", async () => {
+        expect.assertions(2);
+
+        const adapter = fakeAdapter({
+            parseWebhook: async () => {
+                const { LunoraPaymentError } = await import("../src/errors");
+
+                throw new LunoraPaymentError("PROVIDER_ERROR", "upstream provider timed out");
+            },
+        });
+        const payment = createPayment({ adapter, store: new MemoryPaymentStore() });
+
+        const response = await payment.handleWebhook(new Request("https://app.test/payment/webhook", { body: "{}", method: "POST" }));
+
+        // `PROVIDER_ERROR` maps to 502 in `LunoraPaymentError`'s own status map —
+        // distinct from `WEBHOOK_SIGNATURE_INVALID`'s 400 above — confirming
+        // `toErrorBody`'s status for this branch tracks `error.status`, not a
+        // hardcoded literal.
+        expect(response.status).toBe(502);
+        await expect(response.json()).resolves.toEqual({ error: "upstream provider timed out" });
+    });
+
+    it("masks an unrecognized webhook-parsing throw behind a generic 400 (unchanged, non-LunoraPaymentError branch)", async () => {
+        expect.assertions(2);
+
+        const adapter = fakeAdapter({
+            parseWebhook: async () => {
+                throw new Error("driver error: connection reset");
+            },
+        });
+        const payment = createPayment({ adapter, store: new MemoryPaymentStore() });
+
+        const response = await payment.handleWebhook(new Request("https://app.test/payment/webhook", { body: "{}", method: "POST" }));
+
+        expect(response.status).toBe(400);
+        await expect(response.json()).resolves.toEqual({ error: "webhook error" });
     });
 });
 
@@ -189,7 +328,7 @@ describe("createPayment — attach / check / track", () => {
 
         const result = await payment.attach({ cancelUrl: "https://x/cancel", priceId: "price_1", referenceId: "user_1", successUrl: "https://x/ok" });
 
-        expect(result.url).toBe("https://pay.test/checkout:stripe:user_1:price_1:subscription:1:https://x/ok:https://x/cancel:");
+        expect(result.url).toMatch(/^https:\/\/pay\.test\/checkout:stripe:[0-9a-f]{64}$/);
     });
 
     it("attach honors an explicit one-time payment mode", async () => {
@@ -205,7 +344,7 @@ describe("createPayment — attach / check / track", () => {
             successUrl: "https://x/ok",
         });
 
-        expect(result.url).toBe("https://pay.test/checkout:stripe:user_1:price_1:payment:1:https://x/ok:https://x/cancel:");
+        expect(result.url).toMatch(/^https:\/\/pay\.test\/checkout:stripe:[0-9a-f]{64}$/);
     });
 
     it("check throws when entitlements are not configured", async () => {

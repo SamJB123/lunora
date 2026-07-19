@@ -19,7 +19,7 @@ const headersFor = (id: string, timestamp: string, signature: string) => {
 const makeClient = (created: Record<string, unknown>[] = []): PolarClientLike => {
     return {
         checkouts: {
-            create: async (parameters) => {
+            create: async (parameters: Record<string, unknown>) => {
                 created.push(parameters);
 
                 return { id: "co_1", url: "https://polar.test/co_1" };
@@ -31,7 +31,7 @@ const makeClient = (created: Record<string, unknown>[] = []): PolarClientLike =>
             },
         },
         events: {
-            ingest: async (parameters) => {
+            ingest: async (parameters: Record<string, unknown>) => {
                 created.push(parameters);
 
                 return { inserted: 1 };
@@ -95,6 +95,49 @@ describe("polar adapter", () => {
         expect(created[0]?.products).toEqual(["prod_1"]);
     });
 
+    it("binds the checkout to the reference's customer instead of orphaning it", async () => {
+        expect.assertions(4);
+
+        const created: Record<string, unknown>[] = [];
+        const adapter = createPolarAdapter({ client: makeClient(created), webhookSecret: SECRET });
+
+        // The facade passes the stored/minted customer id; the adapter must attach it (else Polar mints a
+        // second orphan customer at completion, leaving the stored customer with no subscription).
+        await adapter.createCheckout({
+            cancelUrl: "https://x/cancel",
+            customerId: "pcus_1",
+            email: "a@b.test",
+            mode: "subscription",
+            priceId: "prod_1",
+            referenceId: "user_1",
+            successUrl: "https://x/ok",
+        });
+
+        expect(created[0]?.customerId).toBe("pcus_1");
+        expect(created[0]?.externalCustomerId).toBe("user_1");
+        // The cancel URL is wired onto Polar's return (back-button) URL rather than dropped.
+        expect(created[0]?.returnUrl).toBe("https://x/cancel");
+        // With a customer already bound, email is not re-sent as a pre-fill.
+        expect(created[0]?.customerEmail).toBeUndefined();
+    });
+
+    it("recovers the referenceId from order metadata in getPaymentStatus (reconcile must not orphan the row)", async () => {
+        expect.assertions(1);
+
+        const client = makeClient();
+        // Polar copies checkout metadata onto the order; the status read must surface it, not blank it.
+        (client as { orders: { get: unknown } }).orders = {
+            get: async () => {
+                return { currency: "usd", id: "ord_1", metadata: { referenceId: "user_1" }, status: "paid", totalAmount: 2500 };
+            },
+        };
+        const adapter = createPolarAdapter({ client, webhookSecret: SECRET });
+
+        const session = await adapter.getPaymentStatus("ord_1");
+
+        expect(session.referenceId).toBe("user_1");
+    });
+
     it("normalizes a verified order.paid webhook (Standard Webhooks scheme)", async () => {
         expect.assertions(6);
 
@@ -126,6 +169,53 @@ describe("polar adapter", () => {
 
         expect(action.type).toBe("subscription.canceled");
         expect(action.subscriptionId).toBe("sub_1");
+    });
+
+    it("maps an `incomplete` subscription to a non-entitling state, not an active grant (regression)", async () => {
+        expect.assertions(1);
+
+        const adapter = createPolarAdapter({ client: makeClient(), webhookSecret: SECRET });
+
+        const payload = JSON.stringify({ data: { id: "sub_1", metadata: { referenceId: "user_1" }, status: "incomplete" }, type: "subscription.created" });
+        const timestamp = String(Math.floor(Date.now() / 1000));
+        const action = await adapter.parseWebhook({ headers: headersFor("msg_incomplete", timestamp, sign("msg_incomplete", timestamp, payload)), payload });
+
+        // `incomplete` (first payment not completed) must NOT map to the entitling
+        // `subscription.active` — it maps to non-entitling `subscription.past_due`.
+        expect(action.type).toBe("subscription.past_due");
+    });
+
+    it("does not capture a still-pending order.created (regression)", async () => {
+        expect.assertions(1);
+
+        const adapter = createPolarAdapter({ client: makeClient(), webhookSecret: SECRET });
+
+        const payload = JSON.stringify({
+            data: { currency: "usd", id: "ord_2", metadata: { referenceId: "user_1" }, status: "pending", total_amount: 2500 },
+            type: "order.created",
+        });
+        const timestamp = String(Math.floor(Date.now() / 1000));
+        const action = await adapter.parseWebhook({ headers: headersFor("msg_pending", timestamp, sign("msg_pending", timestamp, payload)), payload });
+
+        // A pending order.created must not be applied as a capture — order.paid is the settle signal.
+        expect(action.type).toBe("unhandled");
+    });
+
+    it("re-activates a subscription on subscription.uncanceled (regression)", async () => {
+        expect.assertions(2);
+
+        const adapter = createPolarAdapter({ client: makeClient(), webhookSecret: SECRET });
+
+        const payload = JSON.stringify({
+            data: { cancel_at_period_end: false, id: "sub_1", metadata: { referenceId: "user_1" }, status: "active" },
+            type: "subscription.uncanceled",
+        });
+        const timestamp = String(Math.floor(Date.now() / 1000));
+        const action = await adapter.parseWebhook({ headers: headersFor("msg_uncancel", timestamp, sign("msg_uncancel", timestamp, payload)), payload });
+
+        // Un-canceling via the Polar portal must re-emit an active subscription, not fall to `unhandled`.
+        expect(action.type).toBe("subscription.active");
+        expect(action.cancelAtPeriodEnd).toBe(false);
     });
 
     it("ingests usage as an event keyed on the external customer id", async () => {

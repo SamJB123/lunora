@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -110,7 +110,7 @@ describe("lunora init", () => {
         });
 
         it("writes pnpm-workspace.yaml with the allowBuilds allowlist before a pnpm install", async () => {
-            expect.assertions(3);
+            expect.assertions(4);
 
             const { spawner } = createRecordingSpawner();
 
@@ -133,7 +133,10 @@ describe("lunora init", () => {
             // `onlyBuiltDependencies:` array — so `pnpm install` runs the native
             // build scripts without the interactive `pnpm approve-builds` step.
             expect(workspace).toContain("allowBuilds:");
-            expect(workspace).toContain("esbuild: true");
+            expect(workspace).toContain("'esbuild': true");
+            // Optional native builds a scaffold doesn't need are listed as denied
+            // (so pnpm neither prompts nor requires a C/C++ toolchain).
+            expect(workspace).toContain("'ssh2': false");
         });
 
         it("does not install when the user declines the offer", async () => {
@@ -173,6 +176,28 @@ describe("lunora init", () => {
 
             expect(result.code).toBe(0);
             expect(calls).toHaveLength(0);
+        });
+
+        it("prints package-manager-neutral overlay next-steps for an npm project", async () => {
+            expect.assertions(3);
+
+            // An existing react-router project that declares npm; the overlay path
+            // (`--in-place`) must render its next-steps with the project's manager.
+            writeFileSync(
+                join(workdir, "package.json"),
+                JSON.stringify({ devDependencies: { "@react-router/dev": "^7.0.0" }, packageManager: "npm@10.9.0" }),
+                "utf8",
+            );
+            const infos: string[] = [];
+            const logger: Logger = { ...silentLogger(), info: (message) => infos.push(message) };
+
+            const result = await runInitCommand({ cwd: workdir, inPlace: true, logger });
+
+            const printed = infos.join("\n");
+
+            expect(result.code).toBe(0);
+            expect(printed).toContain("npm install @lunora/react");
+            expect(printed).not.toContain("pnpm add");
         });
 
         it("substitutes {{name}} placeholders", async () => {
@@ -246,6 +271,36 @@ describe("lunora init", () => {
             // Third-party deps keep their template ranges verbatim.
             expect(pkg.dependencies["react-dom"]).toBe("^19.0.0");
             expect(pkg.devDependencies.wrangler).toBe("^4.74.0");
+        });
+
+        it("pins a STABLE published version exactly when the channel tag resolves to it (1.0 promotion)", async () => {
+            expect.assertions(4);
+
+            // After the 1.0 promotion the channel tag resolves to a stable
+            // version; the scaffold must pin that exact version — never the
+            // `^0.0.0` placeholder and never a floating `alpha` tag.
+            stubRegistry("1.0.0");
+
+            await runInitCommand({
+                cwd: workdir,
+                from: templatesRoot,
+                logger: silentLogger(),
+                name: "stable-stamped",
+                templateType: "tanstack-start-react",
+            });
+
+            const pkg = JSON.parse(readFileSync(join(workdir, "stable-stamped", "package.json"), "utf8")) as {
+                dependencies: Record<string, string>;
+                devDependencies: Record<string, string>;
+            };
+
+            expect(pkg.dependencies.lunorash).toBe("1.0.0");
+            expect(pkg.dependencies["@lunora/react"]).toBe("1.0.0");
+            expect(pkg.devDependencies["@lunora/vite"]).toBe("1.0.0");
+
+            const raw = readFileSync(join(workdir, "stable-stamped", "package.json"), "utf8");
+
+            expect(raw).not.toContain("^0.0.0");
         });
 
         it("falls back to the channel dist-tag when the registry lookup fails (offline)", async () => {
@@ -356,6 +411,38 @@ describe("lunora init", () => {
             expect(pkg).toContain('"name": "starter"');
         });
 
+        it("next template scaffolds app router + two-worker entries", async () => {
+            expect.assertions(12);
+
+            const result = await runInitCommand({
+                cwd: workdir,
+                from: templatesRoot,
+                logger: silentLogger(),
+                name: "next-app",
+                templateType: "next",
+            });
+
+            expect(result.code).toBe(0);
+
+            const target = join(workdir, "next-app");
+
+            expect(existsSync(join(target, "next.config.ts"))).toBe(true);
+            expect(existsSync(join(target, "open-next.config.ts"))).toBe(true);
+            expect(existsSync(join(target, "app", "layout.tsx"))).toBe(true);
+            expect(existsSync(join(target, "app", "page.tsx"))).toBe(true);
+            expect(existsSync(join(target, "lunora", "schema.ts"))).toBe(true);
+            // Two-worker split: Next SSR worker config + standalone Lunora worker.
+            expect(existsSync(join(target, "wrangler.jsonc"))).toBe(true);
+            expect(existsSync(join(target, "wrangler.lunora.jsonc"))).toBe(true);
+            expect(existsSync(join(target, "lunora", "server.ts"))).toBe(true);
+
+            const pkg = readFileSync(join(target, "package.json"), "utf8");
+
+            expect(pkg).toContain('"next"');
+            expect(pkg).toContain("@lunora/react");
+            expect(pkg).toContain('"name": "next-app"');
+        });
+
         it("vinext (App Router) template scaffolds the class-A composed worker", async () => {
             expect.assertions(4);
 
@@ -423,6 +510,60 @@ describe("lunora init", () => {
             expect(errors.join("\n")).toContain("not empty");
         });
 
+        it("refuses an empty project name", async () => {
+            expect.assertions(3);
+
+            const errors: string[] = [];
+
+            const result = await runInitCommand({
+                cwd: workdir,
+                from: templatesRoot,
+                logger: { ...silentLogger(), error: (message) => errors.push(message) },
+                name: "",
+                templateType: "tanstack-start-react",
+            });
+
+            expect(result.code).toBe(1);
+            expect(errors.join("\n")).toContain("refusing an empty project name");
+            // cwd itself must not have been scaffolded into (e.g. no package.json dropped in workdir)
+            expect(existsSync(join(workdir, "package.json"))).toBe(false);
+        });
+
+        it("refuses a whitespace-only project name", async () => {
+            expect.assertions(3);
+
+            const errors: string[] = [];
+
+            const result = await runInitCommand({
+                cwd: workdir,
+                from: templatesRoot,
+                logger: { ...silentLogger(), error: (message) => errors.push(message) },
+                name: "   ",
+                templateType: "tanstack-start-react",
+            });
+
+            expect(result.code).toBe(1);
+            expect(errors.join("\n")).toContain("refusing an empty project name");
+            expect(existsSync(join(workdir, "   "))).toBe(false);
+        });
+
+        it("trims a whitespace-padded name so the target dir is not whitespace-padded", async () => {
+            expect.assertions(3);
+
+            const result = await runInitCommand({
+                cwd: workdir,
+                from: templatesRoot,
+                logger: silentLogger(),
+                name: "  padded-app  ",
+                templateType: "tanstack-start-react",
+            });
+
+            expect(result.code).toBe(0);
+            // The trimmed name is used for the target dir — no whitespace-padded folder.
+            expect(existsSync(join(workdir, "padded-app", "package.json"))).toBe(true);
+            expect(existsSync(join(workdir, "  padded-app  "))).toBe(false);
+        });
+
         it("--from with missing template reports a helpful error", async () => {
             expect.assertions(2);
 
@@ -440,10 +581,12 @@ describe("lunora init", () => {
             expect(errors.join("\n")).toContain("template not found in local source");
         });
 
-        it("isTemplate accepts the real template dir names incl. vinext (not the removed vite-react)", () => {
-            expect.assertions(10);
+        it("isTemplate accepts the real template dir names incl. next and vinext (not the removed vite-react)", () => {
+            expect.assertions(12);
 
             expect(isTemplate("astro")).toBe(true);
+            expect(isTemplate("expo")).toBe(true);
+            expect(isTemplate("next")).toBe(true);
             expect(isTemplate("nuxt")).toBe(true);
             expect(isTemplate("standalone")).toBe(true);
             expect(isTemplate("sveltekit")).toBe(true);
@@ -476,6 +619,34 @@ describe("lunora init", () => {
             expect(existsSync(join(target, "wrangler.jsonc"))).toBe(true);
             // vite.config.ts does NOT exist in the astro template (class-B framework)
             expect(existsSync(join(target, "vite.config.ts"))).toBe(false);
+        });
+
+        it("expo template scaffolds the RN client, worker backend, and app config", async () => {
+            expect.assertions(8);
+
+            const result = await runInitCommand({
+                cwd: workdir,
+                from: templatesRoot,
+                logger: silentLogger(),
+                name: "expo-app",
+                templateType: "expo",
+            });
+
+            expect(result.code).toBe(0);
+
+            const target = join(workdir, "expo-app");
+            const appJson = readFileSync(join(target, "app.json"), "utf8");
+
+            // Expo-specific entry + config — proves we did NOT fall back to vite.
+            expect(existsSync(join(target, "app.json"))).toBe(true);
+            expect(existsSync(join(target, "App.tsx"))).toBe(true);
+            expect(existsSync(join(target, "src", "Chat.tsx"))).toBe(true);
+            // The worker backend + Lunora schema.
+            expect(existsSync(join(target, "src", "server", "index.ts"))).toBe(true);
+            expect(existsSync(join(target, "lunora", "schema.ts"))).toBe(true);
+            expect(existsSync(join(target, "wrangler.jsonc"))).toBe(true);
+            // {{name}} is substituted into the app manifest.
+            expect(appJson).toContain('"slug": "expo-app"');
         });
     });
 

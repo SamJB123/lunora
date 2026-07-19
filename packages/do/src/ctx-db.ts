@@ -29,6 +29,7 @@
 
 /* eslint-disable unicorn/prevent-abbreviations -- "ctx-db" is the established public module name: src/index.ts and every consumer/test import `createShardCtxDb` / `CtxDbOptions` from "./ctx-db.js", and it deliberately mirrors @lunora/d1's "d1-ctx-db.ts" twin. Renaming the file or those exports would break those importers. `doc`/`docs` is the domain term for a stored document throughout the DO/D1 ORM. */
 
+import { LunoraError } from "@lunora/errors";
 import type { SQL } from "drizzle-orm";
 // Aliased: this module already uses `sql` for the workerd `SqlExec` (see `runSql`), so the drizzle tag is `dsql`.
 import { sql as dsql } from "drizzle-orm";
@@ -75,7 +76,7 @@ import type { ReactiveCache } from "./reactive-cache";
 import type { RelationExistsMarker } from "./relation-predicates";
 import { assertFlatPredicate as assertFlatRelationPredicate, resolveRelationPredicates } from "./relation-predicates";
 import type { RelationDefinitionLike } from "./relations";
-import { applyOnDelete, resolveWith, runRowValidators } from "./relations";
+import { applyOnDelete, fanOutScalarCounts, resolveWith, runRowValidators } from "./relations";
 import { guardWriter } from "./rls-guard";
 import { buildFtsMatch, ftsTableName, scoreDocument, stringifySearchText, tokenizeSearch } from "./search-text";
 import type { SystemDatabaseReader, SystemReaderSchedulerLike, SystemReaderStorageLike } from "./system-reader";
@@ -271,7 +272,7 @@ const CLIENT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a
  */
 const assertValidClientId = (clientId: string): void => {
     if (!CLIENT_ID_PATTERN.test(clientId)) {
-        throw new Error(`invalid clientId ${JSON.stringify(clientId)}: a client-supplied row id must be a UUID`);
+        throw new LunoraError("INTERNAL", `invalid clientId ${JSON.stringify(clientId)}: a client-supplied row id must be a UUID`);
     }
 };
 
@@ -499,11 +500,11 @@ const assertBatchLimit = (count: number, limit: number | undefined, op: string):
     const cap = limit ?? DEFAULT_BATCH_LIMIT;
 
     if (count > cap) {
-        throw Object.assign(new Error(`${op}: batch of ${String(count)} exceeds the limit of ${String(cap)} (raise options.limit or chunk the call)`), {
-            code: "BATCH_LIMIT_EXCEEDED",
-            name: "LunoraError",
-            status: 400,
-        });
+        throw new LunoraError(
+            "BATCH_LIMIT_EXCEEDED",
+            `${op}: batch of ${String(count)} exceeds the limit of ${String(cap)} (raise options.limit or chunk the call)`,
+            { status: 400 },
+        );
     }
 };
 
@@ -549,6 +550,15 @@ interface DatabaseWriterLike {
      * to the global writer, so no global batch method is needed.
      */
     deleteMany?: (ids: ReadonlyArray<string>, options?: { limit?: number }, expectedTable?: string) => Promise<{ deleted: number }>;
+
+    /**
+     * Delete every row matching `where` in one call. Matching rows are resolved
+     * first, then each row is deleted through the single-row delete pipeline so
+     * companions, CDC, and broadcast stay correct. **Atomic within a mutation** —
+     * the DO wraps a mutation's dispatch in a BEGIN/COMMIT span, so a mid-batch
+     * throw rolls the whole mutation back. (An action has no transaction span.)
+     */
+    deleteWhere?: (tableName: string, where: WhereInput, options?: { limit?: number }) => Promise<{ deleted: number }>;
     findFirst: (tableName: string, args?: QueryArgs) => Promise<Record<string, unknown> | null>;
     findFirstOrThrow: (tableName: string, args?: QueryArgs) => Promise<Record<string, unknown>>;
     findMany: (tableName: string, args?: QueryArgs) => Promise<QueryPage>;
@@ -584,11 +594,13 @@ interface DatabaseWriterLike {
      * Insert many documents into one table (a loop over `insert()`),
      * returning the minted ids in input order. Each row gets defaults,
      * validators, triggers, companion sync, CDC, and broadcast exactly as a
-     * single insert; the caller pays one round-trip instead of N. **Atomic within
-     * a mutation** — the DO wraps a mutation's dispatch in a BEGIN/COMMIT span, so
-     * a mid-batch throw rolls the whole mutation back. (An action has no
-     * transaction span — there, the prior inserts persist; the in-memory test
-     * harness mirrors the span.)
+     * single insert; the caller pays one round-trip instead of N. Pass
+     * `options.skipDuplicates: true` to turn UNIQUE-constraint breaches into
+     * `null` results for that row instead of failing the whole batch.
+     * **Atomic within a mutation** — the DO wraps a mutation's dispatch in a
+     * BEGIN/COMMIT span, so a mid-batch throw rolls the whole mutation back. (An
+     * action has no transaction span — there, the prior inserts persist; the
+     * in-memory test harness mirrors the span.)
      * Rejects a batch larger than `options.limit` (default {@link DEFAULT_BATCH_LIMIT}).
      *
      * Optional on the interface (like `rankBefore`): the DO writer implements it;
@@ -596,7 +608,11 @@ interface DatabaseWriterLike {
      * batched per-row through the DO writer's loop, which routes each `insert()`
      * to the global writer, so no global batch method is needed.
      */
-    insertMany?: (tableName: string, documents: ReadonlyArray<Record<string, unknown>>, options?: { limit?: number }) => Promise<string[]>;
+    insertMany?: (
+        tableName: string,
+        documents: ReadonlyArray<Record<string, unknown>>,
+        options?: { limit?: number; skipDuplicates?: boolean },
+    ) => Promise<(string | null)[]>;
 
     /**
      * Trusted bulk insert: one multi-row `INSERT` that **skips per-row `.check()`
@@ -648,7 +664,21 @@ interface DatabaseWriterLike {
      * batched per-row through the DO writer's loop, which routes each `patch()`
      * to the global writer, so no global batch method is needed.
      */
-    patchMany?: (patches: ReadonlyArray<{ id: string; patch: Record<string, unknown> }>, options?: { limit?: number }, expectedTable?: string) => Promise<void>;
+    patchMany?: (
+        patches: ReadonlyArray<{ id: string; patch: Record<string, unknown> }>,
+        options?: { limit?: number },
+        expectedTable?: string,
+    ) => Promise<{ patched: number }>;
+
+    /**
+     * Patch every row matching `where` with the same `patch` in one call.
+     * Matching rows are resolved first, then each row is patched through the
+     * single-row patch pipeline so companions, CDC, and broadcast stay correct.
+     * **Atomic within a mutation** — the DO wraps a mutation's dispatch in a
+     * BEGIN/COMMIT span, so a mid-batch throw rolls the whole mutation back. (An
+     * action has no transaction span.)
+     */
+    patchWhere?: (tableName: string, args: { patch: Record<string, unknown>; where: WhereInput }, options?: { limit?: number }) => Promise<{ patched: number }>;
     query: (tableName: string) => TableReaderLike;
 
     /**
@@ -703,7 +733,7 @@ interface DatabaseWriterLike {
      * since a global table has no shard boundaries to merge across.
      */
     rankPageRows?: (tableName: string, indexName: string, options?: RankPageOptions) => Promise<ShardRankPageResult>;
-    replace: (id: string, document: Record<string, unknown>, expectedTable?: string) => Promise<void>;
+    replace: (id: string, document: Record<string, unknown>, expectedTable?: string, options?: { allowExplicitId?: boolean }) => Promise<void>;
 
     /**
      * Un-soft-delete a row: clears the `.softDelete()` marker column (a by-id
@@ -785,7 +815,7 @@ const createSearchBuilder = (search: SearchStage, tableName: string): SearchFilt
     const builder: SearchFilterBuilderLike = {
         eq: (field, value) => {
             if (!search.definition.filterFields?.includes(field)) {
-                throw new Error(`field "${field}" is not a filter field of search index "${search.indexName}" on table "${tableName}"`);
+                throw new LunoraError("INTERNAL", `field "${field}" is not a filter field of search index "${search.indexName}" on table "${tableName}"`);
             }
 
             search.filters.push({ field, value });
@@ -794,7 +824,10 @@ const createSearchBuilder = (search: SearchStage, tableName: string): SearchFilt
         },
         search: (field, query) => {
             if (field !== search.definition.field) {
-                throw new Error(`search index "${search.indexName}" on table "${tableName}" indexes "${search.definition.field}", not "${field}"`);
+                throw new LunoraError(
+                    "INTERNAL",
+                    `search index "${search.indexName}" on table "${tableName}" indexes "${search.definition.field}", not "${field}"`,
+                );
             }
 
             // Mutate the caller-owned stage in place (same object the query
@@ -1121,19 +1154,14 @@ const paginateStage = (sql: SqlExec, tableName: string, stage: QueryStage, optio
 };
 
 /**
- * Thrown by `.unique()` when more than one row matches. Like {@link ConflictError}
- * / `NotFoundError`, `code` / `status` are declared as own properties so the
- * cross-package structural error mapper renders it as a 400 without an
- * `instanceof` check against `@lunora/do`.
+ * Thrown by `.unique()` when more than one row matches. A `LunoraError` subclass
+ * (`code: "NOT_UNIQUE"`, `status: 400`) recognised structurally by the
+ * cross-package transport mapper (via `isLunoraError`) without an `instanceof`
+ * check against `@lunora/do`.
  */
-class NotUniqueError extends Error {
-    public readonly code: string = "NOT_UNIQUE";
-
-    public readonly status: number = 400;
-
+class NotUniqueError extends LunoraError {
     public constructor(message: string = "unique() found more than one matching document") {
-        super(message);
-        this.name = "NotUniqueError";
+        super("NOT_UNIQUE", message, { name: "NotUniqueError" });
     }
 }
 
@@ -1157,7 +1185,7 @@ const NUL_CHARACTER = String.fromCodePoint(0);
  */
 const normalizeIdStructurally = (schema: SchemaLike, tableName: string, id: string): null | string => {
     if (!schema.tables[tableName]) {
-        throw new Error(`unknown table: ${tableName}`);
+        throw new LunoraError("INTERNAL", `unknown table: ${tableName}`);
     }
 
     // Reject empties and any id carrying whitespace or a NUL byte — no minter in
@@ -1174,7 +1202,7 @@ const buildReader = (sql: SqlExec, schema: SchemaLike, tableName: string, onInde
     const tableDefinition = schema.tables[tableName];
 
     if (!tableDefinition) {
-        throw new Error(`unknown table: ${tableName}`);
+        throw new LunoraError("INTERNAL", `unknown table: ${tableName}`);
     }
 
     // Soft delete: the fluent reader (`ctx.db.query(table)...`) always hides
@@ -1195,7 +1223,7 @@ const buildReader = (sql: SqlExec, schema: SchemaLike, tableName: string, onInde
         const { search } = stage;
 
         if (!search) {
-            throw new Error("runSearchFetch called without a staged search");
+            throw new LunoraError("INTERNAL", "runSearchFetch called without a staged search");
         }
 
         const filtered = stage.inMemoryFilters.length > 0;
@@ -1307,7 +1335,7 @@ const buildReader = (sql: SqlExec, schema: SchemaLike, tableName: string, onInde
         // eslint-disable-next-line @typescript-eslint/require-await -- TableReaderLike returns Promises (the D1 twin awaits real I/O); the DO impl is synchronous over local SQLite
         async paginate(options) {
             if (stage.search) {
-                throw new Error("pagination is not supported on search queries; use .take(n) or .collect()");
+                throw new LunoraError("INTERNAL", "pagination is not supported on search queries; use .take(n) or .collect()");
             }
 
             return paginateStage(sql, tableName, stage, options, scopeCondition);
@@ -1333,7 +1361,7 @@ const buildReader = (sql: SqlExec, schema: SchemaLike, tableName: string, onInde
             const definition = tableDefinition.indexes.find((index) => index.name === indexName);
 
             if (!definition) {
-                throw new Error(`unknown index "${indexName}" on table "${tableName}"`);
+                throw new LunoraError("INTERNAL", `unknown index "${indexName}" on table "${tableName}"`);
             }
 
             onIndexUse(tableName, indexName, "index");
@@ -1350,7 +1378,7 @@ const buildReader = (sql: SqlExec, schema: SchemaLike, tableName: string, onInde
             const definition = (tableDefinition.searchIndexes ?? []).find((index) => index.name === indexName);
 
             if (!definition) {
-                throw new Error(`unknown search index "${indexName}" on table "${tableName}"`);
+                throw new LunoraError("INTERNAL", `unknown search index "${indexName}" on table "${tableName}"`);
             }
 
             onIndexUse(tableName, indexName, "search");
@@ -1368,7 +1396,7 @@ const buildReader = (sql: SqlExec, schema: SchemaLike, tableName: string, onInde
             search(createSearchBuilder(searchStage, tableName));
 
             if (!searchStage.hasQuery) {
-                throw new Error(`search index "${indexName}" on table "${tableName}" requires a .search(field, query) call`);
+                throw new LunoraError("INTERNAL", `search index "${indexName}" on table "${tableName}" requires a .search(field, query) call`);
             }
 
             return reader;
@@ -1464,7 +1492,10 @@ const applyOnUpdate = (
 const assertNoExplicitUndefined = (op: "patch" | "replace", document: Record<string, unknown>): void => {
     for (const field of Object.keys(document)) {
         if (document[field] === undefined) {
-            throw new Error(`Cannot ${op} field '${field}' to undefined — use null to clear a nullable field, or omit the key to leave it unchanged.`);
+            throw new LunoraError(
+                "INTERNAL",
+                `Cannot ${op} field '${field}' to undefined — use null to clear a nullable field, or omit the key to leave it unchanged.`,
+            );
         }
     }
 };
@@ -1634,7 +1665,10 @@ const createShardCtxDb = (options: CtxDbOptions): DatabaseWriterLike => {
     const routeBackend = (table: string, op: "cascade" | "relation load"): DatabaseWriterLike => {
         if (isGlobalTable(table)) {
             if (!globalDb) {
-                throw new Error(`cross-backend ${op} for global table '${table}' requires a globalDb writer — pass one to createShardCtxDb({ globalDb })`);
+                throw new LunoraError(
+                    "INTERNAL",
+                    `cross-backend ${op} for global table '${table}' requires a globalDb writer — pass one to createShardCtxDb({ globalDb })`,
+                );
             }
 
             return globalDb;
@@ -1667,7 +1701,7 @@ const createShardCtxDb = (options: CtxDbOptions): DatabaseWriterLike => {
         }
 
         if (!globalDb) {
-            throw new Error(`${op} on global table '${tableName}' requires a globalDb writer — pass one to createShardCtxDb({ globalDb })`);
+            throw new LunoraError("INTERNAL", `${op} on global table '${tableName}' requires a globalDb writer — pass one to createShardCtxDb({ globalDb })`);
         }
 
         return globalDb;
@@ -1683,15 +1717,12 @@ const createShardCtxDb = (options: CtxDbOptions): DatabaseWriterLike => {
     const globalFallback = (): DatabaseWriterLike | undefined => globalDb;
 
     /**
-     * Backend-routed `fetcher`/`counter` pair handed to {@link resolveWith} so a
-     * shard-local parent's `with` can load a global (D1) child in one bounded
-     * `IN (...)` read. The unsupported direction (global parent → shard-local
-     * child) is rejected upstream in `resolveWith`'s `requireRelation`.
+     * Backend-routed `fetcher`/`groupedCounter` pair handed to {@link resolveWith}
+     * so a shard-local parent's `with` can load a global (D1) child in one bounded
+     * `IN (...)` read and count children in one grouped query.
      */
     const relationFetcher = (relationTable: string, relationArgs: QueryArgs): Promise<QueryPage> =>
         routeBackend(relationTable, "relation load").findMany(relationTable, relationArgs);
-    const relationCounter = (relationTable: string, relationWhere?: WhereInput): Promise<number> =>
-        routeBackend(relationTable, "relation load").count(relationTable, relationWhere);
 
     /**
      * Child reader for relation-predicate semijoin resolution. A local child
@@ -1751,6 +1782,83 @@ const createShardCtxDb = (options: CtxDbOptions): DatabaseWriterLike => {
             schema,
             tableName: predicateTable,
         });
+
+    /**
+     * Grouped aggregate counter for `_count` relation loading. For shard-local
+     * children, runs a single `SELECT :whereField AS __fk__, COUNT(*) … GROUP BY
+     * :whereField` against this DO's SQLite and returns all per-parent tallies in
+     * one query. For global (D1) children, fans out parallel scalar `count()`
+     * calls — one per distinct FK value — through the `globalDb` writer, since
+     * the `DatabaseWriterLike` interface doesn't expose a grouped-count method.
+     *
+     * CORRECTNESS: `policyWhere` (the child table's RLS read filter) may contain
+     * Prisma-style relation predicates (e.g. `{author:{is:W}}`). These must be
+     * resolved via `resolveAggregateRelations` BEFORE `compileWhereSql` is called;
+     * otherwise the relation node is treated as scalar equality and never matches,
+     * making every `_count` return 0. The cross-backend (fan-out) path routes
+     * through the full `count()` method, which already resolves relation predicates
+     * internally, so only the local grouped path needs this step.
+     */
+    const relationGroupedCounter = async (
+        relationTable: string,
+        whereField: string,
+        values: unknown[],
+        policyWhere?: WhereInput,
+    ): Promise<Map<unknown, number>> => {
+        const globalWriter = globalWriterFor(relationTable, "relation grouped count");
+
+        if (globalWriter) {
+            // Global (D1) child: parallel scalar counts through the D1 writer.
+            // The D1 writer's count() already resolves relation predicates internally.
+            // Stamp a scan dependency: any row in the child table can shift a count.
+            onRead(relationTable, SCAN_DEP);
+
+            return fanOutScalarCounts((t, w) => globalWriter.count(t, w), relationTable, whereField, values, policyWhere);
+        }
+
+        // Shard-local child: one grouped SQL query.
+        const definition = schema.tables[relationTable];
+
+        if (!definition) {
+            throw new LunoraError("INTERNAL", `unknown table: ${relationTable}`);
+        }
+
+        // Register a scan dependency — any insert/delete in the child table can
+        // shift a count, so invalidate the same way the scalar count path did.
+        onRead(relationTable, SCAN_DEP);
+
+        // Build WHERE: whereField IN (values) [AND policyWhere] [AND softDeleteScope].
+        // Then resolve any relation predicates in the combined WHERE before compiling
+        // to SQL. Without resolution, a relation predicate in policyWhere (e.g.
+        // {author:{is:W}}) is compiled as scalar equality and never matches, causing
+        // every _count to silently return 0 (fail-closed but wrong).
+        const softScope = softDeleteScope(definition.softDeleteMode, undefined);
+        const inFilter: WhereInput = { [whereField]: { in: values } };
+        const combined = mergeWhere(mergeWhere(inFilter, policyWhere), softScope);
+        // resolveAggregateRelations rewrites relation-crossing predicates (e.g.
+        // {author:{is:W}}) into flat IN clauses before SQL compilation — same path
+        // count() / findMany() use. Pass `undefined` for relationBaseWhere (consistent
+        // with how the scalar counter was called: no nested policy threading).
+        const resolvedCombined = await resolveAggregateRelations(combined, relationTable, undefined);
+        const whereCondition = compileWhereSql(resolvedCombined, doWhereSqlStrategy);
+
+        // `jsonPathSql` maps `_id` → `id` (physical column) and user fields to
+        // `json_extract(__doc__, '$.field')`, matching how WHERE compiles the
+        // same field — so GROUP BY and WHERE are consistent.
+        const fieldSql = jsonPathSql(whereField);
+
+        let query = dsql`SELECT ${fieldSql} AS __fk__, COUNT(*) AS count FROM ${dsql.identifier(relationTable)}`;
+
+        if (whereCondition) {
+            query = dsql`${query} WHERE ${whereCondition}`;
+        }
+
+        query = dsql`${query} GROUP BY ${fieldSql}`;
+
+        const rows = runDrizzle<{ __fk__: unknown; count: number }>(sql, query).toArray();
+
+        return new Map(rows.map((row) => [row["__fk__"], row.count]));
+    };
 
     let triggerDepth = 0;
 
@@ -1947,7 +2055,7 @@ const createShardCtxDb = (options: CtxDbOptions): DatabaseWriterLike => {
             const definition = schema.tables[tableName];
 
             if (!definition) {
-                throw new Error(`unknown table: ${tableName}`);
+                throw new LunoraError("INTERNAL", `unknown table: ${tableName}`);
             }
 
             // Reject an off-allowlist `op` up front (it's a compile-time-only
@@ -1966,7 +2074,7 @@ const createShardCtxDb = (options: CtxDbOptions): DatabaseWriterLike => {
             }
 
             if (!aggOptions.field) {
-                throw new Error(`aggregate(${tableName}, { op: "${aggOptions.op}" }): "field" is required for non-count reducers`);
+                throw new LunoraError("INTERNAL", `aggregate(${tableName}, { op: "${aggOptions.op}" }): "field" is required for non-count reducers`);
             }
 
             onRead(tableName, SCAN_DEP);
@@ -2039,7 +2147,7 @@ const createShardCtxDb = (options: CtxDbOptions): DatabaseWriterLike => {
             const definition = schema.tables[tableName];
 
             if (!definition) {
-                throw new Error(`unknown table: ${tableName}`);
+                throw new LunoraError("INTERNAL", `unknown table: ${tableName}`);
             }
 
             const countOptions = normalizeCountArgument(whereOrOptions);
@@ -2268,6 +2376,40 @@ const createShardCtxDb = (options: CtxDbOptions): DatabaseWriterLike => {
             return { deleted: ids.length };
         },
 
+        async deleteWhere(tableName, where, batchOptions) {
+            const global = globalWriterFor(tableName, "deleteWhere");
+
+            let ids: string[];
+
+            if (global) {
+                // Global tables have no native batch primitive; resolve ids and
+                // route each delete through the DO's single-row pipeline, which
+                // forwards to the global writer.
+                const rows = await global.findMany(tableName, { where });
+                ids = rows.page.map((row) => String(row["_id"]));
+            } else {
+                if (!schema.tables[tableName]) {
+                    throw new LunoraError("INTERNAL", `unknown table: ${tableName}`);
+                }
+
+                // Resolve matching rows first. The mutation-span (if any) keeps
+                // the read and the subsequent deletes consistent.
+                const page = await writer.findMany(tableName, { where });
+                ids = page.page.map((row) => String(row["_id"]));
+            }
+
+            assertBatchLimit(ids.length, batchOptions?.limit, "deleteWhere");
+
+            // Reuse the id-based pipeline so triggers, companions, CDC, and
+            // broadcast all fire correctly. The concrete DO writer always
+            // implements deleteMany; the optional type is for global/D1 twins.
+            if (writer.deleteMany === undefined) {
+                throw new LunoraError("INTERNAL", `ctx.db.${tableName}.deleteMany is unavailable: this writer has no batch delete`);
+            }
+
+            return writer.deleteMany(ids, batchOptions);
+        },
+
         async findFirst(tableName, args = {}) {
             const result = await writer.findMany(tableName, { ...args, limit: 1 });
 
@@ -2302,7 +2444,7 @@ const createShardCtxDb = (options: CtxDbOptions): DatabaseWriterLike => {
             const findManyDefinition = schema.tables[tableName];
 
             if (!findManyDefinition) {
-                throw new Error(`unknown table: ${tableName}`);
+                throw new LunoraError("INTERNAL", `unknown table: ${tableName}`);
             }
 
             // A query with no `where` and no `baseWhere` is a true full-table
@@ -2395,7 +2537,7 @@ const createShardCtxDb = (options: CtxDbOptions): DatabaseWriterLike => {
             if (limit === undefined) {
                 if (args.with) {
                     await resolveWith({
-                        counter: relationCounter,
+                        groupedCounter: relationGroupedCounter,
                         fetcher: relationFetcher,
                         parents: docs,
                         relationBaseWhere: args.relationBaseWhere,
@@ -2415,8 +2557,8 @@ const createShardCtxDb = (options: CtxDbOptions): DatabaseWriterLike => {
 
             if (args.with) {
                 await resolveWith({
-                    counter: relationCounter,
                     fetcher: relationFetcher,
+                    groupedCounter: relationGroupedCounter,
                     parents: page,
                     relationBaseWhere: args.relationBaseWhere,
                     schema,
@@ -2492,7 +2634,7 @@ const createShardCtxDb = (options: CtxDbOptions): DatabaseWriterLike => {
             const definition = schema.tables[tableName];
 
             if (!definition) {
-                throw new Error(`unknown table: ${tableName}`);
+                throw new LunoraError("INTERNAL", `unknown table: ${tableName}`);
             }
 
             onRead(tableName, SCAN_DEP);
@@ -2503,7 +2645,7 @@ const createShardCtxDb = (options: CtxDbOptions): DatabaseWriterLike => {
             aggregateSqlFunction(agg.op);
 
             if (agg.op !== "count" && !agg.field) {
-                throw new Error(`groupBy(${tableName}, { agg: { op: "${agg.op}" } }): "field" is required for non-count reducers`);
+                throw new LunoraError("INTERNAL", `groupBy(${tableName}, { agg: { op: "${agg.op}" } }): "field" is required for non-count reducers`);
             }
 
             // Soft delete: group over LIVE rows only; AND the scope in and force
@@ -2583,7 +2725,7 @@ const createShardCtxDb = (options: CtxDbOptions): DatabaseWriterLike => {
                 const { field } = agg;
 
                 if (field === undefined) {
-                    throw new Error(`groupBy(${tableName}, { agg: { op: "${agg.op}" } }): "field" is required for non-count reducers`);
+                    throw new LunoraError("INTERNAL", `groupBy(${tableName}, { agg: { op: "${agg.op}" } }): "field" is required for non-count reducers`);
                 }
 
                 select.push(dsql`${dsql.raw(aggregateSqlFunction(agg.op))}(${jsonPathSql(field)}) AS value`);
@@ -2640,7 +2782,7 @@ const createShardCtxDb = (options: CtxDbOptions): DatabaseWriterLike => {
             const definition = schema.tables[tableName];
 
             if (!definition) {
-                throw new Error(`unknown table: ${tableName}`);
+                throw new LunoraError("INTERNAL", `unknown table: ${tableName}`);
             }
 
             const withDefaults = applyInsertDefaults(definition, document, auth);
@@ -2664,7 +2806,11 @@ const createShardCtxDb = (options: CtxDbOptions): DatabaseWriterLike => {
             } else {
                 id = generateId();
             }
-            const creationTime = typeof withDefaults["_creationTime"] === "number" ? withDefaults["_creationTime"] : clock();
+            // Like `_id` above, a document-supplied `_creationTime` is only honored
+            // under the trusted-import `allowExplicitId` opt-in. The default mutation
+            // path (and the optimistic `clientId` path) mints from `clock()` so a
+            // raw-forwarded client payload can't backdate/forward-date the row.
+            const creationTime = insertOptions?.allowExplicitId && typeof withDefaults["_creationTime"] === "number" ? withDefaults["_creationTime"] : clock();
 
             const documentWithMeta: Record<string, unknown> = { ...withDefaults, _creationTime: creationTime, _id: id };
 
@@ -2731,7 +2877,7 @@ const createShardCtxDb = (options: CtxDbOptions): DatabaseWriterLike => {
             const definition = schema.tables[tableName];
 
             if (!definition) {
-                throw new Error(`unknown table: ${tableName}`);
+                throw new LunoraError("INTERNAL", `unknown table: ${tableName}`);
             }
 
             // Backfill the counters once against the pre-insert snapshot (same
@@ -2746,7 +2892,10 @@ const createShardCtxDb = (options: CtxDbOptions): DatabaseWriterLike => {
             const rows = documents.map((document) => {
                 const withDefaults = applyInsertDefaults(definition, document, auth);
                 const id = batchOptions?.allowExplicitId === true && typeof withDefaults["_id"] === "string" ? withDefaults["_id"] : generateId();
-                const creationTime = typeof withDefaults["_creationTime"] === "number" ? withDefaults["_creationTime"] : clock();
+                // Gate `_creationTime` behind the same `allowExplicitId` opt-in as
+                // `_id` above — the default path mints from `clock()`.
+                const creationTime =
+                    batchOptions?.allowExplicitId === true && typeof withDefaults["_creationTime"] === "number" ? withDefaults["_creationTime"] : clock();
 
                 return { creationTime, document: { ...withDefaults, _creationTime: creationTime, _id: id }, id };
             });
@@ -2783,11 +2932,23 @@ const createShardCtxDb = (options: CtxDbOptions): DatabaseWriterLike => {
             // mid-loop throw; in an action (no span) prior inserts persist.
             // The win is one caller round-trip, not fewer SQLite writes. Order is
             // preserved so an FK reference to an earlier row in the same batch resolves.
-            const ids: string[] = [];
+            const skipDuplicates = batchOptions?.skipDuplicates === true;
+            const ids: (string | null)[] = [];
 
             for (const document of documents) {
-                // eslint-disable-next-line no-await-in-loop -- sequential by design: preserves insert order + the single-threaded SQLite transaction
-                ids.push(await writer.insert(tableName, document));
+                try {
+                    // eslint-disable-next-line no-await-in-loop -- sequential by design: preserves insert order + the single-threaded SQLite transaction
+                    ids.push(await writer.insert(tableName, document));
+                } catch (error) {
+                    if (skipDuplicates && error instanceof ConflictError && error.kind === "unique") {
+                        // Preserve the input-order slot with null so callers can
+                        // line up skipped duplicates by index.
+                        // eslint-disable-next-line unicorn/no-null -- preserve slot with null for JSON compatibility/index alignment
+                        ids.push(null);
+                    } else {
+                        throw error;
+                    }
+                }
             }
 
             return ids;
@@ -2814,14 +2975,14 @@ const createShardCtxDb = (options: CtxDbOptions): DatabaseWriterLike => {
                     return;
                 }
 
-                throw new Error(`document not found: ${id}`);
+                throw new LunoraError("INTERNAL", `document not found: ${id}`);
             }
 
             const { docJson: existingJson, row: existing, tableName } = located;
             const tableDefinition = schema.tables[tableName];
 
             if (!tableDefinition) {
-                throw new Error(`unknown table: ${tableName}`);
+                throw new LunoraError("INTERNAL", `unknown table: ${tableName}`);
             }
 
             onRead(tableName, id);
@@ -2891,6 +3052,48 @@ const createShardCtxDb = (options: CtxDbOptions): DatabaseWriterLike => {
                 // eslint-disable-next-line no-await-in-loop -- sequential by design: single-threaded SQLite transaction
                 await writer.patch(entry.id, entry.patch, expectedTable);
             }
+
+            return { patched: patches.length };
+        },
+
+        async patchWhere(tableName, args, batchOptions) {
+            const global = globalWriterFor(tableName, "patchWhere");
+
+            let patches: { id: string; patch: Record<string, unknown> }[];
+
+            if (global) {
+                // Global tables have no native batch primitive; resolve ids and
+                // route each patch through the DO's single-row pipeline, which
+                // forwards to the global writer.
+                const rows = await global.findMany(tableName, { where: args.where });
+                patches = rows.page.map((row) => {
+                    return { id: String(row["_id"]), patch: args.patch };
+                });
+            } else {
+                if (!schema.tables[tableName]) {
+                    throw new LunoraError("INTERNAL", `unknown table: ${tableName}`);
+                }
+
+                // Resolve matching rows first. The mutation-span (if any) keeps
+                // the read and the subsequent patches consistent.
+                const page = await writer.findMany(tableName, { where: args.where });
+                patches = page.page.map((row) => {
+                    return { id: String(row["_id"]), patch: args.patch };
+                });
+            }
+
+            assertBatchLimit(patches.length, batchOptions?.limit, "patchWhere");
+
+            // Reuse the id-based pipeline so OCC, triggers, companions, CDC, and
+            // broadcast all fire correctly. The concrete DO writer always
+            // implements patchMany; the optional type is for global/D1 twins.
+            if (writer.patchMany === undefined) {
+                throw new LunoraError("INTERNAL", `ctx.db.${tableName}.patchMany is unavailable: this writer has no batch patch`);
+            }
+
+            await writer.patchMany(patches, batchOptions);
+
+            return { patched: patches.length };
         },
 
         query(tableName) {
@@ -2928,13 +3131,13 @@ const createShardCtxDb = (options: CtxDbOptions): DatabaseWriterLike => {
             const definition = schema.tables[tableName];
 
             if (!definition) {
-                throw new Error(`unknown table: ${tableName}`);
+                throw new LunoraError("INTERNAL", `unknown table: ${tableName}`);
             }
 
             const index = definition.rankIndexes?.find((i) => i.name === indexName);
 
             if (!index) {
-                throw new Error(`unknown rankIndex "${indexName}" on table "${tableName}"`);
+                throw new LunoraError("INTERNAL", `unknown rankIndex "${indexName}" on table "${tableName}"`);
             }
 
             // Refuse a shard-local rank when the partition spans shards (a
@@ -3021,7 +3224,8 @@ const createShardCtxDb = (options: CtxDbOptions): DatabaseWriterLike => {
             // with a clear message instead of routing into a non-existent
             // `globalDb.rankBefore` (which would throw an opaque TypeError).
             if (isGlobalTable(tableName)) {
-                throw new Error(
+                throw new LunoraError(
+                    "INTERNAL",
                     `rankBefore is not supported on the global (.global()) table '${tableName}' — cross-shard rank cursors apply only to sharded tables`,
                 );
             }
@@ -3029,13 +3233,13 @@ const createShardCtxDb = (options: CtxDbOptions): DatabaseWriterLike => {
             const definition = schema.tables[tableName];
 
             if (!definition) {
-                throw new Error(`unknown table: ${tableName}`);
+                throw new LunoraError("INTERNAL", `unknown table: ${tableName}`);
             }
 
             const index = definition.rankIndexes?.find((i) => i.name === indexName);
 
             if (!index) {
-                throw new Error(`unknown rankIndex "${indexName}" on table "${tableName}"`);
+                throw new LunoraError("INTERNAL", `unknown rankIndex "${indexName}" on table "${tableName}"`);
             }
 
             // Same RLS coupling-seam as rank()/count(): a restricted-count ctx
@@ -3123,13 +3327,13 @@ const createShardCtxDb = (options: CtxDbOptions): DatabaseWriterLike => {
                     return;
                 }
 
-                throw new Error(`document not found: ${id}`);
+                throw new LunoraError("INTERNAL", `document not found: ${id}`);
             }
 
             const field = schema.tables[located.tableName]?.softDeleteMode?.field;
 
             if (!field) {
-                throw new Error(`ctx.db.restore: table "${located.tableName}" is not a .softDelete() table`);
+                throw new LunoraError("INTERNAL", `ctx.db.restore: table "${located.tableName}" is not a .softDelete() table`);
             }
 
             // Only an actually-soft-deleted row needs its rank entry rebuilt below
@@ -3151,7 +3355,7 @@ const createShardCtxDb = (options: CtxDbOptions): DatabaseWriterLike => {
             }
         },
 
-        async replace(id, document, expectedTable) {
+        async replace(id, document, expectedTable, replaceOptions) {
             // Single probe that also captures the read-time `__doc__` blob.
             // The before-update trigger below spans an `await`, so the write
             // must compare-and-swap on this snapshot (see `runGuardedWrite`)
@@ -3167,25 +3371,30 @@ const createShardCtxDb = (options: CtxDbOptions): DatabaseWriterLike => {
                 const global = expectedTable === undefined ? globalFallback() : undefined;
 
                 if (global) {
-                    await global.replace(id, document);
+                    await global.replace(id, document, undefined, replaceOptions);
                     return;
                 }
 
-                throw new Error(`document not found: ${id}`);
+                throw new LunoraError("INTERNAL", `document not found: ${id}`);
             }
 
             const { docJson: existingJson, row: previous, tableName } = located;
             const tableDefinition = schema.tables[tableName];
 
             if (!tableDefinition) {
-                throw new Error(`unknown table: ${tableName}`);
+                throw new LunoraError("INTERNAL", `unknown table: ${tableName}`);
             }
 
             // Reject explicit `undefined` values: the spread + JSON.stringify below
             // would silently strip them, deleting the field instead of writing it.
             assertNoExplicitUndefined("replace", document);
 
-            const creationTime = typeof document["_creationTime"] === "number" ? document["_creationTime"] : clock();
+            // A client-supplied `_creationTime` is honored only under the
+            // trusted-replay `allowExplicitId` opt-in (CDC replay, data-migration
+            // rewrite — both replay a row's original creation time). The default
+            // mutation path mints from `clock()` so a forged document
+            // `_creationTime` can't overwrite the persisted timestamp.
+            const creationTime = replaceOptions?.allowExplicitId && typeof document["_creationTime"] === "number" ? document["_creationTime"] : clock();
             const replaced: Record<string, unknown> = { ...document, _creationTime: creationTime, _id: id };
 
             applyOnUpdate(tableDefinition, document, replaced, auth);
@@ -3246,8 +3455,19 @@ export { assertValidClientId, createShardCtxDb, normalizeIdStructurally, NotUniq
 export { backfillAggregateIndexes, backfillRankIndexes } from "./ctx-db-backfill";
 export type { CdcChange } from "./ctx-db-cdc";
 export { applyCdcChanges, bumpCdcEpoch, CDC_LOG_TABLE, minCdcSeq, readCdcChanges, readCdcCursor, readCdcEpoch, trimCdcChanges } from "./ctx-db-cdc";
+export { advanceClientWatermark, CLIENT_WATERMARK_TABLE, migrateClientWatermark, readClientWatermark } from "./ctx-db-client-watermark";
+export {
+    deleteGlobalShapeSnapshot,
+    deleteGlobalShapeSnapshotsForConnection,
+    GLOBAL_SHAPE_SNAPSHOT_TABLE,
+    migrateGlobalShapeSnapshot,
+    readGlobalShapeSnapshot,
+    writeGlobalShapeSnapshot,
+} from "./ctx-db-global-shape-snapshot";
 export { IDEMPOTENCY_TABLE, readIdempotent, trimIdempotent, writeIdempotent } from "./ctx-db-idempotency";
 export { runShardMigrations } from "./ctx-db-migrations";
+export type { ShapeRow } from "./ctx-db-shapes";
+export { selectShapeMemberIds, selectShapeRows } from "./ctx-db-shapes";
 export type { SchedulerLike, TriggerContextLike, TriggerDefinitionLike, TriggerEventLike } from "./triggers";
 export type {
     BroadcastDelta,

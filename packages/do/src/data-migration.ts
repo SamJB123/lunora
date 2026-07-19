@@ -24,6 +24,8 @@
  * rows or the state table.
  */
 
+import { LunoraError } from "@lunora/errors";
+
 import type { DatabaseWriterLike, SqlCursor, SqlExec } from "./ctx-db";
 
 /** Reserved table the per-shard runner tracks migration progress in. Auto-hidden from the data browser by the `__lunora` prefix. */
@@ -377,7 +379,7 @@ const runDataMigration = async (options: RunDataMigrationOptions): Promise<Migra
     const transform = direction === "up" ? migration.up : migration.down;
 
     if (!transform) {
-        throw new Error(`data migration "${migration.id}" has no \`${direction}\` transform`);
+        throw new LunoraError("INTERNAL", `data migration "${migration.id}" has no \`${direction}\` transform`);
     }
 
     // eslint-disable-next-line unicorn/no-null -- keyset cursor: null is the "start of table" sentinel and the value bound to the SQLite cursor column
@@ -460,8 +462,13 @@ const runDataMigration = async (options: RunDataMigrationOptions): Promise<Migra
                     changed += 1;
 
                     if (!dryRun) {
+                        // Trusted rewrite: preserve the row's original `_creationTime`
+                        // via the `allowExplicitId` opt-in (default replace mints a
+                        // fresh clock()).
                         // eslint-disable-next-line no-await-in-loop -- writes share one SQLite handle; parallelizing would interleave statements on a single connection.
-                        await writer.replace(String(document["_id"]), { ...next, _creationTime: document["_creationTime"], _id: document["_id"] });
+                        await writer.replace(String(document["_id"]), { ...next, _creationTime: document["_creationTime"], _id: document["_id"] }, undefined, {
+                            allowExplicitId: true,
+                        });
                     }
                 }
 
@@ -537,8 +544,17 @@ const runDataMigration = async (options: RunDataMigrationOptions): Promise<Migra
     if (!dryRun && !isDone) {
         // Paused on the `maxBatches` limit, not finished. Drop our claim so the
         // next invocation can resume immediately rather than waiting out the
-        // stale-claim timeout (see releaseClaim).
-        releaseClaim(sql, migration.id);
+        // stale-claim timeout (see releaseClaim). A failure here is non-fatal:
+        // the batch succeeded, and the stale-claim timeout still lets a later
+        // invocation reclaim after STALE_CLAIM_TIMEOUT_MS.
+        try {
+            releaseClaim(sql, migration.id);
+        } catch (error) {
+            // Claim release is best-effort; the stale-claim timeout is the fallback. Log so
+            // repeated failures are observable rather than silently delaying every resume.
+            // eslint-disable-next-line no-console -- no logger is injected here; emit via console so the host captures the swallowed release failure
+            console.warn(`data migration "${migration.id}": releaseClaim failed`, error);
+        }
     }
 
     // eslint-disable-next-line unicorn/no-null -- MigrationRunResult.cursor: null on completion (no resume point), matching the wire shape

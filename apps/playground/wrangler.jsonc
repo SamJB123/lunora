@@ -36,6 +36,16 @@
             "bucket_name": "lunora-playground-avatars",
         },
     ],
+    // Workers KV backing `ctx.kv` (see lunora/kv.ts) and the Studio's KV browser.
+    // In local dev the @cloudflare/vite-plugin provisions this namespace in
+    // Miniflare automatically — no Cloudflare account needed. Replace the `id`
+    // with a real one (`wrangler kv namespace create KV`) before deploying.
+    "kv_namespaces": [
+        {
+            "binding": "KV",
+            "id": "<replace-with-kv-create-id>",
+        },
+    ],
     "vars": {
         "PUBLIC_STORAGE_BASE_URL": "https://files.example.com",
         // REPLACE before deploying to production — both point at the Worker's
@@ -45,5 +55,19 @@
         // Pointing at localhost in production silently breaks scheduled jobs.
         "LUNORA_WORKER_ORIGIN": "http://localhost:8787",
         "LUNORA_ORIGIN_URL": "http://localhost:8787",
+    },
+    "queues": {
+        "consumers": [
+            {
+                "queue": "notifications",
+                "max_retries": 3,
+            },
+        ],
+        "producers": [
+            {
+                "binding": "QUEUE_NOTIFICATIONS",
+                "queue": "notifications",
+            },
+        ],
     },
 }

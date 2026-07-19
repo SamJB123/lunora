@@ -17,12 +17,10 @@
 import { writeFileSync } from "node:fs";
 
 import { containerBuildTag } from "@lunora/container";
-import { applyEdits, modify } from "jsonc-parser";
 
-import type { DurableObjectSpec, InferredBindings, InferredContainer, InferredQueue, InferredWorkflow } from "./infer-bindings";
+import type { DurableObjectSpec, InferredAgent, InferredBindings, InferredContainer, InferredQueue, InferredWorkflow } from "./infer-bindings";
+import { applyModify } from "./jsonc-edit";
 import { findWranglerFile, readWranglerJsonc } from "./wrangler-path";
-
-const FORMATTING = { formattingOptions: { insertSpaces: true, tabSize: 4 } } as const;
 
 /**
  * Placeholder `database_id` written for an auto-provisioned `DB` binding. It is
@@ -77,6 +75,8 @@ interface WranglerShape {
     containers?: ReadonlyArray<ContainerEntry>;
     d1_databases?: ReadonlyArray<{ binding?: string }>;
     durable_objects?: { bindings?: ReadonlyArray<DurableObjectBinding> };
+    // Hint-only: the `app_id` is a remote Flagship app Lunora can't mint — warned, never written.
+    flagship?: ReadonlyArray<{ app_id?: string; binding?: string }>;
     // Hint-only: the `id` is a remote Hyperdrive resource Lunora can't mint — warned, never written.
     hyperdrive?: ReadonlyArray<{ binding?: string; id?: string }>;
     // Self-describing: a parameterless { binding } — auto-writeable like `ai` (see reconcileImages).
@@ -106,12 +106,12 @@ interface WranglerShape {
 interface ExportGap {
     /** Generated class wrangler needs exported, e.g. `OrderPipelineWorkflow`. */
     className: string;
-    /** The `lunora/{containers,workflows}.ts` export name, e.g. `orderPipeline`. */
+    /** The `lunora/{agents,containers,workflows}.ts` export name, e.g. `orderPipeline`. */
     exportName: string;
     /** Which declaration is unexported. */
-    kind: "container" | "workflow";
+    kind: "agent" | "container" | "workflow";
     /** The `_generated/{module}` to re-export from, e.g. `workflows`. */
-    module: "containers" | "workflows";
+    module: "agents" | "containers" | "workflows";
 }
 
 interface ReconcileBindingsResult {
@@ -155,6 +155,12 @@ const collectExportGaps = (inferred: InferredBindings): ExportGap[] => {
         }
     }
 
+    for (const agent of inferred.agents) {
+        if (!agent.exported) {
+            gaps.push({ className: agent.className, exportName: agent.exportName, kind: "agent", module: "agents" });
+        }
+    }
+
     return gaps;
 };
 
@@ -172,6 +178,12 @@ interface ReconcileStep {
  * bindings (browser/images/analytics) are auto-written instead; see reconcile.
  */
 const collectHintBindingWarnings = (inferred: InferredBindings, parsed?: WranglerShape): string[] => {
+    // A Flagship binding-mode provider needs a matching `flagship[]` entry; the
+    // warning keys on the *binding name* (an app can wire several Flagship apps),
+    // not array length, and carries the specific name + app_id remediation.
+    const flagshipBindingMissing =
+        inferred.flagshipBinding !== undefined && !(parsed?.flagship ?? []).some((entry) => entry.binding === inferred.flagshipBinding);
+
     const rules: ReadonlyArray<[boolean, string]> = [
         [
             inferred.usesKv && (parsed?.kv_namespaces?.length ?? 0) === 0,
@@ -185,10 +197,56 @@ const collectHintBindingWarnings = (inferred: InferredBindings, parsed?: Wrangle
             inferred.usesPipelines && (parsed?.pipelines?.length ?? 0) === 0,
             "ctx.pipelines is used but no pipelines binding exists; run 'wrangler pipelines create <name>' and add a 'pipelines' binding ({ binding, pipeline }) — the pipeline resource can't be auto-provisioned.",
         ],
+        [
+            flagshipBindingMissing,
+            `lunora/flags.ts uses Flagship in binding mode but no flagship binding "${inferred.flagshipBinding ?? ""}" exists; add a flagship entry ({ binding: "${inferred.flagshipBinding ?? ""}", app_id }) — the app_id can't be auto-provisioned.`,
+        ],
     ];
 
     return rules.filter(([active]) => active).map(([, warning]) => warning);
 };
+
+/**
+ * Capability reminders for the x402 rails. Neither implies a wrangler binding
+ * Lunora can auto-write: the charge recipient is a user-named `[vars]` entry, and
+ * the pay wallet key is a Secrets Store binding created out-of-band. So both are
+ * always-on reminders — nothing in `wrangler.jsonc` can confirm them away (the pay
+ * binding name is `signer.secretName`, unknown here) — rather than suppressible
+ * hint bindings. The pay reminder also flags the mandatory spend policy: the rail
+ * moves real funds.
+ */
+const collectX402Warnings = (inferred: InferredBindings): string[] => {
+    const rules: ReadonlyArray<[boolean, string]> = [
+        [
+            inferred.usesX402Charge,
+            "@lunora/x402/charge is used; set the recipient wallet address as a [vars] entry (the var name is your choice) and pass it to the charge config — the x402 facilitator settles USDC to that address.",
+        ],
+        [
+            inferred.usesX402Pay,
+            "@lunora/x402/pay is used (ActionCtx-only, spends real funds); add a secrets_store_secrets[] binding holding the agent wallet key (binding name == signer.secretName) and pair the pay rail with a spend policy — ctx.secrets reads a Secrets Store binding, not .dev.vars.",
+        ],
+    ];
+
+    return rules.filter(([active]) => active).map(([, warning]) => warning);
+};
+
+/**
+ * The declared-but-not-re-exported warning lines for a container / workflow /
+ * agent set — one per declaration the worker entry never exports (wrangler
+ * would reject its `class_name` at deploy). Shared by the three cases so
+ * {@link collectWarnings} stays flat; the prose mirrors each {@link ExportGap}.
+ */
+const unexportedDeclarationWarnings = (
+    kind: string,
+    module: ExportGap["module"],
+    declarations: ReadonlyArray<{ className: string; exported: boolean; exportName: string }>,
+): string[] =>
+    declarations
+        .filter((declaration) => !declaration.exported)
+        .map(
+            (declaration) =>
+                `${kind} "${declaration.exportName}" is declared but ${declaration.className} is not exported by the worker entry; add \`export * from "./lunora/_generated/${module}"\` so its binding can be provisioned.`,
+        );
 
 /**
  * Hints for capabilities used but not safely auto-provisionable — only emitted
@@ -223,21 +281,11 @@ const collectWarnings = (inferred: InferredBindings, parsed?: WranglerShape): st
         warnings.push("@lunora/scheduler is used but the worker entry exports no SchedulerDO; export it so the SCHEDULER binding can be provisioned.");
     }
 
-    for (const container of inferred.containers) {
-        if (!container.exported) {
-            warnings.push(
-                `container "${container.exportName}" is declared but ${container.className} is not exported by the worker entry; add \`export * from "./lunora/_generated/containers"\` so its binding can be provisioned.`,
-            );
-        }
-    }
-
-    for (const workflow of inferred.workflows) {
-        if (!workflow.exported) {
-            warnings.push(
-                `workflow "${workflow.exportName}" is declared but ${workflow.className} is not exported by the worker entry; add \`export * from "./lunora/_generated/workflows"\` so its binding can be provisioned.`,
-            );
-        }
-    }
+    warnings.push(
+        ...unexportedDeclarationWarnings("container", "containers", inferred.containers),
+        ...unexportedDeclarationWarnings("workflow", "workflows", inferred.workflows),
+        ...unexportedDeclarationWarnings("agent", "agents", inferred.agents),
+    );
 
     // Container logs are invisible without Workers observability. An absent key
     // is reconciled to enabled below; an explicit `false` is a user billing
@@ -256,16 +304,9 @@ const collectWarnings = (inferred: InferredBindings, parsed?: WranglerShape): st
         );
     }
 
-    warnings.push(...collectHintBindingWarnings(inferred, parsed));
+    warnings.push(...collectX402Warnings(inferred), ...collectHintBindingWarnings(inferred, parsed));
 
     return warnings;
-};
-
-/** Apply one structural edit and return the rewritten text. */
-const applyModify = (text: string, path: ReadonlyArray<number | string>, value: unknown): string => {
-    const edits = modify(text, [...path], value, FORMATTING);
-
-    return edits.length > 0 ? applyEdits(text, edits) : text;
 };
 
 /** Compute the lowest free `vN` `migrations` tag (`v1`, `v2`, …). */
@@ -484,23 +525,49 @@ const workflowEntryFor = (workflow: InferredWorkflow): Record<string, unknown> =
 };
 
 /**
- * Add any missing `workflows[]` entries (matched by `class_name`). Workflows are
- * NOT Durable Objects, so — unlike containers — this writes ONLY the
+ * Render one wrangler `workflows[]` entry from an inferred agent. An agent
+ * compiles onto a Cloudflare Workflow, so its wrangler footprint is identical to
+ * a workflow's — a `{ binding, class_name, name }` entry in the same array. Pure.
+ */
+const agentEntryFor = (agent: InferredAgent): Record<string, unknown> => {
+    return { binding: agent.bindingName, class_name: agent.className, name: agent.name };
+};
+
+/**
+ * Add any missing `workflows[]` entries (matched by `class_name`) from both
+ * `defineWorkflow` and `defineAgent` exports — an agent compiles onto a
+ * Cloudflare Workflow, so both land in the SAME `workflows[]` array, and one
+ * step owns that key (the reconcile pipeline's disjoint-key invariant forbids a
+ * second step rewriting `workflows[]` off the now-stale `parsed`). Workflows and
+ * agents are NOT Durable Objects, so — unlike containers — this writes ONLY the
  * `workflows[]` array: no `durable_objects` binding, no `migrations` class, no
  * `observability` toggle. Pure.
  */
-const reconcileWorkflows = (text: string, parsed: WranglerShape, workflows: ReadonlyArray<InferredWorkflow>): ReconcileStep => {
+const reconcileWorkflows = (
+    text: string,
+    parsed: WranglerShape,
+    workflows: ReadonlyArray<InferredWorkflow>,
+    agents: ReadonlyArray<InferredAgent> = [],
+): ReconcileStep => {
     const existing = parsed.workflows ?? [];
     const existingClasses = new Set(existing.map((entry) => entry.class_name));
-    const missing = workflows.filter((workflow) => !existingClasses.has(workflow.className));
+    const missingWorkflows = workflows.filter((workflow) => !existingClasses.has(workflow.className));
+    const missingAgents = agents.filter((agent) => !existingClasses.has(agent.className));
 
-    if (missing.length === 0) {
+    if (missingWorkflows.length === 0 && missingAgents.length === 0) {
         return { added: [], text };
     }
 
-    const nextText = applyModify(text, ["workflows"], [...existing, ...missing.map((workflow) => workflowEntryFor(workflow))]);
+    const nextText = applyModify(
+        text,
+        ["workflows"],
+        [...existing, ...missingWorkflows.map((workflow) => workflowEntryFor(workflow)), ...missingAgents.map((agent) => agentEntryFor(agent))],
+    );
 
-    return { added: missing.map((workflow) => `workflows/${workflow.className}`), text: nextText };
+    return {
+        added: [...missingWorkflows.map((workflow) => `workflows/${workflow.className}`), ...missingAgents.map((agent) => `workflows/${agent.className}`)],
+        text: nextText,
+    };
 };
 
 /**
@@ -604,10 +671,24 @@ const reconcileWranglerBindings = (projectRoot: string, inferred: InferredBindin
     // class_name the worker doesn't export. Their DO bindings + migration
     // classes ride through `reconcileDurableObjects` alongside the built-ins.
     const exportedContainers = inferred.containers.filter((container) => container.exported);
+    // A voice-enabled agent's real-time session runs in a dedicated Durable
+    // Object (unlike the durable loop, which compiles onto a Workflow). Each such
+    // agent's generated `VoiceSessionDO` subclass therefore needs a
+    // `durable_objects` binding + `new_sqlite_classes` migration, reconciled
+    // through the same `reconcileDurableObjects` step as the built-ins and
+    // containers. Non-voice agents add nothing here (they only touch
+    // `workflows[]` via `exportedAgents`).
+    const voiceAgents = inferred.agents.filter(
+        (agent): agent is InferredAgent & { voiceBindingName: string; voiceClassName: string } =>
+            agent.exported && agent.voice === true && agent.voiceBindingName !== undefined && agent.voiceClassName !== undefined,
+    );
     const requiredDurableObjects: DurableObjectSpec[] = [
         ...inferred.durableObjects,
         ...exportedContainers.map((container) => {
             return { binding: container.bindingName, className: container.className };
+        }),
+        ...voiceAgents.map((agent) => {
+            return { binding: agent.voiceBindingName, className: agent.voiceClassName };
         }),
     ];
 
@@ -616,6 +697,11 @@ const reconcileWranglerBindings = (projectRoot: string, inferred: InferredBindin
     // so they get their own `workflows[]` step and never touch durable_objects
     // / migrations (no `requiredDurableObjects` entry, unlike containers).
     const exportedWorkflows = inferred.workflows.filter((workflow) => workflow.exported);
+    // Agents compile onto Cloudflare Workflows, so their exported agent
+    // WorkflowEntrypoint classes reconcile into the SAME `workflows[]` array
+    // (via the single `reconcileWorkflows` step below — see its doc for why one
+    // step must own that key). Same export gate as workflows.
+    const exportedAgents = inferred.agents.filter((agent) => agent.exported);
 
     // The reconcile pipeline: each enabled step rewrites `text` but reads the
     // original `parsed`. This is only safe because the steps touch disjoint
@@ -635,7 +721,10 @@ const reconcileWranglerBindings = (projectRoot: string, inferred: InferredBindin
         { enabled: inferred.usesAnalytics, run: (text) => reconcileAnalytics(text, parsed) },
         { enabled: true, run: (text) => reconcileObservability(text, parsed) },
         { enabled: exportedContainers.length > 0, run: (text) => reconcileContainers(text, parsed, exportedContainers) },
-        { enabled: exportedWorkflows.length > 0, run: (text) => reconcileWorkflows(text, parsed, exportedWorkflows) },
+        {
+            enabled: exportedWorkflows.length > 0 || exportedAgents.length > 0,
+            run: (text) => reconcileWorkflows(text, parsed, exportedWorkflows, exportedAgents),
+        },
         { enabled: inferred.queues.length > 0, run: (text) => reconcileQueues(text, parsed, inferred.queues) },
     ];
 
